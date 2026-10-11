@@ -1,0 +1,74 @@
+name: Build aota_nx NRO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Job 1 (runner biasa, tanpa container): unduh SDK mesa-switch dari
+  # Release asset publik di sukalibur9/mesa-switch (tag: sdk-26.2.3,
+  # file: mesa-sdk.zip), lalu jadikan artifact workflow ini supaya job
+  # build bisa mengambilnya.
+  #
+  # CATATAN: jangan pakai `gh run download ... --repo sukalibur9/mesa-switch`
+  # dengan secrets.GITHUB_TOKEN di sini — token bawaan hanya berlaku untuk
+  # repo tempat workflow berjalan, sehingga unduhan artifact antar-repo
+  # akan gagal (404). Release asset publik bisa diunduh tanpa token.
+  fetch-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download mesa-switch SDK (public release asset)
+        run: |
+          curl -sSL -o /tmp/mesa-sdk.zip \
+            "https://github.com/sukalibur9/mesa-switch/releases/download/sdk-26.2.3/mesa-sdk.zip"
+          mkdir -p /tmp/mesa-sdk
+          cd /tmp/mesa-sdk && unzip -q -o /tmp/mesa-sdk.zip
+          ls /tmp/mesa-sdk/lib/libvulkan.a /tmp/mesa-sdk/include/vulkan/vulkan.h
+
+      - name: Upload SDK for build job
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-sdk
+          path: /tmp/mesa-sdk/
+
+  # Job 2 (container devkitPro resmi): compile wrapper + Vulkan WSI shim.
+  build:
+    needs: fetch-sdk
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/download-artifact berjalan di host runner, BUKAN di dalam
+      # container: /tmp tidak dishare ke container. Karena itu SDK ditaruh
+      # di dalam $GITHUB_WORKSPACE (di-mount ke container di path yang sama).
+      - uses: actions/download-artifact@v4
+        with:
+          name: mesa-sdk
+          path: mesa-sdk
+
+      - name: Verify SDK
+        run: ls mesa-sdk/lib/libvulkan.a mesa-sdk/include/vulkan/vulkan.h
+
+      - name: Install dependencies
+        run: |
+          # Tanpa -Syu (full upgrade) supaya versi toolchain tetap seperti
+          # yang dibundel di image; cukup instal portlib yang dibutuhkan.
+          # switch-libelf sengaja tidak dipasang: Makefile memperlakukannya
+          # sebagai opsional (libvulkan.a SDK tidak memakai simbol elf_*).
+          dkp-pacman -S --noconfirm \
+            switch-sdl2 switch-libpng switch-bzip2 switch-zlib \
+            switch-tools
+
+      - name: Build
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          export VULKAN_SDK=$GITHUB_WORKSPACE/mesa-sdk
+          make clean
+          make -j$(nproc)
+
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: aota_nx-vulkan-nro
+          path: aota_nx.nro
