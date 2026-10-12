@@ -39,6 +39,7 @@ int unity6_patch_choreographer(so_module *unity);
 #include "unity_entrypoints.h"
 #include "diag.h"
 #include "os_video.h"
+#include "vsync_fake.h"  /* Unity 6 vsync counter thread */
 
 #define LIB_MAIN   "libmain.so"
 #define LIB_UNITY  "libunity.so"
@@ -1994,6 +1995,11 @@ int main(int argc, char *argv[]) {
 #if OS_HAVE_TIME_FIX
   nx_install_time_fix();   /* PvZ: hook Update + start clock thread BEFORE the first (blocking) nativeRender */
 #endif
+  /* Unity 6 vsync: start the counter bumping thread. The engine's WaitVSync()
+   * blocks on a vsync counter that nothing on Switch advances. This thread
+   * bumps it at ~60Hz once the counter address is bound (via vsync_bind_counter
+   * when the vsync wait pattern is detected). Ported from cloverpit_nx. */
+  vsync_start();
 
   diag_thread_register(NULL, 0);
   diag_set_name(NULL, "NX_UIMain");   // the thread that drives nativeRender
