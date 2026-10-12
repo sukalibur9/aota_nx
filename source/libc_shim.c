@@ -1,3 +1,22 @@
+/* libc_shim.c -- bionic-compatible libc wrappers for libcrx.so + libc++_shared
+ *
+ * The Android engine and its C++ runtime are linked against bionic. Where the
+ * bionic and newlib ABIs differ (struct layouts, flag values, missing
+ * functions) we provide converting wrappers here; everything that matches is
+ * passed straight through from imports.c. Online/IPC functionality (sockets,
+ * fork/exec, dlopen of system libs) is dead on Switch and stubbed to fail
+ * cleanly so the engine falls back to offline behaviour.
+ *
+ * This software may be modified and distributed under the terms
+ * of the MIT license. See the LICENSE file for details.
+ */
+
+#define _GNU_SOURCE
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>  /* strncasecmp */
 #include <math.h>
@@ -27,6 +46,7 @@
 #include "libc_shim.h"
 #include "android_native_unity.h"
 #include "diag.h"
+#include "vsync_fake.h"  /* Unity 6 vsync counter binding */
 
 // ---------------------------------------------------------------------------
 // fortify (_chk) wrappers: ignore the object-size argument
@@ -155,6 +175,7 @@ static CondVar futex_cond[FUTEX_BUCKETS];
 /* Wake generation per bucket, bumped under futex_lock[h] on every WAKE. Lets a
  * timed waiter distinguish "woken" from "timed out" across capped chunks. */
 static volatile u64 futex_wake_gen[FUTEX_BUCKETS];
+
 #define FXOWN_N 64
 static uintptr_t fxown_a[FXOWN_N];
 static unsigned  fxown_c[FXOWN_N];
@@ -181,6 +202,9 @@ static void fxown_spin(volatile int32_t *uaddr) {
     debugPrintf("[fxown] STUCK ua=%p tid=%d val=%08x owner_tid=%llx (300 re-polls ~5s)\n",
                 (void *)uaddr, gettid_fake(), (unsigned)*uaddr,
                 (unsigned long long)owner);
+    /* Try to bind as vsync counter: if this is the Unity 6 vsync wait,
+     * the counter is at mutex + 0x58. The vsync thread will start bumping it. */
+    vsync_bind_counter(a);
   }
 }
 static void fxown_wake(volatile int32_t *uaddr) {
