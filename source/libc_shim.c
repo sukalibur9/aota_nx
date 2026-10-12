@@ -155,23 +155,6 @@ static CondVar futex_cond[FUTEX_BUCKETS];
 /* Wake generation per bucket, bumped under futex_lock[h] on every WAKE. Lets a
  * timed waiter distinguish "woken" from "timed out" across capped chunks. */
 static volatile u64 futex_wake_gen[FUTEX_BUCKETS];
-  static void fxown_spin(volatile int32_t *uaddr) {
-    uintptr_t a = (uintptr_t)uaddr;
-    if (a < 0x2400000000ULL) return;            /* skip job/loader region */
-    mutexLock(&fxown_lk);
-    int s = fxown_slot(a); unsigned c = ++fxown_c[s];
-    mutexUnlock(&fxown_lk);
-    if (c == 300) {
-      /* Unity 6000.5.8f1 mutex_lock (libunity.so+0x58a6dc) stores owner thread ID
-       * at [mutex+64]. Dump it to identify who holds the mutex we're stuck on. */
-      uint64_t owner = 0;
-      __builtin_memcpy(&owner, (const void *)(a + 64), sizeof(owner));
-      debugPrintf("[fxown] STUCK ua=%p tid=%d val=%08x owner_tid=%llx (300 re-polls ~5s)\n",
-                  (void *)uaddr, gettid_fake(), (unsigned)*uaddr,
-                  (unsigned long long)owner);
-  }
-}
-
 #define FXOWN_N 64
 static uintptr_t fxown_a[FXOWN_N];
 static unsigned  fxown_c[FXOWN_N];
@@ -190,8 +173,15 @@ static void fxown_spin(volatile int32_t *uaddr) {
   mutexLock(&fxown_lk);
   int s = fxown_slot(a); unsigned c = ++fxown_c[s];
   mutexUnlock(&fxown_lk);
-  if (c == 300)
-    debugPrintf("[fxown] STUCK ua=%p tid=%d val=%08x (300 re-polls ~5s)\n", (void *)uaddr, gettid_fake(), (unsigned)*uaddr);
+  if (c == 300) {
+    /* Unity 6000.5.8f1 mutex_lock (libunity.so+0x58a6dc) stores owner thread ID
+     * at [mutex+64]. Dump it to identify who holds the mutex we're stuck on. */
+    uint64_t owner = 0;
+    __builtin_memcpy(&owner, (const void *)(a + 64), sizeof(owner));
+    debugPrintf("[fxown] STUCK ua=%p tid=%d val=%08x owner_tid=%llx (300 re-polls ~5s)\n",
+                (void *)uaddr, gettid_fake(), (unsigned)*uaddr,
+                (unsigned long long)owner);
+  }
 }
 static void fxown_wake(volatile int32_t *uaddr) {
   uintptr_t a = (uintptr_t)uaddr;
