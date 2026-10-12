@@ -1,22 +1,3 @@
-/* libc_shim.c -- bionic-compatible libc wrappers for libcrx.so + libc++_shared
- *
- * The Android engine and its C++ runtime are linked against bionic. Where the
- * bionic and newlib ABIs differ (struct layouts, flag values, missing
- * functions) we provide converting wrappers here; everything that matches is
- * passed straight through from imports.c. Online/IPC functionality (sockets,
- * fork/exec, dlopen of system libs) is dead on Switch and stubbed to fail
- * cleanly so the engine falls back to offline behaviour.
- *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
- */
-
-#define _GNU_SOURCE
-
-#include <stdlib.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdarg.h>
 #include <string.h>
 #include <strings.h>  /* strncasecmp */
 #include <math.h>
