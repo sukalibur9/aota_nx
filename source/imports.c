@@ -235,12 +235,15 @@ int pthread_attr_setstacksize_fake(void *a, size_t s) { if (a) { OurAttr *o = a;
 int pthread_attr_getstacksize_fake(const void *a, size_t *s) { if (s) { const OurAttr *o = a; *s = (a && o->magic == ATTR_MAGIC && o->stacksize) ? o->stacksize : (512 * 1024); } return 0; }
 int pthread_attr_setschedparam_fake(void *a, const void *p) { (void)a; (void)p; return 0; }
 
-typedef struct { void *(*entry)(void *); void *arg; int is_main; uint8_t tls[BIONIC_TLS_SIZE]; } ThreadStart;
+typedef struct { void *(*entry)(void *); void *arg; int is_main; volatile int started; uint8_t tls[BIONIC_TLS_SIZE]; } ThreadStart;
 static volatile int g_first_engine_thread_taken = 0;
 static void *thread_trampoline(void *p) {
   ThreadStart *ts = (ThreadStart *)p;   /* leaked on purpose: tpidr points into ts->tls */
   install_bionic_tls(ts->tls);          // this thread's OWN stack-guard block (tpidr_el0+0x28)
   diag_thread_register(ts->entry, ts->is_main);
+  __sync_synchronize();
+  ts->started = 1;
+  __sync_synchronize();
   debugPrintf("[pthread] thread started entry=%p tid=%lu\n", ts->entry, (unsigned long)pthread_self());
   void *r = ts->entry(ts->arg);
   diag_thread_unregister();
@@ -257,6 +260,8 @@ int pthread_create_fake(pthread_t *thread, const void *bionic_attr, void *entry,
   ts->entry = (void *(*)(void *))entry;
   ts->arg = arg;
   ts->is_main = (__sync_lock_test_and_set(&g_first_engine_thread_taken, 1) == 0);
+  ts->started = 0;
+  __sync_synchronize();
   size_t stack = 0;
   if (bionic_attr) {
     const OurAttr *o = bionic_attr;
@@ -269,6 +274,15 @@ int pthread_create_fake(pthread_t *thread, const void *bionic_attr, void *entry,
   pthread_attr_destroy(&attr);
   debugPrintf("[pthread] create entry=%p -> r=%d\n", entry, r);
   if (r != 0) { free(ts); return r; }
+  /* Wait for the new thread to complete its trampoline init (TLS + diag register)
+     before returning, making thread startup deterministic. This prevents races
+     where Unity's main thread checks thread lists before workers register. */
+  int spins = 0;
+  while (!ts->started) {
+    __sync_synchronize();
+    if (++spins > 1000000) break; /* ~1s timeout, don't hang forever */
+    for (volatile int i = 0; i < 100; i++) { /* brief pause */ }
+  }
   return 0;
 }
 int pthread_join_fake(pthread_t thread, void **retval) {
