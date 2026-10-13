@@ -17,7 +17,7 @@
 #include "config.h"
 #include "util.h"
 #include "jni_fake.h"
-#include "data.h
+#include "data.h"
 #include "text2bitmap.h"
 #include "os_video.h"
 #include "unity_sendmessage.h"
