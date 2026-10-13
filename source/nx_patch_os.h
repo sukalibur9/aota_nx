@@ -237,9 +237,9 @@ static const NxPatchWord OS_BRANCH_FORCES[] = {
  * ======================================================================== */
 #define OS_HAVE_DIAG_SKIP_PROPVEC 1
 __attribute__((unused))
-
 static const NxPatchWord OS_DIAG_PATCHES[] = {
   { 0x122b004, 0x081140f9, 0xd503201f },  /* DIAG: ldr x8,[x8,#0x20] -> nop (vtable ID) */
+  { 0x122b218, 0x54ffff21, 0xd503201f },  /* DIAG: b.ne -> nop, break list-walk spin; falls through to list-exhausted path */
   { 0x124400c, 0xf9000d2b, 0xd503201f },  /* FIX: STR x11,[x9,#0x18] -> nop (null list head) */
   { 0x1244014, 0xf9000969, 0xd503201f },  /* FIX: STR x9,[x11,#0x10] -> nop (null list node) */
 };
@@ -262,7 +262,7 @@ static const NxPatchWord OS_ATOMIC_PATCHES[] = {
 /* Experimental 2026-10-12: skip the futex wait loop at 0x58a780 entirely.
  * Changes `cbz w0, 58a7b4` to unconditional `b 58a7b4`, so Unity proceeds
  * without waiting for the event. May crash if the wait was necessary. */
-#define OS_HAVE_WAIT_SKIP 0
+#define OS_HAVE_WAIT_SKIP 1
 static const NxPatchWord OS_WAITSKIP_PATCHES[] = {
   { 0x58a790, 0x34000120, 0x14000009 },  /* cbz w0,+0x24 -> b +0x24 */
 };
