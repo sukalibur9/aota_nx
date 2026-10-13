@@ -261,7 +261,7 @@ static const NxPatchWord OS_ATOMIC_PATCHES[] = {
 /* Experimental 2026-10-12: skip the futex wait loop at 0x58a780 entirely.
  * Changes `cbz w0, 58a7b4` to unconditional `b 58a7b4`, so Unity proceeds
  * without waiting for the event. May crash if the wait was necessary. */
-#define OS_HAVE_WAIT_SKIP 1
+#define OS_HAVE_WAIT_SKIP 0
 static const NxPatchWord OS_WAITSKIP_PATCHES[] = {
   { 0x58a790, 0x34000120, 0x14000009 },  /* cbz w0,+0x24 -> b +0x24 */
 };
