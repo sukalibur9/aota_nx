@@ -235,7 +235,7 @@ static const NxPatchWord OS_BRANCH_FORCES[] = {
  * VERIFY-FIRST: only applied if the stock word matches. Remove once the root
  * cause (why x1 = 0x81ff) is understood.
  * ======================================================================== */
-#define OS_HAVE_DIAG_SKIP_PROPVEC 0
+#define OS_HAVE_DIAG_SKIP_PROPVEC 1
 __attribute__((unused))
 static const NxPatchWord OS_DIAG_PATCHES[] = {
   { 0x122b004, 0x081140f9, 0xd503201f },  /* DIAG: ldr x8,[x8,#0x20] -> nop (vtable ID) */
