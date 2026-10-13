@@ -240,8 +240,6 @@ __attribute__((unused))
 
 static const NxPatchWord OS_DIAG_PATCHES[] = {
   { 0x122b004, 0x081140f9, 0xd503201f },  /* DIAG: ldr x8,[x8,#0x20] -> nop (vtable ID) */
-  { 0x122b1f0, 0x54ffff41, 0xd503201f },  /* DIAG: b.ne -> nop (break AsyncReadManager retry loop #2) */
-  { 0x122b22c, 0x540006a3, 0xd503201f },  /* DIAG: b.ne -> nop (break AsyncReadManager spin at 0x122b210) */
   { 0x124400c, 0xf9000d2b, 0xd503201f },  /* FIX: STR x11,[x9,#0x18] -> nop (null list head) */
   { 0x1244014, 0xf9000969, 0xd503201f },  /* FIX: STR x9,[x11,#0x10] -> nop (null list node) */
 };
