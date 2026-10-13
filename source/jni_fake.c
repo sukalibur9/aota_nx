@@ -1,5 +1,6 @@
 /* jni_fake.c -- fake JNI environment for the MVGL engine (libcrx.so)
  *
+ 
  * This software may be modified and distributed under the terms
  * of the MIT license. See the LICENSE file for details.
  */
@@ -16,7 +17,7 @@
 #include "config.h"
 #include "util.h"
 #include "jni_fake.h"
-#include "data.h"
+#include "data.h
 #include "text2bitmap.h"
 #include "os_video.h"
 #include "unity_sendmessage.h"
@@ -999,6 +1000,13 @@ static void *act_object(const FakeID *id, va_list va) {
    * "getClassLoader" and swallowing that would be wrong. */
   if (!strcmp(id->name, "getClass"))
     return intern_class(id->cls[0] ? id->cls : "java/lang/Object");
+  /* PlayAssetDeliveryUnityWrapper -- Unity's Play Asset Delivery bridge.
+   * The game calls new PlayAssetDeliveryUnityWrapper(unityPlayer, context)
+   * during startup. Without this, the init returns null and asset loading
+   * may stall waiting for PAD. Return a dummy object; the asset_pack.c
+   * file-based fallback handles actual asset reads. */
+  if (name_has(id->sig, "PlayAssetDeliveryUnityWrapper"))
+    return jni_make_object("com/unity3d/player/PlayAssetDeliveryUnityWrapper");
   /* ClassLoader handles are only ever passed back to us (Class.forName's third
    * argument, findLibrary), so any non-null interned object serves. Deliberately
    * NOT handling forName itself: returning a Class for a type that genuinely is
