@@ -193,6 +193,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL shim_EnumerateInstanceExtensionProperties(
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetInstanceProcAddr(VkInstance instance, const char* pName);
 
+/* Forward declarations for validation stubs (build #66) */
+static VKAPI_ATTR VkResult VKAPI_CALL stub_CreateDebugUtilsMessenger(VkInstance inst, const void* ci, const VkAllocationCallbacks* al, void* m);
+static VKAPI_ATTR void VKAPI_CALL stub_DestroyDebugUtilsMessenger(VkInstance inst, void* m, const VkAllocationCallbacks* al);
+static VKAPI_ATTR VkResult VKAPI_CALL stub_CreateDebugReportCallback(VkInstance inst, const void* ci, const VkAllocationCallbacks* al, void* cb);
+static VKAPI_ATTR void VKAPI_CALL stub_DestroyDebugReportCallback(VkInstance inst, void* cb, const VkAllocationCallbacks* al);
+
 static PFN_vkVoidFunction shim_lookup(const char* name) {
   if (streq(name, "vkGetInstanceProcAddr"))
     return (PFN_vkVoidFunction)shim_GetInstanceProcAddr;
@@ -202,7 +208,46 @@ static PFN_vkVoidFunction shim_lookup(const char* name) {
     return (PFN_vkVoidFunction)shim_EnumerateInstanceExtensionProperties;
   if (streq(name, "vkCreateAndroidSurfaceKHR"))
     return (PFN_vkVoidFunction)shim_CreateAndroidSurfaceKHR;
+  /* Build #66: stub out validation/debug functions - Unity may try to
+   * enable them and crash if they fail. Return success doing nothing. */
+  if (streq(name, "vkCreateDebugUtilsMessengerEXT"))
+    return (PFN_vkVoidFunction)stub_CreateDebugUtilsMessenger;
+  if (streq(name, "vkDestroyDebugUtilsMessengerEXT"))
+    return (PFN_vkVoidFunction)stub_DestroyDebugUtilsMessenger;
+  if (streq(name, "vkCreateDebugReportCallbackEXT"))
+    return (PFN_vkVoidFunction)stub_CreateDebugReportCallback;
+  if (streq(name, "vkDestroyDebugReportCallbackEXT"))
+    return (PFN_vkVoidFunction)stub_DestroyDebugReportCallback;
   return NULL;
+}
+
+/* Validation/debug stubs (build #66) */
+static VKAPI_ATTR VkResult VKAPI_CALL
+stub_CreateDebugUtilsMessenger(VkInstance inst, const void* ci,
+                               const VkAllocationCallbacks* al, void* m) {
+  debugPrintf("[vulkan] STUB vkCreateDebugUtilsMessengerEXT -> VK_SUCCESS (no-op)\n");
+  if (m) *(void**)m = (void*)0x1; /* dummy non-null handle */
+  return 0; /* VK_SUCCESS */
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+stub_DestroyDebugUtilsMessenger(VkInstance inst, void* m,
+                                const VkAllocationCallbacks* al) {
+  debugPrintf("[vulkan] STUB vkDestroyDebugUtilsMessengerEXT (no-op)\n");
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+stub_CreateDebugReportCallback(VkInstance inst, const void* ci,
+                               const VkAllocationCallbacks* al, void* cb) {
+  debugPrintf("[vulkan] STUB vkCreateDebugReportCallbackEXT -> VK_SUCCESS (no-op)\n");
+  if (cb) *(void**)cb = (void*)0x1; /* dummy non-null handle */
+  return 0; /* VK_SUCCESS */
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+stub_DestroyDebugReportCallback(VkInstance inst, void* cb,
+                                const VkAllocationCallbacks* al) {
+  debugPrintf("[vulkan] STUB vkDestroyDebugReportCallbackEXT (no-op)\n");
 }
 
 /* --- Call-tracing wrappers for surface functions (build #54) ---
