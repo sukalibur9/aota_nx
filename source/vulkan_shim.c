@@ -275,6 +275,14 @@ trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const Vk
       use_ci = &fixed;
       debugPrintf("[vulkan]   FIX: format 0 -> 44 (B8G8R8A8_UNORM)\n");
     }
+    /* Build #57 fix: NVK returns -8 (FEATURE_NOT_PRESENT) for usage=0x93.
+     * Strip to COLOR_ATTACHMENT only, which all swapchains support. */
+    if (use_ci->imageUsage != 0x10) {
+      if (use_ci != &fixed) fixed = *use_ci;
+      fixed.imageUsage = 0x10 /* VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT */;
+      use_ci = &fixed;
+      debugPrintf("[vulkan]   FIX: usage 0x%x -> 0x10 (COLOR_ATTACHMENT)\n", ci->imageUsage);
+    }
   } else {
     debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p, ci=NULL!)\n", (void*)dev);
   }
