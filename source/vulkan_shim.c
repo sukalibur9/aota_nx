@@ -287,12 +287,12 @@ trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const Vk
     debugPrintf("[vulkan]   preTransform=%d compositeAlpha=0x%x clipped=%d oldSwapchain=%p\n",
                 (int)ci->preTransform, ci->compositeAlpha, ci->clipped, (void*)ci->oldSwapchain);
     /* Build #56 fix: Unity passes VK_FORMAT_UNDEFINED (0). NVK rejects it.
-     * Substitute a widely-supported format. */
+     * Build #59: try RGBA (37) instead of BGRA (44) - Switch native may be RGBA. */
     if (ci->imageFormat == 0 /* VK_FORMAT_UNDEFINED */) {
       fixed = *ci;
-      fixed.imageFormat = 44 /* VK_FORMAT_B8G8R8A8_UNORM */;
+      fixed.imageFormat = 37 /* VK_FORMAT_R8G8B8A8_UNORM */;
       use_ci = &fixed;
-      debugPrintf("[vulkan]   FIX: format 0 -> 44 (B8G8R8A8_UNORM)\n");
+      debugPrintf("[vulkan]   FIX: format 0 -> 37 (R8G8B8A8_UNORM)\n");
     }
     /* Build #57 fix: NVK returns -8 (FEATURE_NOT_PRESENT) for usage=0x93.
      * Strip to COLOR_ATTACHMENT only, which all swapchains support. */
