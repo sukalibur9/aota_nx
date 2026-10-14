@@ -256,9 +256,18 @@ trace_GetPresentModes(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkPresen
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* al, VkSwapchainKHR* sc) {
-  debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p surf=%p w=%u h=%u)\n",
-              (void*)dev, (void*)(ci ? ci->surface : 0),
-              ci ? ci->imageExtent.width : 0, ci ? ci->imageExtent.height : 0);
+  if (ci) {
+    debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p surf=%p)\n", (void*)dev, (void*)ci->surface);
+    debugPrintf("[vulkan]   extent=%ux%u format=%d colorspace=%d presentMode=%d\n",
+                ci->imageExtent.width, ci->imageExtent.height,
+                (int)ci->imageFormat, (int)ci->imageColorSpace, (int)ci->presentMode);
+    debugPrintf("[vulkan]   imageCount=%u arrayLayers=%u usage=0x%x sharingMode=%d\n",
+                ci->minImageCount, ci->imageArrayLayers, ci->imageUsage, (int)ci->imageSharingMode);
+    debugPrintf("[vulkan]   preTransform=%d compositeAlpha=0x%x clipped=%d oldSwapchain=%p\n",
+                (int)ci->preTransform, ci->compositeAlpha, ci->clipped, (void*)ci->oldSwapchain);
+  } else {
+    debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p, ci=NULL!)\n", (void*)dev);
+  }
   VkResult r = g_real_CreateSwapchain(dev, ci, al, sc);
   debugPrintf("[vulkan] RET vkCreateSwapchainKHR = %d (swapchain=%p)\n", r, (void*)(sc ? *sc : 0));
   return r;
