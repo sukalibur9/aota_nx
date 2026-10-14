@@ -231,6 +231,14 @@ trace_GetSurfaceCaps(VkPhysicalDevice pd, VkSurfaceKHR s, VkSurfaceCapabilitiesK
               (void*)pd, (void*)s);
   VkResult r = g_real_GetSurfaceCaps(pd, s, caps);
   debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfaceCapabilitiesKHR = %d\n", r);
+  if (r == 0 && caps) {
+    debugPrintf("[vulkan]   caps: minImg=%u maxImg=%u curExtent=%ux%u\n",
+                caps->minImageCount, caps->maxImageCount,
+                caps->currentExtent.width, caps->currentExtent.height);
+    debugPrintf("[vulkan]   caps: maxExtent=%ux%u transform=0x%x alpha=0x%x usage=0x%x\n",
+                caps->maxImageExtent.width, caps->maxImageExtent.height,
+                caps->supportedTransforms, caps->supportedCompositeAlpha, caps->supportedUsageFlags);
+  }
   return r;
 }
 
@@ -241,6 +249,12 @@ trace_GetSurfaceFormats(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkSurf
   VkResult r = g_real_GetSurfaceFormats(pd, s, n, f);
   debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfaceFormatsKHR = %d (count=%u)\n",
               r, n ? *n : 0);
+  if (r == 0 && f && n) {
+    for (uint32_t i = 0; i < *n && i < 8; i++) {
+      debugPrintf("[vulkan]   format[%u]: format=%d colorspace=%d\n",
+                  i, (int)f[i].format, (int)f[i].colorSpace);
+    }
+  }
   return r;
 }
 
@@ -251,6 +265,11 @@ trace_GetPresentModes(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkPresen
   VkResult r = g_real_GetPresentModes(pd, s, n, m);
   debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfacePresentModesKHR = %d (count=%u)\n",
               r, n ? *n : 0);
+  if (r == 0 && m && n) {
+    for (uint32_t i = 0; i < *n && i < 8; i++) {
+      debugPrintf("[vulkan]   presentMode[%u]: %d\n", i, (int)m[i]);
+    }
+  }
   return r;
 }
 
