@@ -214,6 +214,9 @@ static PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_real_GetSurfaceCaps = NUL
 static PFN_vkGetPhysicalDeviceSurfaceFormatsKHR g_real_GetSurfaceFormats = NULL;
 static PFN_vkGetPhysicalDeviceSurfacePresentModesKHR g_real_GetPresentModes = NULL;
 static PFN_vkCreateSwapchainKHR g_real_CreateSwapchain = NULL;
+static PFN_vkGetSwapchainImagesKHR g_real_GetSwapchainImages = NULL;
+static PFN_vkAcquireNextImageKHR g_real_AcquireNextImage = NULL;
+static PFN_vkQueuePresentKHR g_real_QueuePresent = NULL;
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_GetSurfaceSupport(VkPhysicalDevice pd, uint32_t qi, VkSurfaceKHR s, VkBool32* sup) {
@@ -310,6 +313,35 @@ trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const Vk
   return r;
 }
 
+/* --- Build #60: trace swapchain image acquire/present --- */
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_GetSwapchainImages(VkDevice dev, VkSwapchainKHR sc, uint32_t* n, VkImage* imgs) {
+  debugPrintf("[vulkan] CALL vkGetSwapchainImagesKHR(dev=%p sc=%p)\n", (void*)dev, (void*)sc);
+  VkResult r = g_real_GetSwapchainImages(dev, sc, n, imgs);
+  debugPrintf("[vulkan] RET vkGetSwapchainImagesKHR = %d (count=%u)\n", r, n ? *n : 0);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_AcquireNextImage(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout,
+                       VkSemaphore sem, VkFence fence, uint32_t* idx) {
+  debugPrintf("[vulkan] CALL vkAcquireNextImageKHR(dev=%p sc=%p timeout=%llu)\n",
+              (void*)dev, (void*)sc, (unsigned long long)timeout);
+  VkResult r = g_real_AcquireNextImage(dev, sc, timeout, sem, fence, idx);
+  debugPrintf("[vulkan] RET vkAcquireNextImageKHR = %d (index=%u)\n", r, idx ? *idx : 999);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_QueuePresent(VkQueue q, const VkPresentInfoKHR* pi) {
+  uint32_t n = pi ? pi->swapchainCount : 0;
+  debugPrintf("[vulkan] CALL vkQueuePresentKHR(q=%p swapchains=%u)\n", (void*)q, n);
+  VkResult r = g_real_QueuePresent(q, pi);
+  debugPrintf("[vulkan] RET vkQueuePresentKHR = %d\n", r);
+  return r;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
   PFN_vkVoidFunction fn = shim_lookup(pName);
@@ -344,6 +376,21 @@ shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
       g_real_CreateSwapchain = (PFN_vkCreateSwapchainKHR)real;
       debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
       return (PFN_vkVoidFunction)trace_CreateSwapchain;
+    }
+    if (streq(pName, "vkGetSwapchainImagesKHR")) {
+      g_real_GetSwapchainImages = (PFN_vkGetSwapchainImagesKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetSwapchainImages;
+    }
+    if (streq(pName, "vkAcquireNextImageKHR")) {
+      g_real_AcquireNextImage = (PFN_vkAcquireNextImageKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_AcquireNextImage;
+    }
+    if (streq(pName, "vkQueuePresentKHR")) {
+      g_real_QueuePresent = (PFN_vkQueuePresentKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_QueuePresent;
     }
     // Log other surface/swapchain/device lookups to avoid spam
     if (strstr(pName, "Surface") || strstr(pName, "Swapchain") ||
