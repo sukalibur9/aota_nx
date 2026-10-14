@@ -256,6 +256,8 @@ trace_GetPresentModes(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkPresen
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* al, VkSwapchainKHR* sc) {
+  VkSwapchainCreateInfoKHR fixed;
+  const VkSwapchainCreateInfoKHR* use_ci = ci;
   if (ci) {
     debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p surf=%p)\n", (void*)dev, (void*)ci->surface);
     debugPrintf("[vulkan]   extent=%ux%u format=%d colorspace=%d presentMode=%d\n",
@@ -265,10 +267,18 @@ trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const Vk
                 ci->minImageCount, ci->imageArrayLayers, ci->imageUsage, (int)ci->imageSharingMode);
     debugPrintf("[vulkan]   preTransform=%d compositeAlpha=0x%x clipped=%d oldSwapchain=%p\n",
                 (int)ci->preTransform, ci->compositeAlpha, ci->clipped, (void*)ci->oldSwapchain);
+    /* Build #56 fix: Unity passes VK_FORMAT_UNDEFINED (0). NVK rejects it.
+     * Substitute a widely-supported format. */
+    if (ci->imageFormat == 0 /* VK_FORMAT_UNDEFINED */) {
+      fixed = *ci;
+      fixed.imageFormat = 44 /* VK_FORMAT_B8G8R8A8_UNORM */;
+      use_ci = &fixed;
+      debugPrintf("[vulkan]   FIX: format 0 -> 44 (B8G8R8A8_UNORM)\n");
+    }
   } else {
     debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p, ci=NULL!)\n", (void*)dev);
   }
-  VkResult r = g_real_CreateSwapchain(dev, ci, al, sc);
+  VkResult r = g_real_CreateSwapchain(dev, use_ci, al, sc);
   debugPrintf("[vulkan] RET vkCreateSwapchainKHR = %d (swapchain=%p)\n", r, (void*)(sc ? *sc : 0));
   return r;
 }
