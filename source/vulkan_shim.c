@@ -342,6 +342,63 @@ trace_QueuePresent(VkQueue q, const VkPresentInfoKHR* pi) {
   return r;
 }
 
+/* --- Build #61: trace device-level rendering functions --- */
+
+static PFN_vkQueueSubmit g_real_QueueSubmit = NULL;
+static PFN_vkCreateShaderModule g_real_CreateShaderModule = NULL;
+static PFN_vkCreateGraphicsPipelines g_real_CreateGraphicsPipelines = NULL;
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
+  debugPrintf("[vulkan] CALL vkQueueSubmit(q=%p count=%u)\n", (void*)q, n);
+  VkResult r = g_real_QueueSubmit(q, n, si, f);
+  debugPrintf("[vulkan] RET vkQueueSubmit = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo* ci,
+                         const VkAllocationCallbacks* al, VkShaderModule* m) {
+  debugPrintf("[vulkan] CALL vkCreateShaderModule(dev=%p codeSize=%u)\n",
+              (void*)dev, ci ? (uint32_t)ci->codeSize : 0);
+  VkResult r = g_real_CreateShaderModule(dev, ci, al, m);
+  debugPrintf("[vulkan] RET vkCreateShaderModule = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache pc, uint32_t n,
+                              const VkGraphicsPipelineCreateInfo* ci,
+                              const VkAllocationCallbacks* al, VkPipeline* p) {
+  debugPrintf("[vulkan] CALL vkCreateGraphicsPipelines(dev=%p count=%u)\n", (void*)dev, n);
+  VkResult r = g_real_CreateGraphicsPipelines(dev, pc, n, ci, al, p);
+  debugPrintf("[vulkan] RET vkCreateGraphicsPipelines = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
+  PFN_vkVoidFunction real = vkGetDeviceProcAddr(dev, pName);
+  if (pName) {
+    if (streq(pName, "vkQueueSubmit")) {
+      g_real_QueueSubmit = (PFN_vkQueueSubmit)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_QueueSubmit;
+    }
+    if (streq(pName, "vkCreateShaderModule")) {
+      g_real_CreateShaderModule = (PFN_vkCreateShaderModule)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateShaderModule;
+    }
+    if (streq(pName, "vkCreateGraphicsPipelines")) {
+      g_real_CreateGraphicsPipelines = (PFN_vkCreateGraphicsPipelines)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateGraphicsPipelines;
+    }
+  }
+  return real;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
   PFN_vkVoidFunction fn = shim_lookup(pName);
@@ -414,7 +471,7 @@ void* vulkan_shim_resolve(const char* symbol) {
   PFN_vkVoidFunction fn = shim_lookup(symbol);
   if (fn == NULL) {
     if (streq(symbol, "vkGetDeviceProcAddr"))
-      fn = (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+      fn = (PFN_vkVoidFunction)shim_GetDeviceProcAddr;
     else if (streq(symbol, "vkEnumerateInstanceLayerProperties"))
       fn = (PFN_vkVoidFunction)vkEnumerateInstanceLayerProperties;
     else if (streq(symbol, "vkEnumerateInstanceVersion"))
