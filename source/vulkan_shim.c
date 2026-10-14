@@ -205,6 +205,65 @@ static PFN_vkVoidFunction shim_lookup(const char* name) {
   return NULL;
 }
 
+/* --- Call-tracing wrappers for surface functions (build #54) ---
+ * Wrap NVK surface entry points to log the CALL (not just the lookup).
+ * If Unity crashes inside one of these, the last log line identifies it. */
+
+static PFN_vkGetPhysicalDeviceSurfaceSupportKHR g_real_GetSurfaceSupport = NULL;
+static PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_real_GetSurfaceCaps = NULL;
+static PFN_vkGetPhysicalDeviceSurfaceFormatsKHR g_real_GetSurfaceFormats = NULL;
+static PFN_vkGetPhysicalDeviceSurfacePresentModesKHR g_real_GetPresentModes = NULL;
+static PFN_vkCreateSwapchainKHR g_real_CreateSwapchain = NULL;
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_GetSurfaceSupport(VkPhysicalDevice pd, uint32_t qi, VkSurfaceKHR s, VkBool32* sup) {
+  debugPrintf("[vulkan] CALL vkGetPhysicalDeviceSurfaceSupportKHR(pd=%p qi=%u surf=%p)\n",
+              (void*)pd, qi, (void*)s);
+  VkResult r = g_real_GetSurfaceSupport(pd, qi, s, sup);
+  debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfaceSupportKHR = %d (supported=%d)\n",
+              r, sup ? *sup : -1);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_GetSurfaceCaps(VkPhysicalDevice pd, VkSurfaceKHR s, VkSurfaceCapabilitiesKHR* caps) {
+  debugPrintf("[vulkan] CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd=%p surf=%p)\n",
+              (void*)pd, (void*)s);
+  VkResult r = g_real_GetSurfaceCaps(pd, s, caps);
+  debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfaceCapabilitiesKHR = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_GetSurfaceFormats(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkSurfaceFormatKHR* f) {
+  debugPrintf("[vulkan] CALL vkGetPhysicalDeviceSurfaceFormatsKHR(pd=%p surf=%p)\n",
+              (void*)pd, (void*)s);
+  VkResult r = g_real_GetSurfaceFormats(pd, s, n, f);
+  debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfaceFormatsKHR = %d (count=%u)\n",
+              r, n ? *n : 0);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_GetPresentModes(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t* n, VkPresentModeKHR* m) {
+  debugPrintf("[vulkan] CALL vkGetPhysicalDeviceSurfacePresentModesKHR(pd=%p surf=%p)\n",
+              (void*)pd, (void*)s);
+  VkResult r = g_real_GetPresentModes(pd, s, n, m);
+  debugPrintf("[vulkan] RET vkGetPhysicalDeviceSurfacePresentModesKHR = %d (count=%u)\n",
+              r, n ? *n : 0);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* al, VkSwapchainKHR* sc) {
+  debugPrintf("[vulkan] CALL vkCreateSwapchainKHR(dev=%p surf=%p w=%u h=%u)\n",
+              (void*)dev, (void*)(ci ? ci->surface : 0),
+              ci ? ci->imageExtent.width : 0, ci ? ci->imageExtent.height : 0);
+  VkResult r = g_real_CreateSwapchain(dev, ci, al, sc);
+  debugPrintf("[vulkan] RET vkCreateSwapchainKHR = %d (swapchain=%p)\n", r, (void*)(sc ? *sc : 0));
+  return r;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
   PFN_vkVoidFunction fn = shim_lookup(pName);
@@ -213,10 +272,38 @@ shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
     return fn;
   }
   PFN_vkVoidFunction real = vkGetInstanceProcAddr(instance, pName);
-  // Log only surface/swapchain/device-related lookups to avoid spam
-  if (pName && (strstr(pName, "Surface") || strstr(pName, "Swapchain") ||
-                strstr(pName, "Device") || strstr(pName, "PhysicalDevice"))) {
-    debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> NVK %p\n", pName, real);
+  // Intercept surface/swapchain calls with tracing wrappers (build #54)
+  if (pName) {
+    if (streq(pName, "vkGetPhysicalDeviceSurfaceSupportKHR")) {
+      g_real_GetSurfaceSupport = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetSurfaceSupport;
+    }
+    if (streq(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) {
+      g_real_GetSurfaceCaps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetSurfaceCaps;
+    }
+    if (streq(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR")) {
+      g_real_GetSurfaceFormats = (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetSurfaceFormats;
+    }
+    if (streq(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR")) {
+      g_real_GetPresentModes = (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetPresentModes;
+    }
+    if (streq(pName, "vkCreateSwapchainKHR")) {
+      g_real_CreateSwapchain = (PFN_vkCreateSwapchainKHR)real;
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateSwapchain;
+    }
+    // Log other surface/swapchain/device lookups to avoid spam
+    if (strstr(pName, "Surface") || strstr(pName, "Swapchain") ||
+        strstr(pName, "Device") || strstr(pName, "PhysicalDevice")) {
+      debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> NVK %p\n", pName, real);
+    }
   }
   return real;
 }
