@@ -375,6 +375,19 @@ trace_AcquireNextImage(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout,
               (void*)dev, (void*)sc, (unsigned long long)timeout);
   VkResult r = g_real_AcquireNextImage(dev, sc, timeout, sem, fence, idx);
   debugPrintf("[vulkan] RET vkAcquireNextImageKHR = %d (index=%u)\n", r, idx ? *idx : 999);
+  /* Build #67 diagnostic: try dummy present to see if Unity unblocks */
+  if (r == 0 && g_cached_queue && idx) {
+    VkPresentInfoKHR pi;
+    memset(&pi, 0, sizeof(pi));
+    pi.sType = 1000001001; /* VK_STRUCTURE_TYPE_PRESENT_INFO_KHR */
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &sc;
+    pi.pImageIndices = idx;
+    debugPrintf("[vulkan] DIAG: attempting dummy vkQueuePresentKHR(q=%p sc=%p idx=%u)\n",
+                (void*)g_cached_queue, (void*)sc, *idx);
+    VkResult pr = g_real_QueuePresent(g_cached_queue, &pi);
+    debugPrintf("[vulkan] DIAG: dummy present returned %d\n", pr);
+  }
   return r;
 }
 
@@ -402,6 +415,9 @@ static PFN_vkResetFences g_real_ResetFences = NULL;
 static PFN_vkCreateSemaphore g_real_CreateSemaphore = NULL;
 static PFN_vkAllocateCommandBuffers g_real_AllocCmdBufs = NULL;
 static PFN_vkBeginCommandBuffer g_real_BeginCmdBuf = NULL;
+/* Build #67: dummy present test */
+static PFN_vkGetDeviceQueue g_real_GetDeviceQueue = NULL;
+static VkQueue g_cached_queue = NULL;
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
@@ -517,6 +533,16 @@ trace_BeginCmdBuf(VkCommandBuffer b, const VkCommandBufferBeginInfo* bi) {
   return r;
 }
 
+/* --- Build #67: dummy present diagnostic --- */
+
+static VKAPI_ATTR void VKAPI_CALL
+trace_GetDeviceQueue(VkDevice dev, uint32_t qfi, uint32_t qi, VkQueue* q) {
+  debugPrintf("[vulkan] CALL vkGetDeviceQueue(dev=%p)\n", (void*)dev);
+  g_real_GetDeviceQueue(dev, qfi, qi, q);
+  g_cached_queue = q ? *q : NULL;
+  debugPrintf("[vulkan] RET vkGetDeviceQueue (queue=%p, cached)\n", (void*)g_cached_queue);
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
   PFN_vkVoidFunction real = vkGetDeviceProcAddr(dev, pName);
@@ -581,6 +607,12 @@ shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
       g_real_BeginCmdBuf = (PFN_vkBeginCommandBuffer)real;
       debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
       return (PFN_vkVoidFunction)trace_BeginCmdBuf;
+    }
+    /* Build #67: capture queue for dummy present test */
+    if (streq(pName, "vkGetDeviceQueue")) {
+      g_real_GetDeviceQueue = (PFN_vkGetDeviceQueue)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_GetDeviceQueue;
     }
   }
   return real;
