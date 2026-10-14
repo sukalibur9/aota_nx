@@ -591,19 +591,19 @@ int open_fake(const char *path, int flags, ...) {
       int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
       if (wfd >= 0) { if (write(wfd, rbuf, sizeof rbuf) < 0) { /* best effort */ } close(wfd); }
       int rfd = open(tf, O_RDONLY);
-      debugPrintf("[io] open(%s,0x%x) -> %d [urandom]\n", path, flags, rfd);
+      debugPrintf("[io] open(%s,0x%x) -> %d [urandom] tid=%d\n", path, flags, rfd, gettid_fake());
       return rfd;
     }
     // synthetic /proc, /sys (incl. self/maps)
     int sfd = synth_proc_open(path);
-    if (sfd >= 0) { debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); return sfd; }
+    if (sfd >= 0) { debugPrintf("[io] open(%s,0x%x) -> %d [synthetic] tid=%d\n", path, flags, sfd, gettid_fake()); return sfd; }
   }
   if (!writing) {
     /* Packed assets win over the filesystem: after the first boot the loose
      * tree is gone and this is the only place the data exists. */
     int packed_fd = asset_pack_open_path(path);
     if (packed_fd >= 0) {
-      debugPrintf("[io] open(%s,0x%x) -> %d [pack]\n", path, flags, packed_fd);
+      debugPrintf("[io] open(%s,0x%x) -> %d [pack] tid=%d\n", path, flags, packed_fd, gettid_fake());
       return packed_fd;
     }
   }
@@ -622,14 +622,14 @@ int open_fake(const char *path, int flags, ...) {
     rc_mark(fd, ((flags & 3) == 0));      /* cache read-only files only */
     struct stat _st;
     if (fstat(fd, &_st) == 0)
-      debugPrintf("[io] open(%s,0x%x) -> %d size=%lld\n", path, flags, fd, (long long)_st.st_size);
+      debugPrintf("[io] open(%s,0x%x) -> %d size=%lld tid=%d\n", path, flags, fd, (long long)_st.st_size, gettid_fake());
     else
-      debugPrintf("[io] open(%s,0x%x) -> %d size=?\n", path, flags, fd);
+      debugPrintf("[io] open(%s,0x%x) -> %d size=? tid=%d\n", path, flags, fd, gettid_fake());
 #if TRACE_BUNDLE_IO
     if (strstr(path, "data.unity3d")) { g_watch_fd = fd; debugPrintf("[io] >>> watching fd=%d (data.unity3d)\n", fd); }
 #endif
   } else {
-    debugPrintf("[io] open(%s,0x%x) -> %d\n", path, flags, fd);
+    debugPrintf("[io] open(%s,0x%x) -> %d tid=%d\n", path, flags, fd, gettid_fake());
   }
   return fd;
 }
@@ -1302,6 +1302,23 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   (void)addr; (void)prot;
   if (length == 0) length = 1;
 
+  /* RADICAL SIMPLIFICATION (build #50): Bypass arena/OC entirely for anonymous
+   * mappings. Use newlib malloc directly via mmap_fallback. This eliminates
+   * the complex arena/overcommit logic as a potential source of heap corruption.
+   * File-backed mappings still use the arena path (needed for correct file I/O).
+   * MAP_FIXED still handled below for compatibility. */
+  if ((flags & BIONIC_MAP_ANONYMOUS) && !((flags & BIONIC_MAP_FIXED) && addr)) {
+    void *p = mmap_fallback(length, flags, fd, offset);
+    if (p) {
+      if (length >= (4u << 20))
+        debugPrintf("[mmap] RADICAL anon %u MB -> %p [newlib direct]\n",
+                    (unsigned)(length >> 20), p);
+      return p;
+    }
+    // Fall through to arena path if newlib fails (unlikely)
+    debugPrintf("[mmap] RADICAL newlib failed for %zu bytes, trying arena\n", length);
+  }
+
   if ((flags & BIONIC_MAP_FIXED) && addr && (flags & BIONIC_MAP_ANONYMOUS)) {
     static unsigned fixed_n = 0;
     if (oc_contains(addr)) {
@@ -1579,7 +1596,7 @@ FILE *fopen_fake(const char *path, const char *mode) {
     void *data = NULL; size_t size = 0;
     if (asset_pack_read_all_path(path, &data, &size)) {
       FILE *pf = fmemopen_locked(data, size ? size : 1, "r");
-      if (pf) { debugPrintf("[io] fopen(%s,%s) -> %p [pack]\n", path, mode, (void *)pf); return pf; }
+      if (pf) { debugPrintf("[io] fopen(%s,%s) -> %p [pack] tid=%d\n", path, mode, (void *)pf); return pf; }
       free(data);
     }
   }
