@@ -208,8 +208,17 @@ static PFN_vkVoidFunction shim_lookup(const char* name) {
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetInstanceProcAddr(VkInstance instance, const char* pName) {
   PFN_vkVoidFunction fn = shim_lookup(pName);
-  if (fn != NULL) return fn;
-  return vkGetInstanceProcAddr(instance, pName);
+  if (fn != NULL) {
+    debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> SHIM %p\n", pName, fn);
+    return fn;
+  }
+  PFN_vkVoidFunction real = vkGetInstanceProcAddr(instance, pName);
+  // Log only surface/swapchain/device-related lookups to avoid spam
+  if (pName && (strstr(pName, "Surface") || strstr(pName, "Swapchain") ||
+                strstr(pName, "Device") || strstr(pName, "PhysicalDevice"))) {
+    debugPrintf("[vulkan] GetInstanceProcAddr(%s) -> NVK %p\n", pName, real);
+  }
+  return real;
 }
 
 /* ---------------------------------------------------------------------------
