@@ -350,6 +350,13 @@ static PFN_vkCreateGraphicsPipelines g_real_CreateGraphicsPipelines = NULL;
 static PFN_vkCreateImageView g_real_CreateImageView = NULL;
 static PFN_vkCreateFramebuffer g_real_CreateFramebuffer = NULL;
 static PFN_vkCreateRenderPass g_real_CreateRenderPass = NULL;
+/* Build #65 */
+static PFN_vkCreateFence g_real_CreateFence = NULL;
+static PFN_vkWaitForFences g_real_WaitForFences = NULL;
+static PFN_vkResetFences g_real_ResetFences = NULL;
+static PFN_vkCreateSemaphore g_real_CreateSemaphore = NULL;
+static PFN_vkAllocateCommandBuffers g_real_AllocCmdBufs = NULL;
+static PFN_vkBeginCommandBuffer g_real_BeginCmdBuf = NULL;
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
@@ -410,6 +417,61 @@ trace_CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo* ci,
   return rr;
 }
 
+/* --- Build #65: trace sync and command buffer functions --- */
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateFence(VkDevice dev, const VkFenceCreateInfo* ci,
+                  const VkAllocationCallbacks* al, VkFence* f) {
+  debugPrintf("[vulkan] CALL vkCreateFence(dev=%p)\n", (void*)dev);
+  VkResult r = g_real_CreateFence(dev, ci, al, f);
+  debugPrintf("[vulkan] RET vkCreateFence = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_WaitForFences(VkDevice dev, uint32_t n, const VkFence* f,
+                    VkBool32 waitAll, uint64_t timeout) {
+  debugPrintf("[vulkan] CALL vkWaitForFences(dev=%p count=%u)\n", (void*)dev, n);
+  VkResult r = g_real_WaitForFences(dev, n, f, waitAll, timeout);
+  debugPrintf("[vulkan] RET vkWaitForFences = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_ResetFences(VkDevice dev, uint32_t n, const VkFence* f) {
+  debugPrintf("[vulkan] CALL vkResetFences(dev=%p count=%u)\n", (void*)dev, n);
+  VkResult r = g_real_ResetFences(dev, n, f);
+  debugPrintf("[vulkan] RET vkResetFences = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateSemaphore(VkDevice dev, const VkSemaphoreCreateInfo* ci,
+                      const VkAllocationCallbacks* al, VkSemaphore* s) {
+  debugPrintf("[vulkan] CALL vkCreateSemaphore(dev=%p)\n", (void*)dev);
+  VkResult r = g_real_CreateSemaphore(dev, ci, al, s);
+  debugPrintf("[vulkan] RET vkCreateSemaphore = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_AllocCmdBufs(VkDevice dev, const VkCommandBufferAllocateInfo* ci,
+                   VkCommandBuffer* b) {
+  debugPrintf("[vulkan] CALL vkAllocateCommandBuffers(dev=%p count=%u)\n",
+              (void*)dev, ci ? ci->commandBufferCount : 0);
+  VkResult r = g_real_AllocCmdBufs(dev, ci, b);
+  debugPrintf("[vulkan] RET vkAllocateCommandBuffers = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_BeginCmdBuf(VkCommandBuffer b, const VkCommandBufferBeginInfo* bi) {
+  debugPrintf("[vulkan] CALL vkBeginCommandBuffer(buf=%p)\n", (void*)b);
+  VkResult r = g_real_BeginCmdBuf(b, bi);
+  debugPrintf("[vulkan] RET vkBeginCommandBuffer = %d\n", r);
+  return r;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
   PFN_vkVoidFunction real = vkGetDeviceProcAddr(dev, pName);
@@ -443,6 +505,37 @@ shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
       g_real_CreateRenderPass = (PFN_vkCreateRenderPass)real;
       debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
       return (PFN_vkVoidFunction)trace_CreateRenderPass;
+    }
+    /* Build #65: sync and command buffer */
+    if (streq(pName, "vkCreateFence")) {
+      g_real_CreateFence = (PFN_vkCreateFence)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateFence;
+    }
+    if (streq(pName, "vkWaitForFences")) {
+      g_real_WaitForFences = (PFN_vkWaitForFences)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_WaitForFences;
+    }
+    if (streq(pName, "vkResetFences")) {
+      g_real_ResetFences = (PFN_vkResetFences)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_ResetFences;
+    }
+    if (streq(pName, "vkCreateSemaphore")) {
+      g_real_CreateSemaphore = (PFN_vkCreateSemaphore)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateSemaphore;
+    }
+    if (streq(pName, "vkAllocateCommandBuffers")) {
+      g_real_AllocCmdBufs = (PFN_vkAllocateCommandBuffers)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_AllocCmdBufs;
+    }
+    if (streq(pName, "vkBeginCommandBuffer")) {
+      g_real_BeginCmdBuf = (PFN_vkBeginCommandBuffer)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_BeginCmdBuf;
     }
   }
   return real;
