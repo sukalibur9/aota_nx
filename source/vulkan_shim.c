@@ -262,6 +262,8 @@ static PFN_vkCreateSwapchainKHR g_real_CreateSwapchain = NULL;
 static PFN_vkGetSwapchainImagesKHR g_real_GetSwapchainImages = NULL;
 static PFN_vkAcquireNextImageKHR g_real_AcquireNextImage = NULL;
 static PFN_vkQueuePresentKHR g_real_QueuePresent = NULL;
+/* Build #67: dummy present test - queue cache declared here for early use */
+static VkQueue g_cached_queue = NULL;
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_GetSurfaceSupport(VkPhysicalDevice pd, uint32_t qi, VkSurfaceKHR s, VkBool32* sup) {
@@ -417,7 +419,7 @@ static PFN_vkAllocateCommandBuffers g_real_AllocCmdBufs = NULL;
 static PFN_vkBeginCommandBuffer g_real_BeginCmdBuf = NULL;
 /* Build #67: dummy present test */
 static PFN_vkGetDeviceQueue g_real_GetDeviceQueue = NULL;
-static VkQueue g_cached_queue = NULL;
+/* g_cached_queue already declared above */
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
