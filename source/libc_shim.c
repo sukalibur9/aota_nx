@@ -1286,7 +1286,10 @@ static void mmap_arena_free(void *addr, size_t len) {
 // ---------------------------------------------------------------------------
 #define MMAP_FALLBACK_MAX 4096
 #ifndef MMAP_FB_SHRINK
-#define MMAP_FB_SHRINK 1                      /* give a munmap'ed tail back to newlib */
+#define MMAP_FB_SHRINK 0                      /* 2026-10-14: disabled for build #52.
+                                                 realloc-shrink moved the block on hardware
+                                                 (fatal in build #51 log). Keep the tail
+                                                 allocated; wastes some RAM but safe. */
 #endif
 #define MMAP_FB_SHRINK_MIN ((size_t)1024 * 1024)   /* ignore smaller tails */
 
