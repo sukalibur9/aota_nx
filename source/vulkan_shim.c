@@ -347,6 +347,9 @@ trace_QueuePresent(VkQueue q, const VkPresentInfoKHR* pi) {
 static PFN_vkQueueSubmit g_real_QueueSubmit = NULL;
 static PFN_vkCreateShaderModule g_real_CreateShaderModule = NULL;
 static PFN_vkCreateGraphicsPipelines g_real_CreateGraphicsPipelines = NULL;
+static PFN_vkCreateImageView g_real_CreateImageView = NULL;
+static PFN_vkCreateFramebuffer g_real_CreateFramebuffer = NULL;
+static PFN_vkCreateRenderPass g_real_CreateRenderPass = NULL;
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
@@ -376,6 +379,37 @@ trace_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache pc, uint32_t n,
   return r;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateImageView(VkDevice dev, const VkImageViewCreateInfo* ci,
+                      const VkAllocationCallbacks* al, VkImageView* v) {
+  debugPrintf("[vulkan] CALL vkCreateImageView(dev=%p format=%d)\n",
+              (void*)dev, ci ? (int)ci->format : -1);
+  VkResult r = g_real_CreateImageView(dev, ci, al, v);
+  debugPrintf("[vulkan] RET vkCreateImageView = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo* ci,
+                        const VkAllocationCallbacks* al, VkFramebuffer* f) {
+  debugPrintf("[vulkan] CALL vkCreateFramebuffer(dev=%p attachments=%u w=%u h=%u)\n",
+              (void*)dev, ci ? ci->attachmentCount : 0,
+              ci ? ci->width : 0, ci ? ci->height : 0);
+  VkResult r = g_real_CreateFramebuffer(dev, ci, al, f);
+  debugPrintf("[vulkan] RET vkCreateFramebuffer = %d\n", r);
+  return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+trace_CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo* ci,
+                       const VkAllocationCallbacks* al, VkRenderPass* r) {
+  debugPrintf("[vulkan] CALL vkCreateRenderPass(dev=%p attachments=%u)\n",
+              (void*)dev, ci ? ci->attachmentCount : 0);
+  VkResult rr = g_real_CreateRenderPass(dev, ci, al, r);
+  debugPrintf("[vulkan] RET vkCreateRenderPass = %d\n", rr);
+  return rr;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
   PFN_vkVoidFunction real = vkGetDeviceProcAddr(dev, pName);
@@ -394,6 +428,21 @@ shim_GetDeviceProcAddr(VkDevice dev, const char* pName) {
       g_real_CreateGraphicsPipelines = (PFN_vkCreateGraphicsPipelines)real;
       debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
       return (PFN_vkVoidFunction)trace_CreateGraphicsPipelines;
+    }
+    if (streq(pName, "vkCreateImageView")) {
+      g_real_CreateImageView = (PFN_vkCreateImageView)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateImageView;
+    }
+    if (streq(pName, "vkCreateFramebuffer")) {
+      g_real_CreateFramebuffer = (PFN_vkCreateFramebuffer)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateFramebuffer;
+    }
+    if (streq(pName, "vkCreateRenderPass")) {
+      g_real_CreateRenderPass = (PFN_vkCreateRenderPass)real;
+      debugPrintf("[vulkan] GetDeviceProcAddr(%s) -> TRACE_WRAPPER\n", pName);
+      return (PFN_vkVoidFunction)trace_CreateRenderPass;
     }
   }
   return real;
