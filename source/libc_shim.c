@@ -591,19 +591,19 @@ int open_fake(const char *path, int flags, ...) {
       int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
       if (wfd >= 0) { if (write(wfd, rbuf, sizeof rbuf) < 0) { /* best effort */ } close(wfd); }
       int rfd = open(tf, O_RDONLY);
-      debugPrintf("[io] open(%s,0x%x) -> %d [urandom] tid=%d\n", path, flags, rfd, gettid_fake());
+      debugPrintf("[io] open(%s,0x%x) -> %d [urandom]\n", path, flags, rfd);
       return rfd;
     }
     // synthetic /proc, /sys (incl. self/maps)
     int sfd = synth_proc_open(path);
-    if (sfd >= 0) { debugPrintf("[io] open(%s,0x%x) -> %d [synthetic] tid=%d\n", path, flags, sfd, gettid_fake()); return sfd; }
+    if (sfd >= 0) { debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); return sfd; }
   }
   if (!writing) {
     /* Packed assets win over the filesystem: after the first boot the loose
      * tree is gone and this is the only place the data exists. */
     int packed_fd = asset_pack_open_path(path);
     if (packed_fd >= 0) {
-      debugPrintf("[io] open(%s,0x%x) -> %d [pack] tid=%d\n", path, flags, packed_fd, gettid_fake());
+      debugPrintf("[io] open(%s,0x%x) -> %d [pack]\n", path, flags, packed_fd);
       return packed_fd;
     }
   }
@@ -622,14 +622,14 @@ int open_fake(const char *path, int flags, ...) {
     rc_mark(fd, ((flags & 3) == 0));      /* cache read-only files only */
     struct stat _st;
     if (fstat(fd, &_st) == 0)
-      debugPrintf("[io] open(%s,0x%x) -> %d size=%lld tid=%d\n", path, flags, fd, (long long)_st.st_size, gettid_fake());
+      debugPrintf("[io] open(%s,0x%x) -> %d size=%lld\n", path, flags, fd, (long long)_st.st_size);
     else
-      debugPrintf("[io] open(%s,0x%x) -> %d size=? tid=%d\n", path, flags, fd, gettid_fake());
+      debugPrintf("[io] open(%s,0x%x) -> %d size=?\n", path, flags, fd);
 #if TRACE_BUNDLE_IO
     if (strstr(path, "data.unity3d")) { g_watch_fd = fd; debugPrintf("[io] >>> watching fd=%d (data.unity3d)\n", fd); }
 #endif
   } else {
-    debugPrintf("[io] open(%s,0x%x) -> %d tid=%d\n", path, flags, fd, gettid_fake());
+    debugPrintf("[io] open(%s,0x%x) -> %d\n", path, flags, fd);
   }
   return fd;
 }
@@ -821,6 +821,21 @@ extern u64    g_alias_base, g_alias_size;
 #define BIONIC_MAP_FIXED     0x10
 #define MMAP_PAGE       0x1000u
 #define MMAP_BIG_ALIGN  MMAP_ARENA_ALIGN
+/* Alignment Baselib_Memory_AllocatePages asks for after the libunity "region granularity
+ * 256MB->64MB" patch. A reservation then looks like mmap(size + 64MB - 4KB). */
+#ifndef MMAP_UNITY_ALIGN
+#define MMAP_UNITY_ALIGN ((size_t)64 * 1024 * 1024)
+#endif
+/* Pages Unity keeps out of an over-map of `len` bytes: len = size + align - PAGE with
+ * align == MMAP_UNITY_ALIGN. Any other length is NOT treated as an over-map (we then
+ * assume the caller keeps all of it), so the "tail slot" trick below can never hand out
+ * a slot that is smaller than what Unity will really use. */
+static size_t mmap_overmap_kept_pages(size_t need_pages, size_t len) {
+  const size_t ua = MMAP_UNITY_ALIGN / MMAP_PAGE;
+  if (((len + MMAP_PAGE) % MMAP_UNITY_ALIGN) == 0 && len + MMAP_PAGE >= 2 * MMAP_UNITY_ALIGN)
+    return need_pages + 1 - ua;
+  return need_pages;
+}
 #define MMAP_BIG_THRESH ((size_t)64 * 1024 * 1024)
 #define BIONIC_PROT_NONE 0x0
 #define BIONIC_PROT_WRITE 0x2
@@ -947,7 +962,7 @@ static void arena_dontneed_range(void *addr, size_t len) {
 // heap-backed arena, so if OC setup fails the engine runs exactly as before.
 // Because decommits are never observed, the pool is a no-reclaim bump allocator.
 // ===========================================================================
-#define OC_NWIN 2
+#define OC_NWIN 6   /* was 2: extra stack-region holes can be added with oc_arena_add_window() */
 #define OC_NOSRC 0xFFFFFFFFu
 typedef struct {
   uint8_t  *base;               // window base (64MB-aligned)
@@ -1019,7 +1034,9 @@ static void *oc_alloc_locked(size_t len, size_t *got) {
   *got = 0;
   size_t need = (len + MMAP_PAGE - 1) / MMAP_PAGE; if (!need) need = 1;
   const size_t step = MMAP_BIG_ALIGN / MMAP_PAGE;
-  size_t kept = need > step ? need - step : need;
+  /* 2026-10-14: was `need > step ? need - step : need` (assumed a 256MB alignment slack, so a
+   * 319MB over-map "kept" only 64MB and a 100MB tail hole was accepted for a 256MB block). */
+  size_t kept = mmap_overmap_kept_pages(need, len);
   for (int w = 0; w < oc_nwin; w++) {                          // pass 1: full over-map fits
     OcWin *W = &oc_win[w];
     for (size_t i = 0; i + need <= W->pages; i += step) {
@@ -1189,7 +1206,7 @@ static void *mmap_arena_alloc_locked(size_t len, size_t *got) {
   if (!need) need = 1;
   if (len >= MMAP_BIG_THRESH) {
     const size_t step = MMAP_BIG_ALIGN / MMAP_PAGE;   // 256MB in pages
-    size_t kept = need > step ? need - step : need;   // pages Unity actually keeps
+    size_t kept = mmap_overmap_kept_pages(need, len); // pages Unity actually keeps (see above)
     // pass 1: full over-map fits within the arena (normal case for all but the last slot)
     for (size_t i = 0; i + need <= mmap_pages; i += step) {
       size_t run = 0;
@@ -1242,27 +1259,163 @@ static void mmap_arena_free(void *addr, size_t len) {
   mutexUnlock(&g_mmap_lock);
 }
 
-// Stopgap: when the 256MB-block arena is exhausted by Unity's 9 pools, small
-// (sub-threshold) il2cpp/GC mmaps still need to land somewhere. Serve them from
-// newlib's free heap via memalign and track each so munmap can free it. This is
-// not real overcommit (it consumes physical newlib heap), but it unblocks the
-// sub-1MB il2cpp allocations that were failing and surfaces il2cpp's true mmap
-// appetite in the log to size the proper fix.
+// ---------------------------------------------------------------------------
+// Heap-backed fallback maps -- last resort when the OC windows and the arena are
+// both full.
+//
+// 2026-10-14 FIX.  The old version handed each mmap to memalign() and free()d the
+// WHOLE block on the first munmap whose address equalled the block base.  That is
+// exactly what Baselib_Memory_AllocatePages does to every aligned reservation:
+//     p = mmap(size + align - 4KB);   a = AlignUp(p, align);
+//     munmap(p, a - p);               <- HEAD trim, addr == base  => whole block freed
+//     munmap(a + size, tail);         <- TAIL trim
+// Unity kept [a, a+size) while newlib handed the same bytes out again.  In debug.log
+// four "fallback" maps (319/319/127/127 MB) all came back as 0x9469d6000, i.e. four
+// Unity allocators owned the same region: zeroed TLSF free-list links and vtable
+// pointers (the crashes at libunity+0x124400c / +0x1244014 / +0x122b004), and later a
+// circular block list the main thread walks forever (libunity+0x122b1fc..0x122b218,
+// "no frame progress").
+//
+// Rules now:
+//  * a block stays allocated until EVERY page of it has been munmap'ed (page bitmap);
+//  * big maps (>= MMAP_BIG_THRESH) are MMAP_UNITY_ALIGN-aligned, so Baselib has no head
+//    to trim;
+//  * a munmap'ed tail is handed back to newlib (realloc shrink, in place) so a 256MB
+//    reservation only costs what Unity really keeps;
+//  * MAP_FIXED on a fallback range is served in place.
+// ---------------------------------------------------------------------------
 #define MMAP_FALLBACK_MAX 4096
-static struct { void *ptr; size_t len; } g_fb[MMAP_FALLBACK_MAX];
-static int   g_fb_n = 0;
-static size_t g_fb_bytes = 0;
-static Mutex g_fb_lock;
+#ifndef MMAP_FB_SHRINK
+#define MMAP_FB_SHRINK 1                      /* give a munmap'ed tail back to newlib */
+#endif
+#define MMAP_FB_SHRINK_MIN ((size_t)1024 * 1024)   /* ignore smaller tails */
+
+typedef struct {
+  uint8_t  *ptr;    /* block start == address returned to the caller (memalign result) */
+  size_t    len;    /* bytes still owned (page multiple; shrinks when a tail is released) */
+  size_t    live;   /* pages not yet munmap'ed */
+  uint32_t *dead;   /* 1 bit/page, set = munmap'ed; allocated at the first partial munmap */
+} FbBlock;
+static FbBlock g_fb[MMAP_FALLBACK_MAX];
+static int     g_fb_n = 0;
+static size_t  g_fb_bytes = 0;
+static size_t  g_fb_peak = 0;
+static Mutex   g_fb_lock;
+
+static inline int fb_dead_get(const FbBlock *b, size_t pg) {
+  return b->dead && ((b->dead[pg >> 5] >> (pg & 31)) & 1u);
+}
+
+// caller holds g_fb_lock. Frees block i (entry is replaced by the last one).
+static void fb_release_locked(int i) {
+  FbBlock *b = &g_fb[i];
+  g_fb_bytes -= b->len;
+  free(b->dead);
+  free(b->ptr);
+  *b = g_fb[--g_fb_n];
+}
+
+#if MMAP_FB_SHRINK
+// caller holds g_fb_lock. If the block's last pages have all been munmap'ed, give
+// them back to newlib. realloc() to a smaller size never moves a chunk in newlib;
+// should it ever return another pointer the caller's addresses would be stale, so
+// that is fatal instead of silent corruption.
+static void fb_shrink_tail_locked(FbBlock *b) {
+  size_t total = b->len / MMAP_PAGE, t = 0;
+  while (t < total && fb_dead_get(b, total - 1 - t)) t++;
+  if (t * MMAP_PAGE < MMAP_FB_SHRINK_MIN || t >= total) return;
+  size_t newlen = (total - t) * MMAP_PAGE;
+  uint8_t *np = (uint8_t *)realloc(b->ptr, newlen);
+  if (!np) return;                                   /* shrink refused: keep the block as is */
+  if (np != b->ptr) fatal_error("mmap fallback: realloc(%p, shrink) moved to %p", (void *)b->ptr, (void *)np);
+  g_fb_bytes -= b->len - newlen;
+  b->len = newlen;
+}
+#endif
+
+// Account for munmap(addr, length) on any fallback block it touches. Returns 1 if the
+// range touched a fallback block (the part inside it is consumed), else 0.
+static int fb_munmap(void *addr, size_t length) {
+  uintptr_t a0 = (uintptr_t)addr, a1 = a0 + length;
+  if (a1 < a0) a1 = UINTPTR_MAX;
+  int hit = 0;
+  mutexLock(&g_fb_lock);
+  for (int i = 0; i < g_fb_n; ) {
+    FbBlock *b = &g_fb[i];
+    uintptr_t bs = (uintptr_t)b->ptr, be = bs + b->len;
+    if (a1 <= bs || a0 >= be) { i++; continue; }
+    hit = 1;
+    uintptr_t s = a0 > bs ? a0 : bs, e = a1 < be ? a1 : be;
+    size_t total = b->len / MMAP_PAGE;
+    size_t p0 = (s - bs) / MMAP_PAGE;
+    size_t p1 = (e - bs + MMAP_PAGE - 1) / MMAP_PAGE;
+    if (p1 > total) p1 = total;
+    if (p0 == 0 && p1 >= total) {                    /* the whole block is gone */
+      fb_release_locked(i);
+      continue;                                      /* slot i now holds another block */
+    }
+    if (!b->dead) {
+      b->dead = (uint32_t *)calloc((total + 31) / 32, sizeof(uint32_t));
+      if (!b->dead) {                                /* cannot track it: leak, never free early */
+        debugPrintf("[mmap] fb: no memory for page map of %p; partial munmap ignored\n", (void *)b->ptr);
+        i++; continue;
+      }
+    }
+    for (size_t pg = p0; pg < p1; pg++) {
+      if (!fb_dead_get(b, pg)) { b->dead[pg >> 5] |= 1u << (pg & 31); b->live--; }
+    }
+    static unsigned part_n = 0;
+    if (part_n < 24)
+      debugPrintf("[mmap] fb: munmap %p +%u KB inside block %p (%u KB): %zu/%zu pages live\n",
+                  addr, (unsigned)(length >> 10), (void *)b->ptr, (unsigned)(b->len >> 10), b->live, total);
+    part_n++;
+    if (b->live == 0) { fb_release_locked(i); continue; }
+#if MMAP_FB_SHRINK
+    fb_shrink_tail_locked(b);
+#endif
+    i++;
+  }
+  mutexUnlock(&g_fb_lock);
+  return hit;
+}
+
+// MAP_FIXED|MAP_ANONYMOUS inside a fallback block: re-map in place (zero-filled when
+// readable), as bionic would. Returns 1 if the range was inside a block.
+static int fb_fixed(void *addr, size_t length, int prot) {
+  uintptr_t a0 = (uintptr_t)addr, a1 = a0 + length;
+  int hit = 0;
+  mutexLock(&g_fb_lock);
+  for (int i = 0; i < g_fb_n; i++) {
+    FbBlock *b = &g_fb[i];
+    uintptr_t bs = (uintptr_t)b->ptr, be = bs + b->len;
+    if (a0 < bs || a1 > be) continue;               /* must lie completely inside */
+    hit = 1;
+    size_t p0 = (a0 - bs) / MMAP_PAGE, p1 = (a1 - bs + MMAP_PAGE - 1) / MMAP_PAGE;
+    for (size_t pg = p0; pg < p1; pg++)
+      if (fb_dead_get(b, pg)) { b->dead[pg >> 5] &= ~(1u << (pg & 31)); b->live++; }
+    break;
+  }
+  mutexUnlock(&g_fb_lock);
+  if (hit && prot != BIONIC_PROT_NONE) memset(addr, 0, length);
+  return hit;
+}
 
 static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
-  void *q = memalign(MMAP_PAGE, length);
+  const size_t len = (length + MMAP_PAGE - 1) & ~(size_t)(MMAP_PAGE - 1);
+  void *q = NULL;
+  int aligned = 0;
+  if (len >= MMAP_BIG_THRESH) {         /* Baselib aligns these -> hand out an aligned base */
+    q = memalign(MMAP_UNITY_ALIGN, len);
+    aligned = (q != NULL);
+  }
+  if (!q) q = memalign(MMAP_PAGE, len);
   if (!q) return NULL;
   long got = 0;
   if (flags & BIONIC_MAP_ANONYMOUS) {
     /* 2026-10-12: DIAG sentinel REMOVED. The 0xAB fill was causing Unity to
      * treat uninitialized structs as initialized (non-NULL garbage pointers).
      * Anonymous mmap is already zero-filled by the kernel; keep it zero. */
-    memset(q, 0x00, length);
+    memset(q, 0x00, len);
   } else {
     if (fd >= 0) {
       long cur = lseek(fd, 0, SEEK_CUR);
@@ -1270,54 +1423,116 @@ static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
         while ((size_t)got < length) { long r = read(fd, (char *)q + got, length - got); if (r <= 0) break; got += r; }
       if (cur >= 0) lseek(fd, cur, SEEK_SET);
     }
-    if ((size_t)got < length) memset((char *)q + got, 0, length - got);
+    if ((size_t)got < len) memset((char *)q + got, 0, len - got);
   }
   mutexLock(&g_fb_lock);
-  if (g_fb_n < MMAP_FALLBACK_MAX) { g_fb[g_fb_n].ptr = q; g_fb[g_fb_n].len = length; g_fb_n++; g_fb_bytes += length; }
+  int tracked = 0;
+  if (g_fb_n < MMAP_FALLBACK_MAX) {
+    FbBlock *b = &g_fb[g_fb_n++];
+    b->ptr = (uint8_t *)q; b->len = len; b->live = len / MMAP_PAGE; b->dead = NULL;
+    g_fb_bytes += len;
+    if (g_fb_bytes > g_fb_peak) g_fb_peak = g_fb_bytes;
+    tracked = 1;
+  }
   const size_t total = g_fb_bytes;
+  const int nblk = g_fb_n;
   mutexUnlock(&g_fb_lock);
-  debugPrintf("[mmap] fallback %u KB -> %p  anon=%d fd=%d off=0x%lx got=%ld (total %u MB)\n",
-              (unsigned)(length >> 10), q, !!(flags & BIONIC_MAP_ANONYMOUS), fd, offset, got,
-              (unsigned)(total >> 20));
+  if (!tracked)
+    debugPrintf("[mmap] fb: block table full (%d) -- %p will never be released\n", MMAP_FALLBACK_MAX, q);
+  debugPrintf("[mmap] fallback %u KB -> %p  anon=%d fd=%d off=0x%lx got=%ld aligned=%d (blocks %d, total %u MB)\n",
+              (unsigned)(length >> 10), q, !!(flags & BIONIC_MAP_ANONYMOUS), fd, offset, got, aligned,
+              nblk, (unsigned)(total >> 20));
   return q;
 }
 
-// returns 1 and frees if addr was a fallback allocation
-static int mmap_fallback_free(void *addr) {
-  mutexLock(&g_fb_lock);
-  for (int i = 0; i < g_fb_n; i++) {
-    if (g_fb[i].ptr == addr) {
-      free(addr);
-      g_fb_bytes -= g_fb[i].len;
-      g_fb[i] = g_fb[--g_fb_n];
-      mutexUnlock(&g_fb_lock);
-      return 1;
+// ---------------------------------------------------------------------------
+// Address-space ledger (diagnostic only, no behaviour change).
+// Mirrors what Unity believes is mapped (maps >= 1 MB). A new map that overlaps a
+// live one is the signature of the aliasing bug fixed above, whichever allocator (OC
+// window, arena or fallback) handed it out -- it is reported once per occurrence in
+// debug.log as "[mmap] !!! OVERLAP".
+// ---------------------------------------------------------------------------
+#ifndef MMAP_LEDGER
+#define MMAP_LEDGER 1
+#endif
+#define MMAP_LEDGER_MIN ((size_t)1024 * 1024)
+#define MMAP_LEDGER_MAX 512
+typedef struct { uintptr_t s, e; const char *src; } LedRange;
+static LedRange g_led[MMAP_LEDGER_MAX];
+static int      g_led_n;
+static unsigned g_led_overlaps, g_led_dropped;
+static Mutex    g_led_lock;
+
+static void ledger_add(const void *p, size_t len, const char *src) {
+#if MMAP_LEDGER
+  if (len < MMAP_LEDGER_MIN) return;
+  uintptr_t s = (uintptr_t)p, e = s + len;
+  mutexLock(&g_led_lock);
+  for (int i = 0; i < g_led_n; i++) {
+    if (s < g_led[i].e && e > g_led[i].s) {
+      g_led_overlaps++;
+      if (g_led_overlaps <= 16)
+        debugPrintf("[mmap] !!! OVERLAP: new %s [%p,%p) intersects live %s [%p,%p)\n",
+                    src, (void *)s, (void *)e, g_led[i].src, (void *)g_led[i].s, (void *)g_led[i].e);
     }
   }
+  if (g_led_n < MMAP_LEDGER_MAX) { g_led[g_led_n].s = s; g_led[g_led_n].e = e; g_led[g_led_n].src = src; g_led_n++; }
+  else g_led_dropped++;
+  mutexUnlock(&g_led_lock);
+#else
+  (void)p; (void)len; (void)src;
+#endif
+}
+
+static void ledger_del(const void *p, size_t len) {
+#if MMAP_LEDGER
+  uintptr_t s = (uintptr_t)p, e = s + len;
+  if (e < s) e = UINTPTR_MAX;
+  mutexLock(&g_led_lock);
+  for (int i = 0; i < g_led_n; ) {
+    LedRange *r = &g_led[i];
+    if (e <= r->s || s >= r->e) { i++; continue; }
+    if (s <= r->s && e >= r->e) { *r = g_led[--g_led_n]; continue; }      /* fully covered */
+    if (s <= r->s) { r->s = e; i++; continue; }                            /* head cut */
+    if (e >= r->e) { r->e = s; i++; continue; }                            /* tail cut */
+    if (g_led_n < MMAP_LEDGER_MAX) {                                       /* hole: split */
+      g_led[g_led_n].s = e; g_led[g_led_n].e = r->e; g_led[g_led_n].src = r->src; g_led_n++;
+    } else g_led_dropped++;
+    r->e = s; i++;
+  }
+  mutexUnlock(&g_led_lock);
+#else
+  (void)p; (void)len;
+#endif
+}
+
+// One-line memory summary for the watchdog dump / boot log. Declare it in libc_shim.h
+// (`void mmap_dump_stats(void);`) and call it from the [wd] stall dump.
+void mmap_dump_stats(void) {
+  size_t oc_used = 0, oc_comm = 0, oc_tot = 0, ar_used = 0, ar_tot = 0;
+  int ok = mutexTryLock(&g_mmap_lock);
+  if (ok) {
+    for (int w = 0; w < oc_nwin; w++) {
+      oc_tot += oc_win[w].pages;
+      for (size_t i = 0; i < oc_win[w].pages; i++) { oc_used += oc_win[w].used[i]; oc_comm += oc_win[w].committed[i]; }
+    }
+    if (mmap_used) { ar_tot = mmap_pages; for (size_t i = 0; i < mmap_pages; i++) ar_used += mmap_used[i]; }
+    mutexUnlock(&g_mmap_lock);
+  }
+  mutexLock(&g_fb_lock);
+  int fbn = g_fb_n; size_t fbb = g_fb_bytes, fbp = g_fb_peak;
   mutexUnlock(&g_fb_lock);
-  return 0;
+  struct mallinfo mi = mallinfo();
+  debugPrintf("[mmapstat] OC reserved %zu/%zu MB committed %zu MB%s | arena %zu/%zu MB | fallback %d blocks %zu MB (peak %zu MB)"
+              " | ledger %d ranges, %u overlaps | newlib used %u MB free %u MB\n",
+              (oc_used * MMAP_PAGE) >> 20, (oc_tot * MMAP_PAGE) >> 20, (oc_comm * MMAP_PAGE) >> 20, ok ? "" : " (busy)",
+              (ar_used * MMAP_PAGE) >> 20, (ar_tot * MMAP_PAGE) >> 20, fbn, fbb >> 20, fbp >> 20,
+              g_led_n, g_led_overlaps, (unsigned)((unsigned)mi.uordblks >> 20), (unsigned)((unsigned)mi.fordblks >> 20));
 }
 
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset) {
   (void)addr; (void)prot;
   if (length == 0) length = 1;
-
-  /* RADICAL SIMPLIFICATION (build #50): Bypass arena/OC entirely for anonymous
-   * mappings. Use newlib malloc directly via mmap_fallback. This eliminates
-   * the complex arena/overcommit logic as a potential source of heap corruption.
-   * File-backed mappings still use the arena path (needed for correct file I/O).
-   * MAP_FIXED still handled below for compatibility. */
-  if ((flags & BIONIC_MAP_ANONYMOUS) && !((flags & BIONIC_MAP_FIXED) && addr)) {
-    void *p = mmap_fallback(length, flags, fd, offset);
-    if (p) {
-      if (length >= (4u << 20))
-        debugPrintf("[mmap] RADICAL anon %u MB -> %p [newlib direct]\n",
-                    (unsigned)(length >> 20), p);
-      return p;
-    }
-    // Fall through to arena path if newlib fails (unlikely)
-    debugPrintf("[mmap] RADICAL newlib failed for %zu bytes, trying arena\n", length);
-  }
 
   if ((flags & BIONIC_MAP_FIXED) && addr && (flags & BIONIC_MAP_ANONYMOUS)) {
     static unsigned fixed_n = 0;
@@ -1344,6 +1559,12 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
       fixed_n++;
       return addr;
     }
+    if (fb_fixed(addr, length, prot)) {      /* heap-backed fallback block: in place */
+      if (fixed_n < 3)
+        debugPrintf("[mmap] MAP_FIXED %u KB @ %p (fallback) -> in place\n", (unsigned)(length >> 10), addr);
+      fixed_n++;
+      return addr;
+    }
     debugPrintf("[mmap] MAP_FIXED %u KB @ %p prot=0x%x UNOWNED -> legacy path\n",
                 (unsigned)(length >> 10), addr, prot);
   }
@@ -1360,6 +1581,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
     if (op) {
       debugPrintf("[mmap] %u MB (prot=0x0 anon=1) -> %p  [OC reserve %u MB]\n",
                   (unsigned)(length >> 20), op, (unsigned)(ocres >> 20));
+      ledger_add(op, ocres < length ? ocres : length, "oc");
       return op;   // reserved-only; committed lazily via mprotect_fake
     }
     debugPrintf("[mmap] OC window full for %u MB -> heap-backed arena\n",
@@ -1394,7 +1616,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
     // and rejecting them is what NULL-derefs the engine. Only a genuinely huge map
     // (> newlib free) will fail, and we log that distinctly.
     void *q = mmap_fallback(length, flags, fd, offset);
-    if (q) return q;
+    if (q) { ledger_add(q, length, "fallback"); return q; }
     debugPrintf("[mmap] arena FULL and newlib fallback FAILED for %u MB (out of RAM)\n",
                 (unsigned)(length >> 20));
     errno = ENOMEM; return (void *)-1;
@@ -1403,6 +1625,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   // Never touch beyond what we actually reserved in-arena (tail over-maps reserve
   // less than the requested length; the spill lives past the arena and is trimmed).
   size_t fill = length < reserved ? length : reserved;
+  ledger_add(p, fill, "arena");
 
   if (g_overcommit) {
     // PROT_NONE reservation: address space only, no physical -- the whole point.
@@ -1446,7 +1669,11 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
 }
 
 int munmap_fake(void *addr, size_t length) {
-  if (mmap_fallback_free(addr)) return 0;   // newlib fallback allocation
+  /* Heap-backed fallback block(s): per-page accounting. A HEAD/TAIL trim of an aligned
+   * reservation (Baselib_Memory_AllocatePages) must NOT free the block -- the middle is
+   * still live (see the FIX note above mmap_fallback). */
+  ledger_del(addr, length);
+  if (fb_munmap(addr, length)) return 0;
   if (oc_contains(addr)) {                   // stack-region OC reservation
     mutexLock(&g_mmap_lock);
     oc_free_locked(addr, length);
@@ -1596,7 +1823,7 @@ FILE *fopen_fake(const char *path, const char *mode) {
     void *data = NULL; size_t size = 0;
     if (asset_pack_read_all_path(path, &data, &size)) {
       FILE *pf = fmemopen_locked(data, size ? size : 1, "r");
-      if (pf) { debugPrintf("[io] fopen(%s,%s) -> %p [pack] tid=%d\n", path, mode, (void *)pf); return pf; }
+      if (pf) { debugPrintf("[io] fopen(%s,%s) -> %p [pack]\n", path, mode, (void *)pf); return pf; }
       free(data);
     }
   }

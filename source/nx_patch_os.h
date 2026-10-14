@@ -234,13 +234,18 @@ static const NxPatchWord OS_BRANCH_FORCES[] = {
  *
  * VERIFY-FIRST: only applied if the stock word matches. Remove once the root
  * cause (why x1 = 0x81ff) is understood.
+ * ========================================================================
+ * 2026-10-14: DISABLED. Analysis proved these DIAG skips are HARMFUL, not helpful.
+ * They NOP TLSF free-list unlink stores, leaving allocated blocks in the free-list
+ * -> double allocation -> heap corruption -> the "no frame progress" hang.
+ * The root cause was heap alias in mmap fallback (now fixed in libc_shim.c).
  * ======================================================================== */
-#define OS_HAVE_DIAG_SKIP_PROPVEC 1
+#define OS_HAVE_DIAG_SKIP_PROPVEC 0
 __attribute__((unused))
 static const NxPatchWord OS_DIAG_PATCHES[] = {
-  { 0x122b004, 0x081140f9, 0xd503201f },  /* DIAG: ldr x8,[x8,#0x20] -> nop (vtable ID) */
-  { 0x124400c, 0xf9000d2b, 0xd503201f },  /* FIX: STR x11,[x9,#0x18] -> nop (null list head) */
-  { 0x1244014, 0xf9000969, 0xd503201f },  /* FIX: STR x9,[x11,#0x10] -> nop (null list node) */
+  /* REMOVED 2026-10-14: { 0x122b004, 0x081140f9, 0xd503201f }, */
+  /* REMOVED 2026-10-14: { 0x124400c, 0xf9000d2b, 0xd503201f }, */
+  /* REMOVED 2026-10-14: { 0x1244014, 0xf9000969, 0xd503201f }, */
 };
 #define OS_DIAG_PATCHES_N (OS_HAVE_DIAG_SKIP_PROPVEC ? \
   ((int)(sizeof(OS_DIAG_PATCHES)/sizeof(OS_DIAG_PATCHES[0]))) : 0)
