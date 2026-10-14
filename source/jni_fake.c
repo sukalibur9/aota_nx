@@ -53,7 +53,7 @@ typedef struct { uint32_t tag; char label[64]; } FakeObject;
 typedef struct { uint32_t tag; char *utf; } FakeString;
 typedef struct { uint32_t tag; int len; void **items; } FakeObjArray;
 typedef struct { uint32_t tag; int len; int elem_size; void *data; } FakePriArray;
-typedef struct { uint32_t tag; char cls[96]; char name[64]; char sig[160]; } FakeID;
+typedef struct { uint32_t tag; char cls[96]; char name[64]; char sig[160]; int is_static; } FakeID;
 
 /* Safely read a jstring argument. Verifies the tag first, because a jvalue[]
  * slot can hold anything and this is reached from a hook where a wrong guess
@@ -315,10 +315,10 @@ static const char *fake_class_name(void *jcls) {
   return NULL;
 }
 
-static FakeID *get_id(const char *cls, const char *name, const char *sig) {
+static FakeID *get_id(const char *cls, const char *name, const char *sig, int is_static) {
   for (int i = 0; i < id_count; i++)
     if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig) &&
-        !strcmp(id_pool[i].cls, cls))
+        !strcmp(id_pool[i].cls, cls) && id_pool[i].is_static == is_static)
       return &id_pool[i];
   if (id_count >= MAX_IDS) {
     debugPrintf("JNI: id pool exhausted (%s.%s)\n", cls, name);
@@ -329,6 +329,7 @@ static FakeID *get_id(const char *cls, const char *name, const char *sig) {
   strncpy(id->cls, cls ? cls : "", sizeof(id->cls) - 1);
   strncpy(id->name, name, sizeof(id->name) - 1);
   strncpy(id->sig, sig, sizeof(id->sig) - 1);
+  id->is_static = is_static;
   debugPrintf("JNI id: %s.%s %s\n", id->cls, id->name, id->sig);
   return id;
 }
@@ -591,7 +592,7 @@ static void proxy_invoke(void *proxy, void *cls, void *method, void *args) {
   g_jnibridge_invoke(fake_env, proxy, ptr, cls, method, args);
 }
 static void proxy_run_runnable(void *runnable) {
-  proxy_invoke(runnable, intern_class("java/lang/Runnable"), get_id("java/lang/Runnable", "run", "()V"), (void *)0);
+  proxy_invoke(runnable, intern_class("java/lang/Runnable"), get_id("java/lang/Runnable", "run", "()V", 0), (void *)0);
 }
 /* Message.sendToTarget(): the factory's HandlerThread never pumps its Looper, so the
    message is never delivered to callback.handleMessage(msg). Deliver it ourselves to
@@ -600,7 +601,7 @@ static void handler_deliver_message(void *callback) {
   void *msg  = jni_make_object("android/os/Message");
   void *args = j_NewObjectArray(fake_env, 1, (void *)0, msg);
   proxy_invoke(callback, intern_class("android/os/Handler$Callback"),
-               get_id("android/os/Handler$Callback", "handleMessage", "(Landroid/os/Message;)Z"), args);
+               get_id("android/os/Handler$Callback", "handleMessage", "(Landroid/os/Message;)Z", 0), args);
 }
 /* ---------------------------------------------------------------------------
  * Google Play Games sign-in.
@@ -680,7 +681,7 @@ static void gpgs_complete_signin(void *listener) {
               listener, (unsigned long long)p->ptr);
   proxy_invoke(listener, intern_class("com/google/android/gms/tasks/OnSuccessListener"),
                get_id("com/google/android/gms/tasks/OnSuccessListener",
-                      "onSuccess", "(Ljava/lang/Object;)V"), args);
+                      "onSuccess", "(Ljava/lang/Object;)V", 0), args);
 }
 
 static uint64_t g_frame_ns = 0;   /* frameTimeNanos for boxed-Long unboxing */
@@ -693,7 +694,7 @@ static void deliver_doframe(void *cb) {
   static int logged = 0;
   if (logged < 3) { logged++; debugPrintf("[jni] doFrame tick -> %p (vsync pump)\n", cb); }
   proxy_invoke(cb, intern_class("android/view/Choreographer$FrameCallback"),
-               get_id("android/view/Choreographer$FrameCallback", "doFrame", "(J)V"), args);
+               get_id("android/view/Choreographer$FrameCallback", "doFrame", "(J)V", 0), args);
 }
 /* drain thread: runs posted work off the main thread (no self-deadlock / re-entrancy) */
 #define RUNQ_N 128
@@ -1024,6 +1025,24 @@ static void *act_object(const FakeID *id, va_list va) {
   if (name_has(id->cls, "Settings$Secure") && name_has(id->name, "getString"))
     return jni_make_string("a1b2c3d4e5f60718");
 
+  /* --- Singleton fallback (android32 pattern, proven on their Unity port) ----
+   * Unhandled static instance()/getInstance()/sharedInstance() with () args
+   * and an object return: answer the class's pooled singleton object instead
+   * of null. A null here is always a NullPointerException one call later, far
+   * from the cause. jni_make_object() pools by label, so the answer is stable
+   * per class across calls -- genuine singleton semantics for a fake JVM. */
+  if (id->is_static &&
+      (!strcmp(id->name, "instance") || !strcmp(id->name, "getInstance") ||
+       !strcmp(id->name, "sharedInstance")) &&
+      id->sig[0] == '(' && id->sig[1] == ')') {
+    const char *sret = strchr(id->sig, ')');
+    if (sret && (sret[1] == 'L' || sret[1] == '[')) {
+      debugPrintf("[jni] SINGLETON fallback: %s.%s%s\n",
+                  id->cls[0] ? id->cls : "?", id->name, id->sig);
+      return jni_make_object(id->cls[0] ? id->cls : "java/lang/Object");
+    }
+  }
+
   /* ANY array-returning method that reached here. Java callers do arr.length or
    * a foreach immediately; an EMPTY array is always a safe answer and a null
    * never is. This is a general rule rather than a per-method case because the
@@ -1305,12 +1324,12 @@ static void log_app_upcall(const FakeID *id) {
  * ReflectionHelper.getMethodID/getFieldID/getConstructorID.
  * `cls_obj` is the java.lang.Class, `a0`/`a1` the name/signature strings (for
  * getConstructorID there is no name, only a signature). */
-static void *reflect_make_id(const FakeID *id, void *cls_obj, void *a0, void *a1) {
+static void *reflect_make_id(const FakeID *id, void *cls_obj, void *a0, void *a1, int is_static) {
   const char *cname = fake_class_name(cls_obj);
   const char *mname, *msig;
   if (name_has(id->name, "getConstructorID")) { mname = "<init>"; msig = jni_string_utf(a0); }
   else                                        { mname = jni_string_utf(a0); msig = jni_string_utf(a1); }
-  FakeID *made = get_id(cname ? cname : "", mname ? mname : "", msig ? msig : "()V");
+  FakeID *made = get_id(cname ? cname : "", mname ? mname : "", msig ? msig : "()V", is_static);
   debugPrintf("[jni] ReflectionHelper.%s(%s.%s %s) -> id %p\n", id->name,
               cname ? cname : "?", mname ? mname : "?", msig ? msig : "?", (void *)made);
   return made;
@@ -1320,6 +1339,39 @@ static int reflect_wants_id(const FakeID *id) {
   return OS_JNI_REFLECTION && name_has(id->cls, "ReflectionHelper") &&
          (name_has(id->name, "getMethodID") || name_has(id->name, "getConstructorID") ||
           name_has(id->name, "getFieldID"));
+}
+
+/* Builder-pattern fallback (android32 pattern, proven on their Unity port):
+ * an unhandled instance method declared to return the receiver's own class
+ * answers the receiver itself, so fluent/chained setters keep working. The
+ * terminal build()/create() are excepted: they fall through to act_object's
+ * generic object fallback. The return-type check is what keeps this honest:
+ * StringBuilder.toString() (-> String, a DECIDED "" fallback per the reviewed
+ * list) does NOT match, while StringBuilder.append() (-> StringBuilder) does.
+ * Without this, every chained setter returns null and the chain dies at the
+ * second call. */
+static int builder_fallback_hit(void *recv, const FakeID *id) {
+  if (id->is_static || !recv) return 0;
+  uint32_t t = *(uint32_t *)recv;
+  /* pooled objects carry TAG_CLASS (see jni_make_object); accept both */
+  if (t != TAG_OBJECT && t != TAG_CLASS) return 0;
+  if (!strcmp(id->name, "build") || !strcmp(id->name, "create")) return 0;
+  const char *ret = strchr(id->sig, ')');
+  if (!ret || ret[1] != 'L') return 0;   /* object return only; void/int use other dispatchers */
+  /* declared return type, without the trailing ';' */
+  const char *rcls = ret + 1;
+  size_t rlen = strlen(rcls);
+  if (rlen < 2 || rcls[rlen - 1] != ';') return 0;
+  /* match against the class the id was minted against ... */
+  size_t cl = strlen(id->cls);
+  if (cl == rlen - 1 && !strncmp(rcls, id->cls, cl)) return 1;
+  /* ... or the receiver's actual class (subclass receivers) */
+  const char *rcn = fake_class_name(recv);
+  if (rcn && rcn[0]) {
+    size_t rl = strlen(rcn);
+    if (rl == rlen - 1 && !strncmp(rcls, rcn, rl)) return 1;
+  }
+  return 0;
 }
 
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
@@ -1365,8 +1417,13 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   if (reflect_wants_id(id)) {
     void *c = va_arg(va, void *);
     void *a0 = va_arg(va, void *);
-    void *a1 = name_has(id->name, "getConstructorID") ? NULL : va_arg(va, void *);
-    return reflect_make_id(id, c, a0, a1);
+    int is_ctor = name_has(id->name, "getConstructorID");
+    void *a1 = is_ctor ? NULL : va_arg(va, void *);
+    /* ReflectionHelper.getMethodID/getFieldID(Class, name, sig, isStatic): the
+     * 4th arg carries static-ness (constructors have none). Thread it through
+     * so reflection-minted ids get the singleton fallback too. */
+    int st = is_ctor ? 0 : va_arg(va, int);
+    return reflect_make_id(id, c, a0, a1, st);
   }
 
   /* ---- Play Games sign-in chain (see gpgs_complete_signin above) -------- */
@@ -1449,6 +1506,12 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
     if (cn && cn[0]) return jni_make_string(cn);
   }
   if (unity_owns_class(id->cls)) return unity_dispatch_object(recv, id, va);
+  /* Builder-pattern fallback: chained setters answer the receiver itself. */
+  if (builder_fallback_hit(recv, id)) {
+    debugPrintf("[jni] BUILDER fallback: %s.%s%s -> receiver %p\n",
+                id->cls[0] ? id->cls : "?", id->name, id->sig, recv);
+    return recv;
+  }
   // any method returning a Bitmap is text rendering (Char2Bitmap / getShadowBitmap
   // / ...): the loaded class always reads back as java/lang/Object, so route by
   // return type rather than class name.
@@ -1527,10 +1590,19 @@ static void *j_GetObjectClass(void *env, void *obj) {
   return intern_class("java/lang/Object");
 }
 static void *j_GetMethodID(void *env, void *cls, const char *name, const char *sig) {
-  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "");
+  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "", 0);
+}
+/* Split from j_GetMethodID: static-ness is now recorded on the FakeID so the
+ * singleton fallback (act_object) can tell a static getInstance() from an
+ * instance call. Previously both aliased to the same function. */
+static void *j_GetStaticMethodID(void *env, void *cls, const char *name, const char *sig) {
+  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "", 1);
 }
 static void *j_GetFieldID(void *env, void *cls, const char *name, const char *sig) {
-  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "");
+  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "", 0);
+}
+static void *j_GetStaticFieldID(void *env, void *cls, const char *name, const char *sig) {
+  (void)env; return get_id(class_name_of(cls), name ? name : "", sig ? sig : "", 1);
 }
 
 /* String(byte[][,charset]) constructor: Unity builds PlayerPrefs keys as
@@ -1726,8 +1798,9 @@ static void *j_CallObjectMethodA (void *e, void *r, FakeID *id, const void *a){
    * Handle it here, where the array is actually in hand. */
   if (a && reflect_wants_id(id)) {
     void *const *jv = (void *const *)a;
-    return reflect_make_id(id, jv[0], jv[1],
-                           name_has(id->name, "getConstructorID") ? NULL : jv[2]);
+    int is_ctor = name_has(id->name, "getConstructorID");
+    int st = is_ctor ? 0 : ((int)(intptr_t)jv[3] & 0xFF);   /* jvalue[3] = isStatic */
+    return reflect_make_id(id, jv[0], jv[1], is_ctor ? NULL : jv[2], st);
   }
   if (a && name_has(id->cls, "ReflectionHelper") && name_has(id->name, "Signature")) {
     void *const *jv = (void *const *)a;
@@ -2373,8 +2446,75 @@ static float field_float(const FakeID *id) {
   return 0.0f;
 }
 
+// --- Field write storage (android32 pattern) ---------------------------------
+// SetXxxField stores the value; GetXxxField reads it back. Keyed by (obj, fid)
+// -- FakeIDs are interned, so the fid pointer is a stable key; static fields
+// key by their jclass the same way. Without this, every Set is silently lost
+// and the subsequent Get returns a guess, which is how stateful Java bridges
+// break. A stored value wins over the hardcoded defs below: it is what the
+// game actually wrote last (Java field semantics).
+#define MAX_FSTORE 128
+/* kind: 0 object, 1 int32 (boolean/byte/char/short/int), 2 long, 3 float bits, 4 double bits */
+static struct { void *obj; const FakeID *fid; int kind; uint64_t val; } fstore[MAX_FSTORE];
+static int fstore_n = 0;
+static void fstore_put(void *obj, const FakeID *fid, int kind, uint64_t val) {
+  if (!fid) return;
+  for (int i = 0; i < fstore_n; i++)
+    if (fstore[i].obj == obj && fstore[i].fid == fid) {
+      fstore[i].kind = kind; fstore[i].val = val; return;
+    }
+  if (fstore_n < MAX_FSTORE) {
+    fstore[fstore_n].obj = obj; fstore[fstore_n].fid = fid;
+    fstore[fstore_n].kind = kind; fstore[fstore_n].val = val; fstore_n++;
+  } else
+    debugPrintf("[jni] field store full, dropping %s.%s\n", fid->cls, fid->name);
+}
+static int fstore_get(void *obj, const FakeID *fid, int kind, uint64_t *out) {
+  if (!fid) return 0;
+  for (int i = 0; i < fstore_n; i++)
+    if (fstore[i].obj == obj && fstore[i].fid == fid && fstore[i].kind == kind) {
+      if (out) *out = fstore[i].val; return 1;
+    }
+  return 0;
+}
+/* The Set*Field slots (104-112, 154-162) were absent from env_table entirely:
+ * any Set call jumped through a NULL pointer. Now they store. Static forms
+ * share the instance signature (env, clazz, fid, value). */
+static void j_SetObjectField(void *env, void *obj, void *fid, void *val) {
+  (void)env;
+  fstore_put(obj, (const FakeID *)fid, 0, (uint64_t)(uintptr_t)val);
+  if (fid) debugPrintf("[jni] SetObjectField %s.%s = %p (stored)\n",
+                       ((const FakeID *)fid)->cls, ((const FakeID *)fid)->name, val);
+}
+static void j_SetIntField(void *env, void *obj, void *fid, juint val) {
+  /* mask to 32 bits: callers pass jint in w0, x0's upper half is unspecified */
+  (void)env; fstore_put(obj, (const FakeID *)fid, 1, (uint64_t)(uint32_t)val);
+}
+static void j_SetLongField(void *env, void *obj, void *fid, uint64_t val) {
+  (void)env; fstore_put(obj, (const FakeID *)fid, 2, val);
+}
+static void j_SetFloatField(void *env, void *obj, void *fid, float val) {
+  (void)env; uint64_t b = 0; memcpy(&b, &val, sizeof val);
+  fstore_put(obj, (const FakeID *)fid, 3, b);
+}
+static void j_SetDoubleField(void *env, void *obj, void *fid, double val) {
+  (void)env; uint64_t b = 0; memcpy(&b, &val, sizeof val);
+  fstore_put(obj, (const FakeID *)fid, 4, b);
+}
+#define j_SetStaticObjectField j_SetObjectField
+#define j_SetStaticIntField    j_SetIntField
+#define j_SetStaticLongField   j_SetLongField
+#define j_SetStaticFloatField  j_SetFloatField
+#define j_SetStaticDoubleField j_SetDoubleField
+
 static void *j_GetObjectField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; if (!fid) return NULL;
+  (void)env; if (!fid) return NULL;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 0, &v)) {
+    debugPrintf("[jni] GetObjectField %s.%s -> stored %p\n",
+                ((const FakeID *)fid)->cls, ((const FakeID *)fid)->name, (void *)(uintptr_t)v);
+    return (void *)(uintptr_t)v;
+  }
   log_field_read((const FakeID *)fid, 'O');
   { const FakeID *f = (const FakeID *)fid;   /* name the field the game really reads */
     if (editbox_text() && editbox_text()[0]) {
@@ -2385,15 +2525,28 @@ static void *j_GetObjectField(void *env, void *obj, void *fid) {
                     f->sig[0] ? f->sig : "?"); } } }
   return field_object((const FakeID *)fid); }
 static juint j_GetIntField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; if (!fid) return 0;
+  (void)env; if (!fid) return 0;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 1, &v)) return (juint)v;
   log_field_read((const FakeID *)fid, 'I');
   return field_int((const FakeID *)fid); }
 static juint j_GetLongField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; if (!fid) return 0; return (juint)field_int((const FakeID *)fid); }
+  (void)env; if (!fid) return 0;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 2, &v)) return (juint)v;
+  return (juint)field_int((const FakeID *)fid); }
 static juint j_GetBooleanField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; if (!fid) return 0; return field_int((const FakeID *)fid) ? 1 : 0; }
+  (void)env; if (!fid) return 0;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 1, &v)) return v ? 1 : 0;
+  return field_int((const FakeID *)fid) ? 1 : 0; }
 static float j_GetFloatField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; if (!fid) return 0.0f; return field_float((const FakeID *)fid); }
+  (void)env; if (!fid) return 0.0f;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 3, &v)) {
+    float f = 0; memcpy(&f, &v, sizeof f); return f;
+  }
+  return field_float((const FakeID *)fid); }
 
 /* GetDoubleField / GetStaticDoubleField. These were falling through to the
  * UNIMPL stub, which is not a harmless no-op for a floating-point return: the
@@ -2402,7 +2555,12 @@ static float j_GetFloatField(void *env, void *obj, void *fid) {
  * 0.0 the stub appears to promise. An explicit 0.0 return is ABI-correct.
  * No fake object carries a double field today, so there is nothing to look up. */
 static double j_GetDoubleField(void *env, void *obj, void *fid) {
-  (void)env; (void)obj; (void)fid; return 0.0; }
+  (void)env; if (!fid) return 0.0;
+  uint64_t v;
+  if (fstore_get(obj, (const FakeID *)fid, 4, &v)) {
+    double d = 0; memcpy(&d, &v, sizeof d); return d;
+  }
+  return 0.0; }
 
 // --- reflection bridge (proxy support) --------------------------------------
 // Unity's AndroidJavaProxy / JNIBridge.newInterfaceProxy converts the reflected
@@ -2415,9 +2573,9 @@ static double j_GetDoubleField(void *env, void *obj, void *fid) {
 static void *j_FromReflectedMethod(void *env, void *m) {
   (void)env;
   if (m && *(uint32_t *)m == TAG_ID) return m;   /* proxy_run passes the real run() id */
-  return get_id("java/lang/reflect/Method", "invoke", "()V"); }
+  return get_id("java/lang/reflect/Method", "invoke", "()V", 0); }
 static void *j_FromReflectedField(void *env, void *f) {
-  (void)env; (void)f; return get_id("java/lang/reflect/Field", "field", "()V"); }
+  (void)env; (void)f; return get_id("java/lang/reflect/Field", "field", "()V", 0); }
 static void *j_ToReflectedMethod(void *env, void *cls, void *mid, juint isStatic) {
   (void)env; (void)cls; (void)isStatic; return mid ? mid : jni_make_object("java/lang/reflect/Method"); }
 static void *j_ToReflectedField(void *env, void *cls, void *fid, juint isStatic) {
@@ -2737,7 +2895,16 @@ void jni_init(void) {
   env_table[101] = (void *)j_GetLongField;           // GetLongField
   env_table[102] = (void *)j_GetFloatField;          // GetFloatField
   env_table[103] = (void *)j_GetDoubleField;         // GetDoubleField (returns in d0)
-  env_table[113] = (void *)j_GetMethodID;            // GetStaticMethodID
+  env_table[104] = (void *)j_SetObjectField;
+  env_table[105] = (void *)j_SetIntField;            // SetBooleanField
+  env_table[106] = (void *)j_SetIntField;            // SetByteField
+  env_table[107] = (void *)j_SetIntField;            // SetCharField
+  env_table[108] = (void *)j_SetIntField;            // SetShortField
+  env_table[109] = (void *)j_SetIntField;
+  env_table[110] = (void *)j_SetLongField;
+  env_table[111] = (void *)j_SetFloatField;
+  env_table[112] = (void *)j_SetDoubleField;
+  env_table[113] = (void *)j_GetStaticMethodID;
   env_table[114] = (void *)j_CallStaticObjectMethod;
   env_table[115] = (void *)j_CallStaticObjectMethodV;
   env_table[117] = (void *)j_CallStaticBooleanMethod;
@@ -2757,7 +2924,7 @@ void jni_init(void) {
   env_table[134] = (void *)j_CallStaticLongMethodA;
   env_table[137] = (void *)j_CallStaticFloatMethodA;
   env_table[143] = (void *)j_CallStaticVoidMethodA;
-  env_table[144] = (void *)j_GetFieldID;             // GetStaticFieldID
+  env_table[144] = (void *)j_GetStaticFieldID;         // GetStaticFieldID
   env_table[145] = (void *)j_GetObjectField;         // GetStaticObjectField
   env_table[146] = (void *)j_GetBooleanField;        // GetStaticBooleanField
   env_table[147] = (void *)j_GetIntField;            // GetStaticByteField
@@ -2767,6 +2934,15 @@ void jni_init(void) {
   env_table[151] = (void *)j_GetLongField;           // GetStaticLongField
   env_table[152] = (void *)j_GetFloatField;          // GetStaticFloatField
   env_table[153] = (void *)j_GetDoubleField;         // GetStaticDoubleField (d0)
+  env_table[154] = (void *)j_SetStaticObjectField;
+  env_table[155] = (void *)j_SetStaticIntField;       // SetStaticBooleanField
+  env_table[156] = (void *)j_SetStaticIntField;       // SetStaticByteField
+  env_table[157] = (void *)j_SetStaticIntField;       // SetStaticCharField
+  env_table[158] = (void *)j_SetStaticIntField;       // SetStaticShortField
+  env_table[159] = (void *)j_SetStaticIntField;
+  env_table[160] = (void *)j_SetStaticLongField;
+  env_table[161] = (void *)j_SetStaticFloatField;
+  env_table[162] = (void *)j_SetStaticDoubleField;
   env_table[163] = (void *)j_NewString;
   env_table[164] = (void *)j_GetStringLength;
   env_table[165] = (void *)j_GetStringChars;      /* was UNIMPL: managed string marshalling */
