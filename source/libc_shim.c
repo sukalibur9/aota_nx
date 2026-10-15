@@ -296,19 +296,29 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       const u64 MAX_WAIT_NS = 100000000ULL;
       const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
       const int capped = ns > MAX_WAIT_NS;
-      /* Build #88: REMOVED gen0 capture (was: const u64 gen0 = futex_wake_gen[h]).
-       * REA proved the generation counter causes missed-wakeup race:
-       * if waker signals before waiter captures gen0, the wake is lost.
-       * Now rely SOLELY on value check (*uaddr != val), which is race-free
-       * when waker follows standard futex protocol (change value BEFORE wake). */
+      /* Build #88: REMOVED gen0 capture. REA proved generation counter causes
+       * missed-wakeup race. Now rely on value check, which is race-free when
+       * waker follows standard futex protocol. */
       u64 waited = 0;
       int woken = 0;
       while (waited < eff_ns) {
         u64 chunk = eff_ns - waited;
         if (chunk > CAP) chunk = CAP;
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
-        /* Build #88: Check ONLY the value, not the generation counter. */
+        /* Build #89: FIX for Unity's "pulse" pattern. Unity calls futex_wake
+         * 4x WITHOUT persistently changing *uaddr (value stays 0).
+         * Standard Linux futex_wait returns 0 when woken by futex_wake,
+         * WITHOUT re-checking the value. The value is only checked BEFORE
+         * the initial wait.
+         * condvarWaitTimeout returns 0 (R_SUCCEEDED) if signaled,
+         * non-zero on timeout. If signaled, treat as woken. */
+        Result rc = condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
+        if (R_SUCCEEDED(rc)) {
+          /* Signaled by futex_wake — success (matches Linux futex semantics).
+           * Do NOT re-check *uaddr; Unity's pulse doesn't change it. */
+          woken = 1; break;
+        }
+        /* Timeout: increment waited and continue. Also check value as safety. */
         if (*uaddr != val) { woken = 1; break; }
         waited += chunk;
       }
@@ -331,17 +341,19 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * Build #73: cap at ~5s (312 x 16ms) then return 0 (fake wake).
        * Build #86: reduce to ~100ms (6 x 16ms) for faster render loop progress.
        * Build #88: REMOVED gen0 from loop condition (was: futex_wake_gen[h]==gen0).
-       * Rely solely on *uaddr != val — race-free per REA analysis.
+       * Build #89: Break on signal (not just value change) for Unity's pulse pattern.
        * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
        * never woken -- a fake wake lets Unity re-check and re-wait instead
        * of hanging forever. */
       int spins = 0;
-      while (*uaddr == val && spins < 6) {
+      int signaled = 0;
+      while (*uaddr == val && spins < 6 && !signaled) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+        Result rc = condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+        if (R_SUCCEEDED(rc)) signaled = 1;  /* Woken by futex_wake (pulse) */
         spins++;
       }
-      if (spins >= 6 && *uaddr == val) {
+      if (spins >= 6 && *uaddr == val && !signaled) {
         void *caller = __builtin_return_address(0);
         debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (was infinite wait)\n",
                     (void *)uaddr, val, gettid_fake(), caller);
