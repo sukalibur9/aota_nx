@@ -245,29 +245,62 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     } else if (to) {
       /* Timed wait: chunk into CAP pieces so a missed bucket wake still
        * recovers, but honor the real deadline -- when it expires without a
-       * wake or value change, return ETIMEDOUT (not a fake "woken"). */
+       * wake or value change, return ETIMEDOUT (not a fake "woken").
+       * Build #73: for very long timeouts (>5s, e.g. Unity's 49-day
+       * "infinite" 0xFFFFFFFF ms), cap the effective wait at ~5s and return
+       * 0 (fake wake) instead of ETIMEDOUT. Unity's AsyncRead threads park
+       * in FUTEX_WAIT with 49-day timeout and are NEVER woken (async I/O
+       * completion never signaled) -- ETIMEDOUT may be mishandled, but a
+       * fake wake lets Unity re-check *uaddr and either proceed or re-wait.
+       * Shorter requested timeouts are honored as-is with real ETIMEDOUT. */
       const u64 ns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
       const u64 CAP = 16000000ULL;
+      const u64 MAX_WAIT_NS = 5000000000ULL;
+      const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
+      const int capped = ns > MAX_WAIT_NS;
       const u64 gen0 = futex_wake_gen[h];
       u64 waited = 0;
       int woken = 0;
-      while (waited < ns) {
-        u64 chunk = ns - waited;
+      while (waited < eff_ns) {
+        u64 chunk = eff_ns - waited;
         if (chunk > CAP) chunk = CAP;
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
         if (futex_wake_gen[h] != gen0 || *uaddr != val) { woken = 1; break; }
         waited += chunk;
       }
-      if (!woken) { errno = ETIMEDOUT; ret = -1; }
+      if (!woken) {
+        if (capped) {
+          /* Fake wake: return 0 (success) as if woken. Unity re-checks *uaddr. */
+          void *caller = __builtin_return_address(0);
+          debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~5s tid=%d caller=%p (req %llums)\n",
+                      (void *)uaddr, val, gettid_fake(), caller,
+                      (unsigned long long)(ns / 1000000ULL));
+          ret = 0;
+        } else {
+          errno = ETIMEDOUT; ret = -1;
+        }
+      }
     } else {
       /* Infinite wait: loop until value changes or woken. The old code did a
        * single 16ms wait then returned success, causing Unity to spin-call
-       * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c). */
+       * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c).
+       * Build #73: cap at ~5s (312 x 16ms) then return 0 (fake wake).
+       * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
+       * never woken -- a fake wake lets Unity re-check and re-wait instead
+       * of hanging forever. */
       const u64 gen0 = futex_wake_gen[h];
-      while (*uaddr == val && futex_wake_gen[h] == gen0) {
+      int spins = 0;
+      while (*uaddr == val && futex_wake_gen[h] == gen0 && spins < 312) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+        spins++;
+      }
+      if (spins >= 312 && *uaddr == val && futex_wake_gen[h] == gen0) {
+        void *caller = __builtin_return_address(0);
+        debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~5s tid=%d caller=%p (was infinite wait)\n",
+                    (void *)uaddr, val, gettid_fake(), caller);
+        ret = 0;  /* fake wake, not ETIMEDOUT */
       }
     }
     mutexUnlock(&futex_lock[h]);
