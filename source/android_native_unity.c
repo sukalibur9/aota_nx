@@ -323,7 +323,12 @@ int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outDa
   mutexLock(&L->m);
   if (!L->signaled){
     if (timeoutMillis==0){ mutexUnlock(&L->m); return ALOOPER_POLL_TIMEOUT; }
-    if (timeoutMillis<0)  condvarWait(&L->cv,&L->m);
+    /* Build #85: Don't wait forever. Unity's render loop calls pollOnce(-1)
+     * expecting vsync callbacks via fd, but our ALooper_addFd is a stub.
+     * Waiting forever stalls the render loop (black screen). Cap at 16ms
+     * (~60fps) so Unity makes progress. */
+    if (timeoutMillis<0)
+      condvarWaitTimeout(&L->cv,&L->m, 16000000ull); /* 16ms */
     else condvarWaitTimeout(&L->cv,&L->m,(u64)timeoutMillis*1000000ull);
   }
   int was = L->signaled; L->signaled=0;
