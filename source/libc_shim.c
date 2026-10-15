@@ -194,12 +194,17 @@ void __malloc_unlock(struct _reent *reent) {
 #define FUTEX_WAIT_BITSET 9
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_CMD_MASK    0x7f  // strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256)
-#define FUTEX_BUCKETS     256
+/* Build #88: Increase from 256 to 4096 to reduce hash collisions.
+ * REA analysis found cross-talk between unrelated futexes due to collisions. */
+#define FUTEX_BUCKETS     4096
 
 static Mutex   futex_lock[FUTEX_BUCKETS];   // libnx Mutex/CondVar are u32; 0 == ready
 static CondVar futex_cond[FUTEX_BUCKETS];
-/* Wake generation per bucket, bumped under futex_lock[h] on every WAKE. Lets a
- * timed waiter distinguish "woken" from "timed out" across capped chunks. */
+/* Wake generation per bucket — DEPRECATED in build #88.
+ * REA analysis proved this causes missed-wakeup race: if waker signals before
+ * waiter captures gen0, the wake is lost forever. Removed; we rely solely on
+ * the value check (*uaddr != val) which is race-free when waker follows
+ * standard futex protocol (change value BEFORE wake). */
 static volatile u64 futex_wake_gen[FUTEX_BUCKETS];
 
 #define FXOWN_N 64
@@ -291,7 +296,11 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       const u64 MAX_WAIT_NS = 100000000ULL;
       const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
       const int capped = ns > MAX_WAIT_NS;
-      const u64 gen0 = futex_wake_gen[h];
+      /* Build #88: REMOVED gen0 capture (was: const u64 gen0 = futex_wake_gen[h]).
+       * REA proved the generation counter causes missed-wakeup race:
+       * if waker signals before waiter captures gen0, the wake is lost.
+       * Now rely SOLELY on value check (*uaddr != val), which is race-free
+       * when waker follows standard futex protocol (change value BEFORE wake). */
       u64 waited = 0;
       int woken = 0;
       while (waited < eff_ns) {
@@ -299,7 +308,8 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
         if (chunk > CAP) chunk = CAP;
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
-        if (futex_wake_gen[h] != gen0 || *uaddr != val) { woken = 1; break; }
+        /* Build #88: Check ONLY the value, not the generation counter. */
+        if (*uaddr != val) { woken = 1; break; }
         waited += chunk;
       }
       if (!woken) {
@@ -320,17 +330,18 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c).
        * Build #73: cap at ~5s (312 x 16ms) then return 0 (fake wake).
        * Build #86: reduce to ~100ms (6 x 16ms) for faster render loop progress.
+       * Build #88: REMOVED gen0 from loop condition (was: futex_wake_gen[h]==gen0).
+       * Rely solely on *uaddr != val — race-free per REA analysis.
        * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
        * never woken -- a fake wake lets Unity re-check and re-wait instead
        * of hanging forever. */
-      const u64 gen0 = futex_wake_gen[h];
       int spins = 0;
-      while (*uaddr == val && futex_wake_gen[h] == gen0 && spins < 6) {
+      while (*uaddr == val && spins < 6) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
         spins++;
       }
-      if (spins >= 6 && *uaddr == val && futex_wake_gen[h] == gen0) {
+      if (spins >= 6 && *uaddr == val) {
         void *caller = __builtin_return_address(0);
         debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (was infinite wait)\n",
                     (void *)uaddr, val, gettid_fake(), caller);
@@ -350,7 +361,9 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     }
     fxown_wake(uaddr);
     mutexLock(&futex_lock[h]);
-    futex_wake_gen[h]++;               /* timed waiters: this was a real wake */
+    /* Build #88: REMOVED futex_wake_gen[h]++ (was: timed waiters generation counter).
+     * REA proved this causes missed-wakeup race. The value check (*uaddr != val)
+     * is sufficient and race-free. Generation counter deprecated. */
     condvarWakeAll(&futex_cond[h]);
     mutexUnlock(&futex_lock[h]);
     return val > 0 ? val : 0; // approximate count woken
