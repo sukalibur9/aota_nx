@@ -154,6 +154,30 @@ int gettid_fake(void) {
 #define ARM64_SYS_PROCESS_VM_READV  270
 #define ARM64_SYS_PROCESS_VM_WRITEV 271
 
+/* Build #74: newlib malloc locking. newlib wraps heap ops (malloc/free/realloc)
+ * in __malloc_lock/__malloc_unlock. libnx 4.9.0 (pinned by wrapper) predates
+ * the malloc-lock wiring added in ~4.11, so the default is a no-op stub --
+ * meaning Unity's 30+ threads (main, UnityMain, AsyncRead, workers) do
+ * concurrent malloc/free WITHOUT locking, causing timing-sensitive heap
+ * corruption. The Instruction Abort post-vkAcquireNextImageKHR (corrupted
+ * function pointer/return address, different address each run) fits this.
+ * We define the strong symbols with a recursive RMutex (newlib docs say the
+ * lock can be taken re-entrantly). If libnx ever provides its own, the
+ * linker picks the strong wrapper symbol. Safe no-op if locks turn out
+ * to already be present (just adds a tiny overhead). */
+static RMutex g_malloc_rmutex;
+static int g_malloc_rmutex_init = 0;
+void __malloc_lock(void) {
+    if (!g_malloc_rmutex_init) {
+        rmutexInit(&g_malloc_rmutex);
+        g_malloc_rmutex_init = 1;
+    }
+    rmutexLock(&g_malloc_rmutex);
+}
+void __malloc_unlock(void) {
+    rmutexUnlock(&g_malloc_rmutex);
+}
+
 // futex(2) emulation over libnx mutex+condvar. The il2cpp runtime synchronizes
 // its GC, thread pool and locks with raw futex; returning ENOSYS made every
 // waiter spin forever (the syscall(98) -> ENOSYS flood) and threading never made
