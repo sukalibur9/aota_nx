@@ -263,11 +263,25 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     } else {
       /* Infinite wait: loop until value changes or woken. The old code did a
        * single 16ms wait then returned success, causing Unity to spin-call
-       * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c). */
+       * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c).
+       * Build #70: cap at ~5s (312 x 16ms). The Loading.AsyncRead threads
+       * park at libunity.so+0x127a57c in an infinite FUTEX_WAIT that is never
+       * woken (async I/O completion never signaled) — deadlocking 25+ threads
+       * post-vkAcquireNextImageKHR. A bounded wait lets Unity see ETIMEDOUT
+       * and either retry or handle it, instead of hanging forever. The waiter
+       * re-checks *uaddr on return, so this is safe. */
       const u64 gen0 = futex_wake_gen[h];
-      while (*uaddr == val && futex_wake_gen[h] == gen0) {
+      int spins = 0;
+      while (*uaddr == val && futex_wake_gen[h] == gen0 && spins < 312) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+        spins++;
+      }
+      if (spins >= 312 && *uaddr == val && futex_wake_gen[h] == gen0) {
+        void *caller = __builtin_return_address(0);
+        debugPrintf("[futex] TIMEOUT ua=%p val=%d after ~5s tid=%d caller=%p (was infinite wait)\n",
+                    (void *)uaddr, val, gettid_fake(), caller);
+        errno = ETIMEDOUT; ret = -1;
       }
     }
     mutexUnlock(&futex_lock[h]);
