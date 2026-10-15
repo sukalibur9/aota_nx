@@ -554,6 +554,28 @@ static void gl_ShaderSource_log(GLuint sh, GLsizei count, const GLchar *const *s
   free(fixed);
 }
 
+/* Build #83: log shader compilation results. Unity 6000.5 might use GLSL
+ * features that mesa 20.1.0/nouveau doesn't support, causing compile failures
+ * that lead to null shader objects and the 0x11038d8 crash. */
+static void gl_CompileShader_log(GLuint sh) {
+  glCompileShader(sh);
+  GLint status = 0;
+  glGetShaderiv(sh, 0x8B81 /*GL_COMPILE_STATUS*/, &status);
+  if (!status) {
+    static unsigned n;
+    if (n < 5) { n++;
+      char log[1024];
+      GLsizei len = 0;
+      glGetShaderInfoLog(sh, sizeof(log)-1, &len, log);
+      log[len] = 0;
+      debugPrintf("[gl] SHADER COMPILE FAILED sh=%u: %.500s\n", (unsigned)sh, log);
+    }
+  } else {
+    static unsigned ok;
+    if (ok < 3) { ok++; debugPrintf("[gl] shader compile OK sh=%u\n", (unsigned)sh); }
+  }
+}
+
 /* Completeness check on every FBO bind: the black screen is glerr=0x506
  * (GL_INVALID_FRAMEBUFFER_OPERATION) with draws>0, i.e. Unity renders into an
  * incomplete framebuffer and every draw is dropped. Report each offending FBO
@@ -1292,7 +1314,7 @@ DynLibFunction dynlib_functions[] = {
   { "glBufferData", (uintptr_t)&glBufferData }, { "glClear", (uintptr_t)&glClear },
   { "glClearColor", (uintptr_t)&glClearColor }, { "glClearDepthf", (uintptr_t)&glClearDepthf },
   { "glClearStencil", (uintptr_t)&glClearStencil }, { "glColorMask", (uintptr_t)&glColorMask },
-  { "glCompileShader", (uintptr_t)&glCompileShader }, { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
+  { "glCompileShader", (uintptr_t)&gl_CompileShader_log }, { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
   { "glCreateProgram", (uintptr_t)&glCreateProgram }, { "glCreateShader", (uintptr_t)&glCreateShader },
   { "glCullFace", (uintptr_t)&glCullFace }, { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
   { "glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers }, { "glDeleteProgram", (uintptr_t)&glDeleteProgram },
