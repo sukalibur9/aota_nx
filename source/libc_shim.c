@@ -2211,6 +2211,13 @@ int getrusage_fake(int who, void *usage) { (void)who; if (usage) memset(usage, 0
 void *dlopen_fake(const char *name, int flags) {
   (void)flags;
   debugPrintf("dlopen(%s)\n", name ? name : "(self)");
+  /* Build #82: return NULL for libswappywrapper to make Unity disable Swappy
+   * gracefully. The binary patch to force-disable Swappy doesn't apply to
+   * Unity 6000.5.8f1 (offset mismatch), and the stub causes a crash. */
+  if (name && strstr(name, "swappy")) {
+    debugPrintf("dlopen(%s) -> NULL [swappy-disabled]\n", name);
+    return NULL;
+  }
   return (void *)0x1;
 }
 int dlclose_fake(void *h) { (void)h; return 0; }
