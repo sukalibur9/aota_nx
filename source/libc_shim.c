@@ -281,7 +281,11 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * Shorter requested timeouts are honored as-is with real ETIMEDOUT. */
       const u64 ns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
       const u64 CAP = 16000000ULL;
-      const u64 MAX_WAIT_NS = 5000000000ULL;
+      /* Build #86: Reduce MAX_WAIT from 5s to 100ms. Unity's render loop
+       * stalls with black screen because main thread waits on futex with
+       * 49-day timeout. 5s fake-wake is too slow for 60fps (needs ~16ms).
+       * 100ms allows Unity to make progress without busy-spinning. */
+      const u64 MAX_WAIT_NS = 100000000ULL;
       const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
       const int capped = ns > MAX_WAIT_NS;
       const u64 gen0 = futex_wake_gen[h];
@@ -299,7 +303,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
         if (capped) {
           /* Fake wake: return 0 (success) as if woken. Unity re-checks *uaddr. */
           void *caller = __builtin_return_address(0);
-          debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~5s tid=%d caller=%p (req %llums)\n",
+          debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (req %llums)\n",
                       (void *)uaddr, val, gettid_fake(), caller,
                       (unsigned long long)(ns / 1000000ULL));
           ret = 0;
@@ -312,19 +316,20 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * single 16ms wait then returned success, causing Unity to spin-call
        * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c).
        * Build #73: cap at ~5s (312 x 16ms) then return 0 (fake wake).
+       * Build #86: reduce to ~100ms (6 x 16ms) for faster render loop progress.
        * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
        * never woken -- a fake wake lets Unity re-check and re-wait instead
        * of hanging forever. */
       const u64 gen0 = futex_wake_gen[h];
       int spins = 0;
-      while (*uaddr == val && futex_wake_gen[h] == gen0 && spins < 312) {
+      while (*uaddr == val && futex_wake_gen[h] == gen0 && spins < 6) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
         condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
         spins++;
       }
-      if (spins >= 312 && *uaddr == val && futex_wake_gen[h] == gen0) {
+      if (spins >= 6 && *uaddr == val && futex_wake_gen[h] == gen0) {
         void *caller = __builtin_return_address(0);
-        debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~5s tid=%d caller=%p (was infinite wait)\n",
+        debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (was infinite wait)\n",
                     (void *)uaddr, val, gettid_fake(), caller);
         ret = 0;  /* fake wake, not ETIMEDOUT */
       }
