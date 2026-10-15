@@ -298,27 +298,16 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       const int capped = ns > MAX_WAIT_NS;
       /* Build #88: REMOVED gen0 capture. REA proved generation counter causes
        * missed-wakeup race. Now rely on value check, which is race-free when
-       * waker follows standard futex protocol. */
+       * waker follows standard futex protocol.
+       * Build #90: REVERTED #89 pulse fix. #89 caused system freeze (2162-0004).
+       * The R_SUCCEEDED check was buggy. Back to #88 logic: value check only. */
       u64 waited = 0;
       int woken = 0;
       while (waited < eff_ns) {
         u64 chunk = eff_ns - waited;
         if (chunk > CAP) chunk = CAP;
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        /* Build #89: FIX for Unity's "pulse" pattern. Unity calls futex_wake
-         * 4x WITHOUT persistently changing *uaddr (value stays 0).
-         * Standard Linux futex_wait returns 0 when woken by futex_wake,
-         * WITHOUT re-checking the value. The value is only checked BEFORE
-         * the initial wait.
-         * condvarWaitTimeout returns 0 (R_SUCCEEDED) if signaled,
-         * non-zero on timeout. If signaled, treat as woken. */
-        Result rc = condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
-        if (R_SUCCEEDED(rc)) {
-          /* Signaled by futex_wake — success (matches Linux futex semantics).
-           * Do NOT re-check *uaddr; Unity's pulse doesn't change it. */
-          woken = 1; break;
-        }
-        /* Timeout: increment waited and continue. Also check value as safety. */
+        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
         if (*uaddr != val) { woken = 1; break; }
         waited += chunk;
       }
@@ -344,16 +333,15 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * Build #89: Break on signal (not just value change) for Unity's pulse pattern.
        * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
        * never woken -- a fake wake lets Unity re-check and re-wait instead
-       * of hanging forever. */
+       * of hanging forever.
+       * Build #90: REVERTED #89 signaled flag. Back to #88 logic. */
       int spins = 0;
-      int signaled = 0;
-      while (*uaddr == val && spins < 6 && !signaled) {
+      while (*uaddr == val && spins < 6) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        Result rc = condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
-        if (R_SUCCEEDED(rc)) signaled = 1;  /* Woken by futex_wake (pulse) */
+        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
         spins++;
       }
-      if (spins >= 6 && *uaddr == val && !signaled) {
+      if (spins >= 6 && *uaddr == val) {
         void *caller = __builtin_return_address(0);
         debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (was infinite wait)\n",
                     (void *)uaddr, val, gettid_fake(), caller);
