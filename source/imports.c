@@ -678,6 +678,15 @@ static EGLBoolean egl_ChooseConfig_log(EGLDisplay d, const EGLint *attrib_list,
   return r;
 }
 
+/* Build #78: log eglMakeCurrent to see if Unity makes the context current */
+static EGLBoolean egl_MakeCurrent_log(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+  debugPrintf("[egl] eglMakeCurrent(d=%p draw=%p read=%p ctx=%p) called\n",
+              (void*)d, (void*)draw, (void*)read, (void*)ctx);
+  EGLBoolean r = eglMakeCurrent(d, draw, read, ctx);
+  debugPrintf("[egl] eglMakeCurrent -> %d\n", (int)r);
+  return r;
+}
+
 static EGLContext egl_CreateContext_log(EGLDisplay d, EGLConfig config,
                                         EGLContext share_context,
                                         const EGLint *attrib_list) {
@@ -1257,7 +1266,7 @@ DynLibFunction dynlib_functions[] = {
   { "eglChooseConfig", (uintptr_t)&egl_ChooseConfig_log },
   { "eglGetConfigAttrib", (uintptr_t)&eglGetConfigAttrib },
   { "eglCreateWindowSurface", (uintptr_t)&egl_CreateWindowSurface_log },
-  { "eglCreateContext", (uintptr_t)&egl_CreateContext_log }, { "eglMakeCurrent", (uintptr_t)&eglMakeCurrent },
+  { "eglCreateContext", (uintptr_t)&egl_CreateContext_log }, { "eglMakeCurrent", (uintptr_t)&egl_MakeCurrent_log },
   { "eglSwapBuffers", (uintptr_t)&egl_SwapBuffers_log }, { "eglQuerySurface", (uintptr_t)&egl_QuerySurface_log },
   { "eglDestroyContext", (uintptr_t)&eglDestroyContext }, { "eglDestroySurface", (uintptr_t)&egl_DestroySurface_log },
 
