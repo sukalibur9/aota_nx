@@ -103,43 +103,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL shim_CreateAndroidSurfaceKHR(
 static VKAPI_ATTR VkResult VKAPI_CALL shim_CreateInstance(
     const VkInstanceCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
-  if (pCreateInfo == NULL || pCreateInfo->enabledExtensionCount == 0 ||
-      pCreateInfo->ppEnabledExtensionNames == NULL ||
-      pCreateInfo->enabledExtensionCount > SHIM_MAX_INSTANCE_EXTS) {
-    return vkCreateInstance(pCreateInfo, pAllocator, pInstance);
-  }
-
-  const char* names[SHIM_MAX_INSTANCE_EXTS];
-  uint32_t count = 0;
-  int have_vi = 0;
-  int translated = 0;
-
-  for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-    if (streq(pCreateInfo->ppEnabledExtensionNames[i], VK_NN_VI_SURFACE_EXTENSION_NAME))
-      have_vi = 1;
-  }
-
-  for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-    const char* name = pCreateInfo->ppEnabledExtensionNames[i];
-    if (streq(name, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
-      translated = 1;
-      if (have_vi) continue; /* the native extension is already requested */
-      name = VK_NN_VI_SURFACE_EXTENSION_NAME;
-      have_vi = 1;
-    }
-    names[count++] = name;
-  }
-
-  if (!translated) return vkCreateInstance(pCreateInfo, pAllocator, pInstance);
-
-  debugPrintf("[vulkan] vkCreateInstance: %s -> %s (%u extensions)\n",
-              VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
-              VK_NN_VI_SURFACE_EXTENSION_NAME, (unsigned)count);
-
-  VkInstanceCreateInfo info = *pCreateInfo;
-  info.enabledExtensionCount = count;
-  info.ppEnabledExtensionNames = names;
-  return vkCreateInstance(&info, pAllocator, pInstance);
+  /* Build #77: Force GLES fallback by failing Vulkan instance creation.
+   * Unity 6000.5.8f1 defaults to Vulkan on Android, but the Vulkan path
+   * consistently crashes post-vkAcquireNextImageKHR (Instruction Abort,
+   * 76 builds). Unity has GLES code (eglChooseConfig, OpenGL ES 3 strings
+   * found in libunity.so), so failing here should trigger the GLES fallback.
+   * VK_ERROR_INCOMPATIBLE_DRIVER = -9 */
+  debugPrintf("[vulkan] Build #77: forcing GLES fallback, vkCreateInstance returns VK_ERROR_INCOMPATIBLE_DRIVER\n");
+  (void)pCreateInfo; (void)pAllocator; (void)pInstance;
+  return -9; /* VK_ERROR_INCOMPATIBLE_DRIVER */
 }
 
 /* ---------------------------------------------------------------------------
