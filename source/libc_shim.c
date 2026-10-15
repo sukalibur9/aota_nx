@@ -2235,6 +2235,15 @@ static const unsigned char* glGetString_log(unsigned int name) {
   return r;
 }
 
+/* Build #81: Swappy stub. Unity dlopen()s libswappywrapper and dlsym()s
+ * UnitySwappyWrapperInit. If we return NULL, Unity may not handle it and
+ * crash with null deref later (seen at libunity.so+0x11038d8, far=0xe8).
+ * Provide a dummy init that returns a non-null handle. */
+static void* UnitySwappyWrapperInit_stub(void) {
+  debugPrintf("[swappy] UnitySwappyWrapperInit_stub called -> dummy handle\n");
+  return (void*)0x5CA1AB1E;
+}
+
 void *dlsym_fake(void *handle, const char *symbol) {
   (void)handle;
   if (!symbol) return NULL;
@@ -2259,6 +2268,11 @@ void *dlsym_fake(void *handle, const char *symbol) {
     }
     p = (void *)eglGetProcAddress(symbol);
     if (p) { debugPrintf("dlsym(%s) -> %p [egl]\n", symbol, p); return p; }
+  }
+  /* Build #81: Swappy stub - Unity expects libswappywrapper */
+  if (strcmp(symbol, "UnitySwappyWrapperInit") == 0) {
+    debugPrintf("dlsym(%s) -> %p [swappy-stub]\n", symbol, (void*)UnitySwappyWrapperInit_stub);
+    return (void*)UnitySwappyWrapperInit_stub;
   }
   /* 4) Vulkan WSI translation (mesa-switch NVK): Unity (Android build) asks
    *    for VK_KHR_android_surface / vkCreateAndroidSurfaceKHR, but NVK
