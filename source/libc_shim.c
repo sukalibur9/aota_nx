@@ -167,14 +167,16 @@ int gettid_fake(void) {
  * to already be present (just adds a tiny overhead). */
 static RMutex g_malloc_rmutex;
 static int g_malloc_rmutex_init = 0;
-void __malloc_lock(void) {
+void __malloc_lock(struct _reent *reent) {
+    (void)reent;
     if (!g_malloc_rmutex_init) {
         rmutexInit(&g_malloc_rmutex);
         g_malloc_rmutex_init = 1;
     }
     rmutexLock(&g_malloc_rmutex);
 }
-void __malloc_unlock(void) {
+void __malloc_unlock(struct _reent *reent) {
+    (void)reent;
     rmutexUnlock(&g_malloc_rmutex);
 }
 
