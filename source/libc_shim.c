@@ -2215,6 +2215,26 @@ void *dlopen_fake(const char *name, int flags) {
 }
 int dlclose_fake(void *h) { (void)h; return 0; }
 const char *dlerror_fake(void) { return NULL; }
+
+/* Build #79: log glGetString to see what Unity queries after eglMakeCurrent.
+ * Unity likely checks GL_VERSION, GL_RENDERER, GL_EXTENSIONS. If mesa doesn't
+ * provide what Unity expects, it may abort (the User Break we're seeing). */
+static const unsigned char* (*real_glGetString)(unsigned int name) = NULL;
+static const unsigned char* glGetString_log(unsigned int name) {
+  if (!real_glGetString) {
+    real_glGetString = (const unsigned char* (*)(unsigned int))eglGetProcAddress("glGetString");
+  }
+  const unsigned char* r = real_glGetString ? real_glGetString(name) : (const unsigned char*)"";
+  const char* nstr = "UNKNOWN";
+  if (name == 0x1F00) nstr = "GL_VENDOR";
+  else if (name == 0x1F01) nstr = "GL_RENDERER";
+  else if (name == 0x1F02) nstr = "GL_VERSION";
+  else if (name == 0x1F03) nstr = "GL_EXTENSIONS";
+  else if (name == 0x8B8C) nstr = "GL_SHADING_LANGUAGE_VERSION";
+  debugPrintf("[gl] glGetString(%s=0x%x) -> \"%s\"\n", nstr, name, r ? (const char*)r : "(null)");
+  return r;
+}
+
 void *dlsym_fake(void *handle, const char *symbol) {
   (void)handle;
   if (!symbol) return NULL;
@@ -2230,8 +2250,13 @@ void *dlsym_fake(void *handle, const char *symbol) {
    *  contains no Firebase class literals and no FirebaseCpp P/Invoke names --
    *  so the whole path is gone rather than left as a dead branch.) */
   /* 3) the full GLES/EGL API (~150 entry points) lives in mesa, beyond our
-   *    static table -- resolve any gl or egl symbol via eglGetProcAddress. */
+   *    static table -- resolve any gl or egl symbol via eglGetProcAddress.
+   *    Build #79: intercept glGetString for logging (Unity queries version/caps). */
   if (!strncmp(symbol, "gl", 2) || !strncmp(symbol, "egl", 3)) {
+    if (strcmp(symbol, "glGetString") == 0) {
+      debugPrintf("dlsym(%s) -> %p [gl-log-wrapper]\n", symbol, (void*)glGetString_log);
+      return (void*)glGetString_log;
+    }
     p = (void *)eglGetProcAddress(symbol);
     if (p) { debugPrintf("dlsym(%s) -> %p [egl]\n", symbol, p); return p; }
   }
