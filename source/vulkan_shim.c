@@ -367,14 +367,20 @@ trace_GetSwapchainImages(VkDevice dev, VkSwapchainKHR sc, uint32_t* n, VkImage* 
   debugPrintf("[vulkan] CALL vkGetSwapchainImagesKHR(dev=%p sc=%p)\n", (void*)dev, (void*)sc);
   VkResult r = g_real_GetSwapchainImages(dev, sc, n, imgs);
   debugPrintf("[vulkan] RET vkGetSwapchainImagesKHR = %d (count=%u)\n", r, n ? *n : 0);
+  /* Build #76 diagnostic: dump image handles to verify they're valid */
+  if (r == 0 && n && *n > 0 && imgs) {
+    for (uint32_t i = 0; i < *n && i < 4; i++) {
+      debugPrintf("[vulkan]   image[%u] = %p\n", i, (void*)imgs[i]);
+    }
+  }
   return r;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 trace_AcquireNextImage(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout,
                        VkSemaphore sem, VkFence fence, uint32_t* idx) {
-  debugPrintf("[vulkan] CALL vkAcquireNextImageKHR(dev=%p sc=%p timeout=%llu)\n",
-              (void*)dev, (void*)sc, (unsigned long long)timeout);
+  debugPrintf("[vulkan] CALL vkAcquireNextImageKHR(dev=%p sc=%p timeout=%llu sem=%p fence=%p)\n",
+              (void*)dev, (void*)sc, (unsigned long long)timeout, (void*)sem, (void*)fence);
   VkResult r = g_real_AcquireNextImage(dev, sc, timeout, sem, fence, idx);
   debugPrintf("[vulkan] RET vkAcquireNextImageKHR = %d (index=%u)\n", r, idx ? *idx : 999);
   /* Build #67 diagnostic: try dummy present to see if Unity unblocks */
