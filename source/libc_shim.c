@@ -259,9 +259,12 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       if (!seen) {
         u64 tns = 0;
         if (to) tns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
-        debugPrintf("[futex] WAIT ua=%p val=%d timeout=%llums tid=%d\n",
+        /* Build #87: log caller address so we can identify which Unity
+         * function is waiting on the futex (for REA analysis). */
+        void *caller = __builtin_return_address(0);
+        debugPrintf("[futex] WAIT ua=%p val=%d timeout=%llums tid=%d caller=%p\n",
                     (void *)uaddr, val, (unsigned long long)(tns / 1000000ULL),
-                    gettid_fake());
+                    gettid_fake(), caller);
       }
     }
     long ret = 0;
