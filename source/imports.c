@@ -620,9 +620,20 @@ static void gl_TexImage2D_log(GLenum target, GLint level, GLint ifmt,
 static void gl_FramebufferTexture2D_log(GLenum target, GLenum att, GLenum textarget,
                                         GLuint tex, GLint level) {
   glFramebufferTexture2D(target, att, textarget, tex, level);
-  if (tex >= 2300 && tex <= 2400) {
+  /* Build #80: log ALL fbTex2D calls to see if Unity attaches the texture.
+   * The FBO is incomplete (no color attachment) which causes the crash. */
+  {
     static unsigned n;
-    if (n < 3) { n++;
+    if (n < 10) { n++;
+      GLenum st = glCheckFramebufferStatus(target);
+      GLenum e = glGetError();
+      debugPrintf("[gfx] fbTex2D att=0x%x tex=%u level=%d -> fbo_status=0x%x err=0x%x\n",
+                  (unsigned)att, (unsigned)tex, (int)level, (unsigned)st, (unsigned)e);
+    }
+  }
+  if (tex >= 2300 && tex <= 2400) {
+    static unsigned m;
+    if (m < 3) { m++;
       GLenum st = glCheckFramebufferStatus(target);
       debugPrintf("[gfx] fbTex2D att=0x%x textarget=0x%x tex=%u level=%d -> status=0x%x\n",
                   (unsigned)att, (unsigned)textarget, (unsigned)tex, (int)level, (unsigned)st);
