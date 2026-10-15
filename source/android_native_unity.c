@@ -307,7 +307,7 @@ static struct ALooper *looper_for(u32 tid, int create){
 static u32 cur_tid(void){ return (u32)(uintptr_t)threadGetCurHandle(); }
 
 ALooper *ALooper_prepare(int opts){ (void)opts; return (ALooper *)looper_for(cur_tid(), 1); }
-ALooper *ALooper_forThread(void){  return (ALooper *)looper_for(cur_tid(), 0); }
+ALooper *ALooper_forThread(void){  return (ALooper *)looper_for(cur_tid(), 1); }
 void     ALooper_acquire(ALooper *l){ struct ALooper *L=(void*)l; if(L){ mutexLock(&L->m); L->refs++; mutexUnlock(&L->m);} }
 void     ALooper_release(ALooper *l){ struct ALooper *L=(void*)l; if(L){ mutexLock(&L->m); if(--L->refs<=0) L->used=0; mutexUnlock(&L->m);} }
 
