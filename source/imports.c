@@ -171,12 +171,24 @@ static int ensure_cond(pthread_cond_t **cnd) {
   if ((uintptr_t)*cnd < 0x10000) return pthread_cond_init_fake(cnd, NULL);
   return 0;
 }
-int pthread_cond_broadcast_fake(pthread_cond_t **cnd) { if (ensure_cond(cnd) < 0) return -1; return pthread_cond_broadcast(*cnd); }
+int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
+  if (ensure_cond(cnd) < 0) return -1;
+  /* Build #101: diagnostic logging for once-init deadlock investigation.
+   * Log all broadcasts to see if the once-init completer ever signals. */
+  debugPrintf("[cond] BROADCAST cnd=%p\n", (void *)*cnd);
+  return pthread_cond_broadcast(*cnd);
+}
 int pthread_cond_signal_fake(pthread_cond_t **cnd) { if (ensure_cond(cnd) < 0) return -1; return pthread_cond_signal(*cnd); }
 int pthread_cond_destroy_fake(pthread_cond_t **cnd) { if (cnd && (uintptr_t)*cnd >= 0x10000) { pthread_cond_destroy(*cnd); free(*cnd); *cnd = NULL; } return 0; }
 int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
   if (ensure_cond(cnd) < 0 || ensure_mutex(mtx) < 0) return -1;
   diag_wait_enter(DIAG_W_COND, *cnd);
+  /* Build #101: diagnostic - log wait entry (deduplicated by cond address to avoid spam) */
+  static pthread_cond_t *last_logged_cnd = NULL;
+  if (*cnd != last_logged_cnd) {
+    debugPrintf("[cond] WAIT cnd=%p mtx=%p\n", (void *)*cnd, (void *)*mtx);
+    last_logged_cnd = *cnd;
+  }
   struct timespec cap;                        /* PvZ: cap indefinite wait at 16ms re-poll */
   clock_gettime(CLOCK_MONOTONIC, &cap);
   long add = 16 * 1000000L;
