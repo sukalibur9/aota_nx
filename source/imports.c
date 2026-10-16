@@ -712,12 +712,9 @@ static EGLBoolean egl_ChooseConfig_log(EGLDisplay d, const EGLint *attrib_list,
 }
 
 /* Build #78: log eglMakeCurrent to see if Unity makes the context current */
-/* Build #93: add tid logging to identify which thread binds the GL context.
- * The GfxDeviceWorker (render thread) starts but goes silent — we need to know
- * if it ever calls eglMakeCurrent. */
 static EGLBoolean egl_MakeCurrent_log(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx) {
-  debugPrintf("[egl] eglMakeCurrent(d=%p draw=%p read=%p ctx=%p) called tid=%d\n",
-              (void*)d, (void*)draw, (void*)read, (void*)ctx, gettid_fake());
+  debugPrintf("[egl] eglMakeCurrent(d=%p draw=%p read=%p ctx=%p) called\n",
+              (void*)d, (void*)draw, (void*)read, (void*)ctx);
   EGLBoolean r = eglMakeCurrent(d, draw, read, ctx);
   debugPrintf("[egl] eglMakeCurrent -> %d\n", (int)r);
   return r;
