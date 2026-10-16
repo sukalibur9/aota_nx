@@ -220,13 +220,11 @@ static const NxPatchWord OS_BRANCH_FORCES[] = {
    * it will proceed past the deadlock.
    * Build #103 FIX: use virtual address 0x127e548 (file offset 0x127a548 maps to
    * vaddr 0x127e548 via LOAD seg 2). #102 used file offset as vaddr -> mismatch.
-   * Build #104: (superseded) wrong location; real hang is at 0x127a578 below. */
+   * Build #104: (REVERTED 2026-10-17) NOP at 0x127a578 broke synchronization.
+   * REA root-cause: blind NOP patches move the hang instead of fixing it.
+   * Reverting to investigate what the futex actually waits for. */
   { 0x127e548, 0x940fc649, 0x52800000 },  /* bl 0x166be6c -> mov w0, #0 */
-  /* Build #104: bypass raw futex syscall wait at vaddr 0x127a578.
-   * Threads stuck here doing syscall(SYS_futex, FUTEX_WAIT_PRIVATE) directly.
-   * Patch the BL to NOP to skip the wait. Diagnostic: if Unity proceeds, the
-   * wait wasn't critical; if it crashes, the wait was necessary. */
-  { 0x127a578, 0x94105c9e, 0xd503201f },  /* bl 0x16917f0 -> nop */
+  /* Build #104 REVERTED: { 0x127a578, 0x94105c9e, 0xd503201f }, */
 };
 #define OS_BRANCH_FORCES_N (OS_HAVE_BRANCH_FORCES ? \
   ((int)(sizeof(OS_BRANCH_FORCES)/sizeof(OS_BRANCH_FORCES[0]))) : 0)
