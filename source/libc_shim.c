@@ -409,6 +409,19 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     futex_slot_t *s = futex_slot_acquire(uaddr);
     if (!s) return futex_wait_bucket_fallback(uaddr, val, to);
 
+    /* Build #95: diagnostic slot logging. Build #94 showed a deterministic
+     * lost-wake: main thread WAITs (infinite) on an address, 4x FUTEX_WAKE
+     * to that exact address are all lost, and the waiter never even gets a
+     * FAKEWAKE (never completes 6x16ms spins). Log which slot the waiter
+     * attaches to and what the waker finds, to distinguish slot-mismatch
+     * from waiter-stuck-before-condvar. */
+    {
+      int slot_idx = (int)(s - futex_slots);
+      debugPrintf("[futex] SLOT-WAIT ua=%p slot=%d gen=%llu refcount=%d tid=%d caller=%p\n",
+                  (void *)uaddr, slot_idx, (unsigned long long)s->gen,
+                  s->refcount, gettid_fake(), __builtin_return_address(0));
+    }
+
     long ret = 0;
     mutexLock(&s->m);
     const u64 gen0 = s->gen;
@@ -508,13 +521,23 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     fxown_wake(uaddr);
     /* Build #91: signal ONLY the slot of this exact address, bumping its
      * generation under the slot mutex so no waiter can miss it or mistake
-     * another address's wake for its own. */
+     * another address's wake for its own.
+     * Build #95: diagnostic - log what the waker finds. */
     futex_slot_t *s = futex_slot_find(uaddr);
     if (s) {
+      int slot_idx = (int)(s - futex_slots);
       mutexLock(&s->m);
+      u64 gen_before = s->gen;
       s->gen++;
       condvarWakeAll(&s->cv);
       mutexUnlock(&s->m);
+      debugPrintf("[futex] SLOT-WAKE ua=%p slot=%d gen %llu->%llu refcount=%d tid=%d\n",
+                  (void *)uaddr, slot_idx,
+                  (unsigned long long)gen_before, (unsigned long long)s->gen,
+                  s->refcount, gettid_fake());
+    } else {
+      debugPrintf("[futex] SLOT-WAKE-MISS ua=%p (no slot bound) tid=%d\n",
+                  (void *)uaddr, gettid_fake());
     }
     /* else: nobody waiting on this address -- pulse lost, same as Linux. */
     return val > 0 ? val : 0; // approximate count woken
