@@ -445,7 +445,9 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       while (!done && waited < eff_ns) {
         u64 chunk = eff_ns - waited;
         if (chunk > CAP) chunk = CAP;
-        diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
+        /* Build #96: fxown_spin/diag_futex_spin removed -- fxown_spin takes
+         * fxown_lk while the waiter holds the slot mutex (lock-order hazard);
+         * diag spin-counting is done by the watchdog from the wait state. */
         Result wrc = condvarWaitTimeout(&s->cv, &s->m, chunk);
         /* libnx contract: s->m is held again here, wake or timeout. */
         if (*uaddr != val) {
@@ -479,25 +481,26 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
         }
       }
     } else {
-      /* Infinite wait: same pulse-aware loop, then the fake-wake safety net. */
-      int spins = 0;
+      /* Infinite wait: single 100ms pulse-aware wait, then the fake-wake
+       * safety net.
+       * Build #96: replaced the 6x16ms chunked loop. Build #95 proved main
+       * hard-parks without ever completing 6 spins (no FAKEWAKE in 180+s),
+       * so the chunked re-entry is where it gets stuck; fxown_spin takes
+       * fxown_lk while holding the slot mutex (lock-order hazard), now
+       * removed. A single 100ms condvar wait cannot get stuck re-entering. */
       int done = 0;
-      while (!done && spins < 6) {
-        diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        Result wrc = condvarWaitTimeout(&s->cv, &s->m, 16000000ULL);
-        if (*uaddr != val) {
-          done = 1;
-        } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
-          done = 1;
-          /* Build #92: 4-frame backtrace for real waiter identification. */
-          void *c0 = __builtin_return_address(0);
-          void *c1 = __builtin_return_address(1);
-          void *c2 = __builtin_return_address(2);
-          void *c3 = __builtin_return_address(3);
-          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p (infinite wait)\n",
-                      (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
-        }
-        spins++;
+      Result wrc = condvarWaitTimeout(&s->cv, &s->m, 100000000ULL);
+      if (*uaddr != val) {
+        done = 1;
+      } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
+        done = 1;
+        /* Build #92: 4-frame backtrace for real waiter identification. */
+        void *c0 = __builtin_return_address(0);
+        void *c1 = __builtin_return_address(1);
+        void *c2 = __builtin_return_address(2);
+        void *c3 = __builtin_return_address(3);
+        debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p (infinite wait)\n",
+                    (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
       }
       if (!done) {
         void *caller = __builtin_return_address(0);
