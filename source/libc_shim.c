@@ -180,33 +180,163 @@ void __malloc_unlock(struct _reent *reent) {
     rmutexUnlock(&g_malloc_rmutex);
 }
 
-// futex(2) emulation over libnx mutex+condvar. The il2cpp runtime synchronizes
-// its GC, thread pool and locks with raw futex; returning ENOSYS made every
-// waiter spin forever (the syscall(98) -> ENOSYS flood) and threading never made
-// progress. Wait queues are hashed by uaddr into a bucket array; FUTEX_WAKE wakes
-// the whole bucket (waiters re-check *uaddr, so over-broad wakes are harmless).
-// The bucket mutex serializes compare-and-sleep against wakers so no wake is lost.
-// Infinite waits are capped at 16ms and return as if woken: under load a wake can
-// be missed (the Unity Job System / GC otherwise deadlock), and a bounded re-poll
-// recovers it safely since the waiter re-checks *uaddr before proceeding.
+// futex(2) emulation for the il2cpp runtime, which synchronizes its GC,
+// thread pool and locks with raw futex.
+//
+// Design (build #91): per-address wait slots.
+//
+// Unity 6000.5.8f1 uses a "pulse" wake pattern: FUTEX_WAKE issued WITHOUT
+// changing *uaddr (observed 4x in the build #88 hardware test). Correct Linux
+// futex semantics require futex_wait to return 0 when woken even while
+// *uaddr == val still holds.
+//
+// Build #89 tried exactly that -- break out of the wait when
+// condvarWaitTimeout reported success ("signaled") instead of re-checking the
+// value. It unblocked the main thread (Unity reached asset loading), but then
+// the Switch froze hard (error 2162-0004, 10 s force-shutdown, log tail was
+// binary garbage = heap corruption).
+//
+// Root cause of the #89 freeze: the condvar it waited on is shared by EVERY
+// futex address hashing to the same bucket (FUTEX_WAKE wakes the whole
+// bucket). A wake issued for address X therefore also released waiters parked
+// on unrelated address Y with a false "success". Those threads proceeded past
+// waits whose condition was never satisfied -- e.g. entered a mutex critical
+// section while the owner still held it -- corrupting the heap until the
+// kernel aborted the process. The value re-check that #88 relied on is the
+// only thing that made bucket-wide wakes safe; #89 dropped it on the wake
+// path, turning cross-address wakes into silent data races.
+//
+// The fix: never share a wait queue between different addresses. Each waiter
+// attaches to a slot keyed by its EXACT uaddr; FUTEX_WAKE signals only the
+// slot of the address being woken. A "signaled" wake therefore provably means
+// YOUR address was pulsed, and returning 0 without a value re-check is then
+// correct Linux semantics. Each slot carries a generation counter bumped by
+// the waker while holding the slot mutex; the waiter captures the generation
+// while holding the same mutex and then sleeps atomically on the slot
+// condvar, so a wake can be neither lost nor misattributed. (Verified against
+// libnx 4.9.0: condvarWaitTimeout requires the mutex held, returns it held,
+// returns 0 on signal and a 0xEA01-valued error on timeout.)
+//
+// Safety nets kept from #90: waits are chunked (16 ms); over-long timeouts
+// (e.g. Unity's 49-day "infinite" 0xFFFFFFFF ms) are capped at 100 ms and then
+// fake-woken (return 0) so a genuinely lost pulse can never hang forever;
+// short timeouts still return a real ETIMEDOUT.
 #define FUTEX_WAIT        0
 #define FUTEX_WAKE        1
 #define FUTEX_WAIT_BITSET 9
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_CMD_MASK    0x7f  // strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256)
-/* Build #88: Increase from 256 to 4096 to reduce hash collisions.
+
+#define FUTEX_SLOTS 1024  // distinct futex addresses ever waited on; Unity uses dozens
+typedef struct {
+  uintptr_t uaddr;  // exact waited-on address; 0 = free slot (sticky once bound)
+  u64 gen;          // bumped under m on every FUTEX_WAKE for uaddr
+  int refcount;     // waiters currently attached
+  Mutex m;          // serializes the gen handshake against sleep/wake
+  CondVar cv;       // signaled only for THIS uaddr
+} futex_slot_t;
+static futex_slot_t futex_slots[FUTEX_SLOTS];  // zero-init: all free
+static Mutex futex_tab_lock;                   // guards uaddr/refcount allocation
+
+// Attach to the slot for uaddr, creating it if needed. Returns NULL only if
+// every slot is in use (practically unreachable at 1024); the caller then
+// uses the legacy bucket fallback (value-check only, no pulse break).
+static futex_slot_t *futex_slot_acquire(volatile int32_t *uaddr) {
+  futex_slot_t *s = NULL;
+  mutexLock(&futex_tab_lock);
+  for (int i = 0; i < FUTEX_SLOTS; i++)
+    if (futex_slots[i].uaddr == (uintptr_t)uaddr) { s = &futex_slots[i]; break; }
+  if (!s)
+    for (int i = 0; i < FUTEX_SLOTS; i++)
+      if (futex_slots[i].uaddr == 0 && futex_slots[i].refcount == 0) {
+        s = &futex_slots[i];
+        s->uaddr = (uintptr_t)uaddr;
+        s->gen = 0;  // safe: refcount==0 means no waiter can compare a stale gen
+        break;
+      }
+  if (s) s->refcount++;
+  mutexUnlock(&futex_tab_lock);
+  return s;
+}
+
+static void futex_slot_release(futex_slot_t *s) {
+  mutexLock(&futex_tab_lock);
+  s->refcount--;
+  // uaddr stays bound (sticky): a later waiter reuses the slot and captures a
+  // fresh gen, so there is no stale-generation hazard; a waker arriving while
+  // no one waits still finds the slot and signals an empty condvar (harmless).
+  mutexUnlock(&futex_tab_lock);
+}
+
+// Find WITHOUT creating: the wake path must not allocate a slot for an
+// address no one waits on (the pulse is then simply lost, as on Linux).
+static futex_slot_t *futex_slot_find(volatile int32_t *uaddr) {
+  futex_slot_t *s = NULL;
+  mutexLock(&futex_tab_lock);
+  for (int i = 0; i < FUTEX_SLOTS; i++)
+    if (futex_slots[i].uaddr == (uintptr_t)uaddr) { s = &futex_slots[i]; break; }
+  mutexUnlock(&futex_tab_lock);
+  return s;
+}
+
+// Legacy bucket arrays -- kept ONLY for the slot-table-full fallback below.
+/* Build #88: Increased from 256 to 4096 to reduce hash collisions.
  * REA analysis found cross-talk between unrelated futexes due to collisions. */
 #define FUTEX_BUCKETS     4096
 
 static Mutex   futex_lock[FUTEX_BUCKETS];   // libnx Mutex/CondVar are u32; 0 == ready
 static CondVar futex_cond[FUTEX_BUCKETS];
-/* Wake generation per bucket — DEPRECATED in build #88.
- * REA analysis proved this causes missed-wakeup race: if waker signals before
- * waiter captures gen0, the wake is lost forever. Removed; we rely solely on
- * the value check (*uaddr != val) which is race-free when waker follows
- * standard futex protocol (change value BEFORE wake). */
-static volatile u64 futex_wake_gen[FUTEX_BUCKETS];
 
+// Fallback when the slot table is full: the build-#90 bucket wait,
+// value-check only, no pulse break. Safe by construction (never returns
+// success without *uaddr != val, except the 100 ms fake-wake safety net,
+// same as #90).
+// (fxown_* are defined just below; forward-declared for the fallback.)
+static void fxown_spin(volatile int32_t *uaddr);
+static void fxown_wake(volatile int32_t *uaddr);
+static long futex_wait_bucket_fallback(volatile int32_t *uaddr, int val, const struct timespec *to) {
+  const unsigned h = (unsigned)(((uintptr_t)uaddr >> 4) & (FUTEX_BUCKETS - 1));
+  long ret = 0;
+  debugPrintf("[futex] SLOT-TABLE FULL, bucket fallback ua=%p (should never happen)\n",
+              (void *)uaddr);
+  mutexLock(&futex_lock[h]);
+  if (*uaddr != val) {
+    errno = EAGAIN; ret = -1;
+  } else if (to) {
+    const u64 ns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
+    const u64 CAP = 16000000ULL;
+    const u64 MAX_WAIT_NS = 100000000ULL;
+    const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
+    const int capped = ns > MAX_WAIT_NS;
+    u64 waited = 0;
+    int woken = 0;
+    while (waited < eff_ns) {
+      u64 chunk = eff_ns - waited;
+      if (chunk > CAP) chunk = CAP;
+      diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
+      condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
+      if (*uaddr != val) { woken = 1; break; }
+      waited += chunk;
+    }
+    if (!woken) {
+      if (capped) {
+        ret = 0;  // fake wake, same as #90
+      } else {
+        errno = ETIMEDOUT; ret = -1;
+      }
+    }
+  } else {
+    int spins = 0;
+    while (*uaddr == val && spins < 6) {
+      diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
+      condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+      spins++;
+    }
+    ret = 0;  // fake wake, same as #90
+  }
+  mutexUnlock(&futex_lock[h]);
+  return ret;
+}
 #define FXOWN_N 64
 static uintptr_t fxown_a[FXOWN_N];
 static unsigned  fxown_c[FXOWN_N];
@@ -250,7 +380,6 @@ static void fxown_wake(volatile int32_t *uaddr) {
 }
 static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct timespec *to) {
   const int cmd = op & FUTEX_CMD_MASK;
-  const unsigned h = (unsigned)(((uintptr_t)uaddr >> 4) & (FUTEX_BUCKETS - 1));
   if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
     /* diagnostic: log each distinct waited-on address once (who waits for what) */
     {
@@ -272,46 +401,53 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
                     gettid_fake(), caller);
       }
     }
+
+    /* Build #91: per-address wait slot. The waiter holds the slot mutex from
+     * the value check through the atomic sleep, and the waker must take the
+     * same mutex to bump the generation and signal -- so a wake can neither
+     * be lost nor delivered to the wrong address (the #89 freeze). */
+    futex_slot_t *s = futex_slot_acquire(uaddr);
+    if (!s) return futex_wait_bucket_fallback(uaddr, val, to);
+
     long ret = 0;
-    mutexLock(&futex_lock[h]);
+    mutexLock(&s->m);
+    const u64 gen0 = s->gen;
     if (*uaddr != val) {
       errno = EAGAIN; ret = -1;
     } else if (to) {
-      /* Timed wait: chunk into CAP pieces so a missed bucket wake still
-       * recovers, but honor the real deadline -- when it expires without a
-       * wake or value change, return ETIMEDOUT (not a fake "woken").
-       * Build #73: for very long timeouts (>5s, e.g. Unity's 49-day
-       * "infinite" 0xFFFFFFFF ms), cap the effective wait at ~5s and return
-       * 0 (fake wake) instead of ETIMEDOUT. Unity's AsyncRead threads park
-       * in FUTEX_WAIT with 49-day timeout and are NEVER woken (async I/O
-       * completion never signaled) -- ETIMEDOUT may be mishandled, but a
-       * fake wake lets Unity re-check *uaddr and either proceed or re-wait.
-       * Shorter requested timeouts are honored as-is with real ETIMEDOUT. */
+      /* Timed wait, chunked so a missed wake still recovers, but honoring the
+       * real deadline. Build #91 adds the pulse break: if OUR address was
+       * woken (generation changed) we return 0 immediately even though
+       * *uaddr == val -- correct Linux futex semantics for Unity's pulse
+       * pattern. Safe now because the slot is keyed by exact address. */
       const u64 ns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
       const u64 CAP = 16000000ULL;
-      /* Build #86: Reduce MAX_WAIT from 5s to 100ms. Unity's render loop
-       * stalls with black screen because main thread waits on futex with
-       * 49-day timeout. 5s fake-wake is too slow for 60fps (needs ~16ms).
-       * 100ms allows Unity to make progress without busy-spinning. */
+      /* Build #86: cap over-long waits (e.g. Unity's 49-day 0xFFFFFFFF ms
+       * "infinite" timeout) at 100 ms, then fake-wake. */
       const u64 MAX_WAIT_NS = 100000000ULL;
       const u64 eff_ns = ns <= MAX_WAIT_NS ? ns : MAX_WAIT_NS;
       const int capped = ns > MAX_WAIT_NS;
-      /* Build #88: REMOVED gen0 capture. REA proved generation counter causes
-       * missed-wakeup race. Now rely on value check, which is race-free when
-       * waker follows standard futex protocol.
-       * Build #90: REVERTED #89 pulse fix. #89 caused system freeze (2162-0004).
-       * The R_SUCCEEDED check was buggy. Back to #88 logic: value check only. */
       u64 waited = 0;
-      int woken = 0;
-      while (waited < eff_ns) {
+      int done = 0;
+      while (!done && waited < eff_ns) {
         u64 chunk = eff_ns - waited;
         if (chunk > CAP) chunk = CAP;
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], chunk);
-        if (*uaddr != val) { woken = 1; break; }
+        Result wrc = condvarWaitTimeout(&s->cv, &s->m, chunk);
+        /* libnx contract: s->m is held again here, wake or timeout. */
+        if (*uaddr != val) {
+          done = 1;  /* standard wake: value changed */
+        } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
+          /* pulse: our address was woken without a value change */
+          done = 1;
+          void *caller = __builtin_return_address(0);
+          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d caller=%p\n",
+                      (void *)uaddr, val, gettid_fake(), caller);
+        }
+        /* else: chunk timeout or spurious wake -- re-poll */
         waited += chunk;
       }
-      if (!woken) {
+      if (!done) {
         if (capped) {
           /* Fake wake: return 0 (success) as if woken. Unity re-checks *uaddr. */
           void *caller = __builtin_return_address(0);
@@ -324,31 +460,31 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
         }
       }
     } else {
-      /* Infinite wait: loop until value changes or woken. The old code did a
-       * single 16ms wait then returned success, causing Unity to spin-call
-       * FUTEX_WAIT in a tight loop (the futex_spin hang at 0x124430c).
-       * Build #73: cap at ~5s (312 x 16ms) then return 0 (fake wake).
-       * Build #86: reduce to ~100ms (6 x 16ms) for faster render loop progress.
-       * Build #88: REMOVED gen0 from loop condition (was: futex_wake_gen[h]==gen0).
-       * Build #89: Break on signal (not just value change) for Unity's pulse pattern.
-       * The Loading.AsyncRead threads park in infinite FUTEX_WAIT that is
-       * never woken -- a fake wake lets Unity re-check and re-wait instead
-       * of hanging forever.
-       * Build #90: REVERTED #89 signaled flag. Back to #88 logic. */
+      /* Infinite wait: same pulse-aware loop, then the fake-wake safety net. */
       int spins = 0;
-      while (*uaddr == val && spins < 6) {
+      int done = 0;
+      while (!done && spins < 6) {
         diag_futex_spin((const void *)uaddr); fxown_spin(uaddr);
-        condvarWaitTimeout(&futex_cond[h], &futex_lock[h], 16000000ULL);
+        Result wrc = condvarWaitTimeout(&s->cv, &s->m, 16000000ULL);
+        if (*uaddr != val) {
+          done = 1;
+        } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
+          done = 1;
+          void *caller = __builtin_return_address(0);
+          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d caller=%p (infinite wait)\n",
+                      (void *)uaddr, val, gettid_fake(), caller);
+        }
         spins++;
       }
-      if (spins >= 6 && *uaddr == val) {
+      if (!done) {
         void *caller = __builtin_return_address(0);
         debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~100ms tid=%d caller=%p (was infinite wait)\n",
                     (void *)uaddr, val, gettid_fake(), caller);
         ret = 0;  /* fake wake, not ETIMEDOUT */
       }
     }
-    mutexUnlock(&futex_lock[h]);
+    mutexUnlock(&s->m);
+    futex_slot_release(s);
     return ret;
   }
   if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
@@ -360,18 +496,22 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       }
     }
     fxown_wake(uaddr);
-    mutexLock(&futex_lock[h]);
-    /* Build #88: REMOVED futex_wake_gen[h]++ (was: timed waiters generation counter).
-     * REA proved this causes missed-wakeup race. The value check (*uaddr != val)
-     * is sufficient and race-free. Generation counter deprecated. */
-    condvarWakeAll(&futex_cond[h]);
-    mutexUnlock(&futex_lock[h]);
+    /* Build #91: signal ONLY the slot of this exact address, bumping its
+     * generation under the slot mutex so no waiter can miss it or mistake
+     * another address's wake for its own. */
+    futex_slot_t *s = futex_slot_find(uaddr);
+    if (s) {
+      mutexLock(&s->m);
+      s->gen++;
+      condvarWakeAll(&s->cv);
+      mutexUnlock(&s->m);
+    }
+    /* else: nobody waiting on this address -- pulse lost, same as Linux. */
     return val > 0 ? val : 0; // approximate count woken
   }
   errno = ENOSYS;
   return -1;
 }
-
 /* newlib has no <sys/uio.h>; the kernel iovec layout is just {ptr, len}. */
 struct nx_iovec { void *iov_base; size_t iov_len; };
 
