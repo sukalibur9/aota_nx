@@ -1377,6 +1377,25 @@ static int builder_fallback_hit(void *recv, const FakeID *id) {
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   log_app_upcall(id);
 
+  /* Build #98: trace all JNI method calls (deduplicated). Unity stalls after
+   * basic GL init (build #97: 0 eglSwapBuffers, main "running" but no frame
+   * progress). The futex mechanics are proven working; the blocker is logical.
+   * This trace shows what Unity is actually calling, so we can see where it
+   * stops. Deduplicated per (class, method) to avoid spam. */
+  {
+    static struct { char cls[96]; char name[64]; } seen[128];
+    static unsigned n = 0;
+    int dup = 0;
+    for (unsigned i = 0; i < n; i++)
+      if (!strcmp(seen[i].cls, id->cls) && !strcmp(seen[i].name, id->name)) { dup = 1; break; }
+    if (!dup && n < 128) {
+      strncpy(seen[n].cls, id->cls, 95); seen[n].cls[95] = 0;
+      strncpy(seen[n].name, id->name, 63); seen[n].name[63] = 0;
+      n++;
+      debugPrintf("[jni] TRACE: %s.%s%s\n", id->cls, id->name, id->sig);
+    }
+  }
+
   /* ---- reflection objects arriving as receivers -------------------------
    * ReflectionHelper.getMethodID/getFieldID hand back a FakeID so that
    * AndroidJNI.FromReflectedMethod can round-trip it into a jmethodID. Unity
