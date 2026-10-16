@@ -55,6 +55,21 @@ int  nx_join_asset_splits(void);                      /* asset_splits.c */
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
 
+/* Build #100: Unity allocator fallback. Set at boot to the original allocator
+ * address (libunity.so+0x122bbac); the wrapper below is BL-patched in place
+ * of the call at +0xf9eac4. */
+uintptr_t unity_alloc_orig_addr = 0;
+void *unity_alloc_fallback(size_t size, int cat, size_t align, int tag) {
+  typedef void *(*alloc_fn)(size_t, int, size_t, int);
+  void *p = ((alloc_fn)unity_alloc_orig_addr)(size, cat, align, tag);
+  if (!p) {
+    debugPrintf("[alloc] FALLBACK: Unity alloc(%zu, cat=%d, align=%zu, tag=%d) -> null, malloc fallback\n",
+                size, cat, align, tag);
+    p = malloc(size ? size : 1);
+  }
+  return p;
+}
+
 /* mmap arena. In overcommit mode (g_overcommit) this is a big *virtual* window in
  * the alias region: Unity's PROT_NONE pool reservations cost only address space
  * and physical pages are committed on demand via svcMapPhysicalMemory. In the
@@ -1756,6 +1771,44 @@ int main(int argc, char *argv[]) {
    * load_module faulted at boot (fbstub94: stock .so on SD, PC in the patch
    * path before finalize). */
   nx_patch_libunity((uintptr_t)unity_mod.load_virtbase);
+
+  /* Build #100: fallback allocator for Unity's internal allocator.
+   * REA analysis of the #99 crash (null deref at libunity.so+0xea8798 during
+   * nativeRender frame 0): Unity's allocator at +0x122bbac returned null for
+   * a 384-byte/tag-676 allocation, and Unity doesn't null-check before calling
+   * the constructor. The 13 region-granularity patches don't touch the bucket
+   * allocator, so this is likely heap exhaustion or a pool issue, not a patch
+   * bug. This hook wraps the allocator: if it returns null, fall back to
+   * system malloc. Defensive -- unblocks this and any future null-returns. */
+  {
+    uintptr_t ub = (uintptr_t)unity_mod.load_virtbase;
+    /* The failing call site: bl 0x122bbac at +0xf9eac4. We patch it to call
+     * our wrapper instead. */
+    uintptr_t call_site = ub + 0xf9eac4;
+    uintptr_t alloc_orig = ub + 0x122bbac;
+    /* Store original for the wrapper */
+    unity_alloc_orig_addr = alloc_orig;
+    uintptr_t wrapper = (uintptr_t)unity_alloc_fallback;
+    /* Verify the BL target is indeed 0x122bbac before patching */
+    uint32_t bl_insn = *(volatile uint32_t *)call_site;
+    int32_t bl_off = (int32_t)(bl_insn & 0x3ffffff);
+    if (bl_off & 0x2000000) bl_off |= 0xfc000000;  /* sign-extend 26 bits */
+    uintptr_t bl_target = call_site + ((int64_t)bl_off * 4);
+    if (bl_target == alloc_orig) {
+      int64_t new_off = ((int64_t)wrapper - (int64_t)call_site) / 4;
+      if (new_off >= -0x2000000 && new_off < 0x2000000) {
+        uint32_t new_bl = 0x94000000 | ((uint32_t)new_off & 0x3ffffff);
+        so_patch_code((void *)call_site, &new_bl, sizeof(new_bl));
+        debugPrintf("[alloc] hooked Unity allocator BL @+0xf9eac4 -> fallback wrapper\n");
+      } else {
+        debugPrintf("[alloc] wrapper too far for BL (offset %lld), hook skipped\n",
+                    (long long)new_off);
+      }
+    } else {
+      debugPrintf("[alloc] BL @+0xf9eac4 targets +0%x (not 0x122bbac), hook skipped\n",
+                  (unsigned)(bl_target - ub));
+    }
+  }
 
   /* Unity 6: ChoreographerBase::Get() -> NULL (fingerprint-scanned).
    * Unity 6 blocks the frame loop on a Choreographer frame callback that no
