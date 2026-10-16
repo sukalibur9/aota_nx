@@ -60,7 +60,7 @@ typedef struct { uint32_t off, from, to; } NxPatchWord;
 #define OS_HAVE_BSA_BYPASS       0   /* BetterStreamingAssets -- NOT derived for AotA yet */
 #define OS_HAVE_NRE_TRACE        1   /* NullReferenceException tracing -- see §6 */
 #define OS_HAVE_SCENE_CENSUS     0   /* FindObjectsOfType census       -- see §6 */
-#define OS_HAVE_BRANCH_FORCES    0   /* none needed for this build               */
+#define OS_HAVE_BRANCH_FORCES    1   /* once-init bypass for #102 */
 
 /* ===========================================================================
  * SECTION 1 -- libunity: allocator region granularity 256MB -> 64MB.  DERIVED.
@@ -212,7 +212,13 @@ static const NxPatchWord OS_PATCH_WORDS[] = {
  * it is not carried over. */
 __attribute__((unused))
 static const NxPatchWord OS_BRANCH_FORCES[] = {
-  { 0, 0, 0 },  /* placeholder; unused while OS_HAVE_BRANCH_FORCES == 0 */
+  /* Build #102: bypass Unity's once-init deadlock at 0x127a57c.
+   * REA: ACQUIRE at 0x166be6c (called from 0x127a548) has all 24 threads stuck
+   * in pthread_cond_wait/futex. The once-init uses futex directly, not pthread_cond,
+   * so the #101 logging didn't catch it. Patch the BL to `mov w0, #0` (return 0 =
+   * already initialized, skip). If the init is critical, Unity will crash; if not,
+   * it will proceed past the deadlock. */
+  { 0x127a548, 0x940fc649, 0x52800000 },  /* bl 0x166be6c -> mov w0, #0 */
 };
 #define OS_BRANCH_FORCES_N (OS_HAVE_BRANCH_FORCES ? \
   ((int)(sizeof(OS_BRANCH_FORCES)/sizeof(OS_BRANCH_FORCES[0]))) : 0)
