@@ -2021,7 +2021,13 @@ int main(int argc, char *argv[]) {
     android_native_update_mode();
     android_native_feed_hid((uint8_t (*)(void*,void*,void*))Unity_nativeInjectEvent,
                             fake_env, fake_unityplayer_thiz);
-    if (!Unity_nativeRender(fake_env, fake_unityplayer_thiz)) break;
+    /* Build #99: log nativeRender invocations. Build #98 showed 0 eglSwapBuffers
+     * with main "running" -- we need to know if nativeRender is even being
+     * called, and whether it returns or blocks. */
+    debugPrintf("[render] nativeRender frame=%d calling...\n", frame);
+    int render_ret = Unity_nativeRender(fake_env, fake_unityplayer_thiz);
+    debugPrintf("[render] nativeRender frame=%d returned %d\n", frame, render_ret);
+    if (!render_ret) break;
     if (frame == 0) {
       /* fbstub42: install the native engine-clock fix first thing. Drives
        * TimeManager::Update with a live newTime so deltaTime / m_Time advance for
