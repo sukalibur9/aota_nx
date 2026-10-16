@@ -217,8 +217,10 @@ static const NxPatchWord OS_BRANCH_FORCES[] = {
    * in pthread_cond_wait/futex. The once-init uses futex directly, not pthread_cond,
    * so the #101 logging didn't catch it. Patch the BL to `mov w0, #0` (return 0 =
    * already initialized, skip). If the init is critical, Unity will crash; if not,
-   * it will proceed past the deadlock. */
-  { 0x127a548, 0x940fc649, 0x52800000 },  /* bl 0x166be6c -> mov w0, #0 */
+   * it will proceed past the deadlock.
+   * Build #103 FIX: use virtual address 0x127e548 (file offset 0x127a548 maps to
+   * vaddr 0x127e548 via LOAD seg 2). #102 used file offset as vaddr -> mismatch. */
+  { 0x127e548, 0x940fc649, 0x52800000 },  /* bl 0x166be6c -> mov w0, #0 */
 };
 #define OS_BRANCH_FORCES_N (OS_HAVE_BRANCH_FORCES ? \
   ((int)(sizeof(OS_BRANCH_FORCES)/sizeof(OS_BRANCH_FORCES[0]))) : 0)
