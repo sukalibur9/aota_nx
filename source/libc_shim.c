@@ -440,9 +440,15 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
         } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
           /* pulse: our address was woken without a value change */
           done = 1;
-          void *caller = __builtin_return_address(0);
-          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d caller=%p\n",
-                      (void *)uaddr, val, gettid_fake(), caller);
+          /* Build #92: log 4-frame backtrace to identify the real Unity waiter.
+           * __builtin_return_address(0) alone gives a stack artifact (0x127a57c);
+           * we need the deeper call chain. */
+          void *c0 = __builtin_return_address(0);
+          void *c1 = __builtin_return_address(1);
+          void *c2 = __builtin_return_address(2);
+          void *c3 = __builtin_return_address(3);
+          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p\n",
+                      (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
         }
         /* else: chunk timeout or spurious wake -- re-poll */
         waited += chunk;
@@ -470,9 +476,13 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
           done = 1;
         } else if (R_SUCCEEDED(wrc) && s->gen != gen0) {
           done = 1;
-          void *caller = __builtin_return_address(0);
-          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d caller=%p (infinite wait)\n",
-                      (void *)uaddr, val, gettid_fake(), caller);
+          /* Build #92: 4-frame backtrace for real waiter identification. */
+          void *c0 = __builtin_return_address(0);
+          void *c1 = __builtin_return_address(1);
+          void *c2 = __builtin_return_address(2);
+          void *c3 = __builtin_return_address(3);
+          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p (infinite wait)\n",
+                      (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
         }
         spins++;
       }
