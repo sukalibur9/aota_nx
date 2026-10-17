@@ -414,12 +414,22 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
      * to that exact address are all lost, and the waiter never even gets a
      * FAKEWAKE (never completes 6x16ms spins). Log which slot the waiter
      * attaches to and what the waker finds, to distinguish slot-mismatch
-     * from waiter-stuck-before-condvar. */
+     * from waiter-stuck-before-condvar.
+     * Build #106: track value changes at waited addresses. Log the current
+     * *uaddr value on each WAIT (deduplicated) to see if threads wait for
+     * a value change that never happens. */
     {
       int slot_idx = (int)(s - futex_slots);
-      debugPrintf("[futex] SLOT-WAIT ua=%p slot=%d gen=%llu refcount=%d tid=%d caller=%p\n",
-                  (void *)uaddr, slot_idx, (unsigned long long)s->gen,
-                  s->refcount, gettid_fake(), __builtin_return_address(0));
+      static const volatile int *last_logged_ua = NULL;
+      static int last_logged_val = 0;
+      int cur_val = *uaddr;
+      if (uaddr != last_logged_ua || cur_val != last_logged_val) {
+        debugPrintf("[futex] SLOT-WAIT ua=%p slot=%d gen=%llu refcount=%d tid=%d caller=%p val=%d\n",
+                    (void *)uaddr, slot_idx, (unsigned long long)s->gen,
+                    s->refcount, gettid_fake(), __builtin_return_address(0), cur_val);
+        last_logged_ua = uaddr;
+        last_logged_val = cur_val;
+      }
     }
 
     long ret = 0;
