@@ -236,6 +236,13 @@ static void dump_thread_context(const char *name, const ThreadContext *ctx) {
   resolve_addr(a, sizeof a, ctx->pc.x);
   resolve_addr(b, sizeof b, ctx->lr);
   dump_emit("[wd]   %s  PC=%s  LR=%s\n", name, a, b);
+  /* Build #107: if the main thread is parked inside OUR wrapper (NRO) during a
+   * stall, that's the smoking gun -- Unity called into our shim and never came
+   * back. Make it unmissable. */
+  if ((strstr(name, "Main") || strstr(name, "main")) &&
+      g_nro_size && ctx->pc.x >= g_nro_base && ctx->pc.x < g_nro_base + g_nro_size) {
+    dump_emit("[wd]   >>> MAIN THREAD PARKED IN WRAPPER CODE (%s) -- shim hang, not Unity <<<\n", a);
+  }
   dump_emit("[wd]     SP=0x%llx FP=0x%llx X0=0x%llx X1=0x%llx X2=0x%llx\n",
               (unsigned long long)ctx->sp, (unsigned long long)ctx->fp,
               (unsigned long long)ctx->cpu_gprs[0].x,
