@@ -537,11 +537,20 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     return ret;
   }
   if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
+    /* Build #112: enhanced wake logging to diagnose worker starvation.
+     * #111 proved main waits on a semaphore never posted; workers idle in
+     * futex waits. Log ALL wakes (not just first 60) with caller to see if
+     * Unity ever tries to wake workers. */
     {
       static int wake_logged = 0;
-      if (wake_logged < 60) {
-        wake_logged++;
-        debugPrintf("[futex] WAKE ua=%p n=%d\n", (void *)uaddr, val);
+      wake_logged++;
+      /* Log first 200, then only wakes to addresses with active waiters */
+      futex_slot_t *chk = futex_slot_find(uaddr);
+      if (wake_logged <= 200 || (chk && chk->refcount > 0)) {
+        debugPrintf("[futex] WAKE#%d ua=%p n=%d tid=%d caller=%p %s\n",
+                    wake_logged, (void *)uaddr, val, gettid_fake(),
+                    __builtin_return_address(0),
+                    (chk && chk->refcount > 0) ? "[HAS-WAITERS]" : "[no-waiters]");
       }
     }
     fxown_wake(uaddr);
