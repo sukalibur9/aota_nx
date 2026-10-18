@@ -87,3 +87,9 @@ jobs:
         with:
           name: aota_nx-vulkan-nro
           path: aota_nx.nro
+
+      - name: Upload link map (for PC-to-function lookup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aota_nx-link-map
+          path: aota_nx.map
