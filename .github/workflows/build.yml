@@ -92,4 +92,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: aota_nx-link-map
-          path: aota_nx.map
+          path: |
+            aota_nx.map
+            aota_nx.elf
