@@ -2587,6 +2587,35 @@ int sem_getvalue_fake(void **s, int *val) {
                 s && *s ? (void*)*s : NULL, v,
                 gettid_fake(), __builtin_return_address(0));
   }
+  /* Build #113: deadlock breaker. If main is stuck polling the job-completion
+   * semaphore (caller 0x2c5ccc8 = libil2cpp job wait loop) and it never gets
+   * posted, fake a post after many polls to unblock and see if the game can
+   * proceed. This tests whether the deadlock is the ONLY blocker. */
+  {
+    void *caller = __builtin_return_address(0);
+    /* libil2cpp.so+0x2c5ccc8 is the sem_getvalue call site in the poll loop.
+     * We can't easily check the offset, so we track by semaphore address
+     * that main polls repeatedly with val=0. */
+    static void *stuck_sem = NULL;
+    static int poll_count = 0;
+    static int unblocked = 0;
+    if (s && *s && v == 0 && !unblocked) {
+      if (stuck_sem == NULL) stuck_sem = *s;
+      if (*s == stuck_sem) {
+        poll_count++;
+        /* After ~5000 polls (~15 sec of usleep(3000)), fake unblock */
+        if (poll_count == 5000) {
+          debugPrintf("[sem] >>> DEADLOCK BREAKER: faking post to stuck sem %p after %d polls <<<\n",
+                      (void*)*s, poll_count);
+          semaphoreSignal(&((FakeSem *)*s)->sem);
+          /* Update the value that caller will see */
+          v = (int)((FakeSem *)*s)->sem.count;
+          if (val) *val = v;
+          unblocked = 1;
+        }
+      }
+    }
+  }
   return 0;
 }
 // no native timed wait on libnx Semaphore; poll with a short backoff to the
