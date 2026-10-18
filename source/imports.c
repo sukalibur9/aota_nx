@@ -1183,7 +1183,7 @@ DynLibFunction dynlib_functions[] = {
   { "gmtime", (uintptr_t)&gmtime }, { "gmtime_r", (uintptr_t)&gmtime_r },
   { "localtime", (uintptr_t)&localtime }, { "localtime_r", (uintptr_t)&localtime_r },
   { "mktime", (uintptr_t)&mktime }, { "time", (uintptr_t)&time },
-  { "nanosleep", (uintptr_t)&nanosleep }, { "usleep", (uintptr_t)&usleep },
+  { "nanosleep", (uintptr_t)&nanosleep }, { "usleep", (uintptr_t)&usleep_fake },
   { "tzset", (uintptr_t)&tzset }, { "tzname", (uintptr_t)&g_tzname_fake },
   { "getenv", (uintptr_t)&getenv_fake }, { "putenv", (uintptr_t)&putenv },
 

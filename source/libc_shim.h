@@ -175,6 +175,7 @@ int waitpid_fake(int pid, int *status, int opts);
 int kill_fake(int pid, int sig);
 int getpid_fake(void);
 int sched_yield_fake(void);
+int usleep_fake(unsigned int usec);
 void *getpwuid_fake(int uid);
 char *getenv_fake(const char *name);
 char *getcwd_fake(char *buf, size_t size);

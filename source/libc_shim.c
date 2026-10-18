@@ -2374,6 +2374,20 @@ int waitpid_fake(int pid, int *status, int opts) { (void)pid; (void)opts; if (st
 int kill_fake(int pid, int sig) { (void)pid; (void)sig; return 0; }
 int getpid_fake(void) { return 1; }
 int sched_yield_fake(void) { svcSleepThread(0); return 0; }
+/* Build #110: usleep wrapper to diagnose main-thread spin-wait. The #107
+ * watchdog showed main parked in usleep()->svcSleepThread() for 3+ minutes,
+ * called from libil2cpp.so. Log the usec argument and caller to see the
+ * sleep pattern (spin-wait with usleep(0)? long sleep?). */
+int usleep_fake(unsigned int usec) {
+  /* Only log from the main thread to avoid spam; workers don't hit this. */
+  static __thread int log_count = 0;
+  if (log_count < 50) {
+    log_count++;
+    debugPrintf("[sleep] usleep(%u) caller=%p tid=%d\n",
+                usec, __builtin_return_address(0), gettid_fake());
+  }
+  return usleep(usec);
+}
 // bionic struct passwd layout (pw_dir at +0x20, as the engine derefs).
 struct bionic_passwd {
   char *pw_name;     /* 0x00 */
