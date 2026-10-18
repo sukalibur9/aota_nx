@@ -2550,10 +2550,36 @@ int pthread_rwlock_unlock_fake(void **rw) {
 typedef struct { Semaphore sem; } FakeSem;
 int sem_init_fake(void **s, int pshared, unsigned int value) { (void)pshared; FakeSem *fs = calloc(1, sizeof(*fs)); semaphoreInit(&fs->sem, value); *s = fs; return 0; }
 int sem_destroy_fake(void **s) { if (s && *s) { free(*s); *s = NULL; } return 0; }
-int sem_post_fake(void **s) { if (s && *s) semaphoreSignal(&((FakeSem *)*s)->sem); return 0; }
+int sem_post_fake(void **s) {
+  /* Build #111: log sem_post to see if the semaphore main waits on ever gets signaled. */
+  static int post_log_count = 0;
+  if (s && *s) {
+    if (post_log_count < 30) {
+      post_log_count++;
+      debugPrintf("[sem] post sem=%p count_before=%lld tid=%d caller=%p\n",
+                  (void*)*s, (long long)((FakeSem *)*s)->sem.count,
+                  gettid_fake(), __builtin_return_address(0));
+    }
+    semaphoreSignal(&((FakeSem *)*s)->sem);
+  }
+  return 0;
+}
 int sem_wait_fake(void **s) { if (s && *s) { Semaphore *sm=&((FakeSem *)*s)->sem; diag_wait_enter(DIAG_W_SEM,sm); semaphoreWait(sm); diag_wait_exit(); } return 0; }
 int sem_trywait_fake(void **s) { if (s && *s && semaphoreTryWait(&((FakeSem *)*s)->sem)) return 0; errno = EAGAIN; return -1; }
-int sem_getvalue_fake(void **s, int *val) { if (s && *s) *val = (int)((FakeSem *)*s)->sem.count; else *val = 0; return 0; }
+int sem_getvalue_fake(void **s, int *val) {
+  /* Build #111: log sem_getvalue to identify which semaphore main polls in its spin-wait loop. */
+  static int getvalue_log_count = 0;
+  int v = 0;
+  if (s && *s) v = (int)((FakeSem *)*s)->sem.count;
+  if (val) *val = v;
+  if (getvalue_log_count < 30) {
+    getvalue_log_count++;
+    debugPrintf("[sem] getvalue sem=%p val=%d tid=%d caller=%p\n",
+                s && *s ? (void*)*s : NULL, v,
+                gettid_fake(), __builtin_return_address(0));
+  }
+  return 0;
+}
 // no native timed wait on libnx Semaphore; poll with a short backoff to the
 // deadline. The engine uses it as a yield-with-timeout in its task scheduler.
 int sem_timedwait_fake(void **s, const struct timespec *abs) {
