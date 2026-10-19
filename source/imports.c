@@ -178,7 +178,12 @@ int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
   debugPrintf("[cond] BROADCAST cnd=%p\n", (void *)*cnd);
   return pthread_cond_broadcast(*cnd);
 }
-int pthread_cond_signal_fake(pthread_cond_t **cnd) { if (ensure_cond(cnd) < 0) return -1; return pthread_cond_signal(*cnd); }
+int pthread_cond_signal_fake(pthread_cond_t **cnd) {
+  if (ensure_cond(cnd) < 0) return -1;
+  /* Build #114: log signals to detect job-system wakeups (was silent) */
+  debugPrintf("[cond] SIGNAL cnd=%p\n", (void *)*cnd);
+  return pthread_cond_signal(*cnd);
+}
 int pthread_cond_destroy_fake(pthread_cond_t **cnd) { if (cnd && (uintptr_t)*cnd >= 0x10000) { pthread_cond_destroy(*cnd); free(*cnd); *cnd = NULL; } return 0; }
 int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
   if (ensure_cond(cnd) < 0 || ensure_mutex(mtx) < 0) return -1;
