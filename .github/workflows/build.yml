@@ -1,7 +1,20 @@
 name: Build aota_nx NRO
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'source/**'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+# Satu build per antrean: push multi-commit (upload draft -> hapus file
+# lama -> rename) hanya menyelesaikan build dari commit terakhir; run
+# dari commit perantara dibatalkan otomatis.
+concurrency:
+  group: build-aota-nx
+  cancel-in-progress: true
 
 jobs:
 
