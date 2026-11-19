@@ -3770,8 +3770,15 @@ int main(int argc, char *argv[]) {
     /* Build #99: log nativeRender invocations. Build #98 showed 0 eglSwapBuffers
      * with main "running" -- we need to know if nativeRender is even being
      * called, and whether it returns or blocks. */
+    /* #309: bracketing frame 0 on the LOCK-FREE channel too. Test #308's
+     * debug.log lost its tail at the il2cpp start stall (a debugPrintf can be
+     * dropped or wedged, and a hung process never flushes), so "did the call
+     * even happen, did it return" was unanswerable from the log. xd_stage
+     * writes and fsyncs its own fd, so these two lines survive a hang. */
+    if (frame == 0) xd_stage("stage:render0-call");
     debugPrintf("[render] nativeRender frame=%d calling...\n", frame);
     int render_ret = Unity_nativeRender(fake_env, fake_unityplayer_thiz);
+    if (frame == 0) xd_stage("stage:render0-returned");
     debugPrintf("[render] nativeRender frame=%d returned %d\n", frame, render_ret);
     { /* [fps139] render throughput, quantified: test #138 showed the 60Hz
        * pacing ticker (frame counter 600) far ahead of nativeRender

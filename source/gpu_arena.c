@@ -3466,6 +3466,13 @@ __attribute__((naked, used, noinline)) static unsigned game_tls_tid(void) {
 }
 
 __attribute__((used)) void entry195_log(void *entry, void *arg) {
+  /* #309: record FIRST, print second. Test #308 stalled with il2cpp waiting
+   * for a freshly created thread that never printed ENTRY RAN; because the
+   * print ran before the #270 lock-free record, "thread never scheduled" and
+   * "thread wedged in debugPrintf's log lock" produced the same silence in
+   * both logs. The raw record now lands before any lock is taken, so the next
+   * boot distinguishes the two. */
+  gtid270_log("entry309", (uintptr_t)arg, game_tls_tid());
   debugPrintf("[entry195] ENTRY RAN entry=%p arg=%p gtid=%u\n", entry, arg, game_tls_tid());
   /* #270: lock-free record -- the debugPrintf above dropped in test #269 */
   gtid270_log("worker", (uintptr_t)arg, game_tls_tid());
