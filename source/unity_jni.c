@@ -253,6 +253,17 @@ const char *unity_handle_class(void *p){
     case UJ_INPUTSTREAM: return "java/io/InputStream";
     case UJ_AFD:         return "android/content/res/AssetFileDescriptor";
     case UJ_FD:          return "java/io/FileDescriptor";
+    /* [b312] PlayerPrefs chain. Without these the handles were invisible to
+     * recv_class(), so SharedPreferences.edit()/getAll() -- whose method ids
+     * arrive minted against 'UnityPlayer' -- fell through to act_object and
+     * returned NULL (test #311: `UNMATCHED -> null: UnityPlayer.edit()` /
+     * `getAll()`). Unity's PlayerPrefs then calls methods on NULL. */
+    case UJ_PREFS:       return "android/content/SharedPreferences";
+    case UJ_EDITOR:      return "android/content/SharedPreferences$Editor";
+    case UJ_MAP:         return "java/util/Map";
+    case UJ_SET:         return "java/util/Set";
+    case UJ_ITER:        return "java/util/Iterator";
+    case UJ_ENTRY:       return "java/util/Map$Entry";
   }
   return NULL;
 }
@@ -532,8 +543,19 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
   if (has(cls,"java/io/File") && (has(m,"getAbsolutePath")||has(m,"getPath")||has(m,"toString")))
     return jni_make_string(managed_root());
 
-  /* UnityPlayer host queries that return objects -> benign */
-  if (has(cls,"UnityPlayer")) return jni_make_object("UnityPlayer");
+  /* UnityPlayer host queries that return objects -> benign.
+   * getSharedPreferences is NOT benign: it is the object PlayerPrefs reads
+   * and writes through, so answer with a real UJ handle (see unity_handle_class)
+   * instead of a label-only object. */
+  if (has(cls,"UnityPlayer")){
+    if (has(m,"getSharedPreferences")){
+      const char *name = jni_string_utf(va_arg(va,void*));
+      debugPrintf("[prefs] getSharedPreferences('%s') -> prefs handle (%d entries)\n",
+                  name ? name : "?", g_kv_n);
+      return uh_new(UJ_PREFS);
+    }
+    return jni_make_object("UnityPlayer");
+  }
 
   return jni_make_object(cls); /* default: opaque handle, never NULL */
 }

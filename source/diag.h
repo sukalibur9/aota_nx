@@ -55,6 +55,11 @@ void diag_futex_spin(const void *obj);
  * `frame` is the current frame index (recorded for the dump header). */
 void diag_frame(int frame);
 
+/* Last frame index reported by diag_frame(). Read by the sentinel heartbeat so
+ * its liveness lines distinguish "wedged" (alive but frame frozen) from
+ * "process gone" (no lines at all). */
+int diag_frame_now(void);
+
 /* Spawn the watchdog. Idempotent. Call once after boot, before the loop. */
 void diag_watchdog_start(void);
 

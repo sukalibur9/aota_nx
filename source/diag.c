@@ -657,15 +657,25 @@ static void watchdog_main(void *unused) {
 /* #292 sentinel: an independent thread whose only job is to prove process
  * liveness. It never touches the log lock, the futex shims or diag state, so
  * its file going quiet means EVERYTHING stopped -- not just the watchdog. */
+int diag_frame_now(void) { return g_frame; }
+
 static void sentinel_main(void *unused) {
   (void)unused;
   int fd = open("sdmc:/switch/aota/sentinel.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (fd < 0) return;
   ssize_t w0 = write(fd, "[s292] boot\n", 12); (void)w0;
-  for (int n = 1; n <= 600; n++) {
-    svcSleepThread(1000ull * 1000ull * 1000ull);
-    char buf[48];
-    int len = snprintf(buf, sizeof buf, "[s292] alive n=%d\n", n);
+  /* [b312] 250 ms instead of 1 s, and the frame index with it. Test #311's
+   * sentinel stopped after `boot` and the watchdog after one 1 s tick, so the
+   * run either died or wedged within a second of frame 0 -- which of the two
+   * cannot be told apart from the log, because debugPrintf DROPS lines when
+   * g_log_lock is contended (util.c #267). The frame counter separates them:
+   * alive n climbing with frame frozen == wedged; alive stopping == the
+   * process is gone. */
+  for (int n = 1; n <= 2400; n++) {
+    svcSleepThread(250ull * 1000ull * 1000ull);
+    char buf[64];
+    int len = snprintf(buf, sizeof buf, "[s292] alive n=%d frame=%d\n",
+                       n, diag_frame_now());
     if (len > 0) { ssize_t w = write(fd, buf, (size_t)len); (void)w; }
   }
   close(fd);
