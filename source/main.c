@@ -1268,6 +1268,10 @@ static void *nx_jobsnoop_thread(void *arg) {
               (unsigned long long)nx_complete_count,
               waiter188_unlock_n, start251_n, worker183_n, waiter220_n, (void *)waiter220_last_mtx, waiter220_last_tid, lock274_fires_id, lock274_fires_tp, unlock277_fires_tp, lock280_null_n, lrsmp, pcs, audst, (unsigned)audq, heap_used, heap_free, marena_used, marena_free, marena_spill);
       fflush(sf);
+      /* #310: failed svcArbitrateLock records (bss, written by the lock
+       * tramp without any I/O) are printed here, on this thread, which has
+       * never wedged on the file path. */
+      { extern void arb310_dump(FILE *f); arb310_dump(sf); }
     }
     sleep(5);
   }

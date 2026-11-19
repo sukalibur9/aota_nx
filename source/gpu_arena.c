@@ -5959,6 +5959,10 @@ void lock274_arm(void) {
  * ------------------------------------------------------------------------- */
 __attribute__((used)) static uintptr_t lock292_svc = 0; /* svc #0x1a stub */
 __attribute__((used)) static uintptr_t lock292_ret = 0; /* lock+0x50 */
+/* #310: lock+0x90 (`ldp x29,x30,[sp],#32; ret`) -- the lock fn's normal
+ * success epilogue. The failure path returns there with w0=0 instead of
+ * falling into libnx's assert. 0 (unset) keeps the old assert behaviour. */
+__attribute__((used)) static uintptr_t lock292_ok_ret = 0;
 
 #define LOCK292_LOG_CAP 64
 static unsigned lock292_n = 0;
@@ -6033,12 +6037,62 @@ __attribute__((used)) void lock292_guard_log(void) {
   gtid270_log("lock292guard", lock292_svc, lock292_guard_n);
 }
 
-/* #299: svcArbitrateLock result on failure. Written before libnx's own
- * assert (see the tramp); lock-free so it is safe on the waiting thread. */
-static unsigned lock292_fail_n = 0;
-__attribute__((used)) void lock292_fail_log(unsigned rc, uintptr_t lock) {
-  if (lock292_fail_n < 32) gtid270_log("arb299rc", rc, (unsigned)lock);
-  lock292_fail_n++;
+/* #310: the failing svcArbitrateLock, recorded with NO I/O at all.
+ *
+ * Test #309 finally got past the start-up stall: gtid.log shows the game
+ * thread running (`entry309`/`worker`), debug.log shows
+ * `[render] nativeRender frame=0 calling...`, and THEN the process died with
+ * the #292 signature (Atmosphere crash report: User Break, Result 0xCA8,
+ * Break Reason 0x1 = libnx mutexLock's assert). The crash report's
+ * return-address chain is __get_handle <- _write_r <- lock272_log_wait <-
+ * lock292_log <- lock292_tramp_log, i.e. the thread was inside OUR logging
+ * write() when it asserted, and the #299 arb299rc line never made it to
+ * gtid.log: the diagnostic's own write() re-enters the fs/newlib lock path
+ * on the very thread that is already failing to lock.
+ *
+ * So the record is now a plain bss store (no write, no malloc, no game
+ * locks) taken in the tramp's failure path, and the snoop thread -- its own
+ * thread, its own FILE*, the only writer that has never wedged -- prints it
+ * as `[arb310] ...` in snoop.log. The record carries mutex, the OWNER tag
+ * read from the mutex word, the caller's own tag and the SVC result, which
+ * is exactly what names the reason (invalid owner handle vs. self-lock).
+ *
+ * The assert is also skipped: on failure the tramp returns success to the
+ * game caller via the lock fn's own epilogue (lock+0x90, verified in the
+ * arm), so one bad arbitration no longer kills the boot. The record still
+ * says it happened; if the mutex is then raced the next symptom is a real
+ * data error, not a silent assert. */
+#define ARB310_MAX 8
+typedef struct {
+  uintptr_t mutex;
+  unsigned owner, own, rc;
+  uintptr_t caller;
+} arb310_rec;
+static arb310_rec arb310_buf[ARB310_MAX];
+static unsigned arb310_n = 0, arb310_printed = 0;
+
+__attribute__((used)) void arb310_record(uintptr_t mutex, unsigned owner, unsigned own,
+                                         unsigned rc, uintptr_t caller) {
+  unsigned i;
+  if (arb310_n < ARB310_MAX) i = arb310_n++;
+  else i = ARB310_MAX - 1;
+  arb310_buf[i].mutex = mutex;
+  arb310_buf[i].owner = owner;
+  arb310_buf[i].own = own;
+  arb310_buf[i].rc = rc;
+  arb310_buf[i].caller = caller;
+}
+
+/* snoop thread only (plain fprintf on its own FILE*, never debugPrintf). */
+__attribute__((used)) void arb310_dump(FILE *f) {
+  if (!f) return;
+  while (arb310_printed < arb310_n) {
+    arb310_rec *r = &arb310_buf[arb310_printed++];
+    fprintf(f, "[arb310] fail mutex=0x%llx owner=0x%x own=0x%x rc=0x%x caller=0x%llx\n",
+            (unsigned long long)r->mutex, r->owner, r->own, r->rc,
+            (unsigned long long)r->caller);
+  }
+  fflush(f);
 }
 
 __attribute__((naked, used, noinline)) static void lock292_tramp_log(void) {
@@ -6046,11 +6100,12 @@ __attribute__((naked, used, noinline)) static void lock292_tramp_log(void) {
     /* Entry (lock+0x4C, displaced `bl`): x0 = holder id (waiter bit
      * cleared), x1 = mutex addr, x2 = own TLS[0x1e4] id, x3 = mutex,
      * x30 = lock fn's return address (the lock caller). */
-    "stp x29, x30, [sp, #-0x30]!\n"
+    "stp x29, x30, [sp, #-0x40]!\n"
     "mov x29, sp\n"
     "str x0, [sp, #0x10]\n"          /* save SVC arg0 (holder id) */
     "str x1, [sp, #0x18]\n"          /* save SVC arg1 (mutex) */
     "str x2, [sp, #0x20]\n"          /* save SVC arg2 (own id) */
+    "str x30, [sp, #0x28]\n"         /* save the lock caller's LR */
     "mov x2, x30\n"                  /* log arg2 = caller (lock fn's ret) */
     "mov x0, x1\n"                   /* log arg0 = mutex */
     "ldr w1, [sp, #0x10]\n"          /* log arg1 = holder id */
@@ -6094,22 +6149,31 @@ __attribute__((naked, used, noinline)) static void lock292_tramp_log(void) {
     "cmp w17, w18\n"
     "b.ne .Lguard_fail\n"
     "blr x16\n"                      /* svcArbitrateLock stub; w0 = result */
-    /* #299: libnx asserts (svcBreak) when this returns R_FAILED. Record the
-     * failing rc first (lock-free gtid.log, the crash report only shows the
-     * assert), then let the assert fire -- the rc names the reason. */
+    /* #310: libnx asserts (svcBreak) when this returns R_FAILED. Record the
+     * failure in bss (NO I/O -- see arb310_record) and return success to the
+     * game caller through the lock fn's own epilogue, so the boot survives. */
     "cbz w0, 215f\n"
-    "str w0, [sp, #0x28]\n"
-    "mov x0, x1\n"                   /* log arg0 = mutex */
-    "ldr w1, [sp, #0x28]\n"          /* log arg1 = rc */
-    "bl lock292_fail_log\n"
-    "ldr w0, [sp, #0x28]\n"
+    "str w0, [sp, #0x30]\n"          /* rc */
+    "mov x0, x1\n"                   /* record arg0 = mutex */
+    "ldr w1, [sp, #0x10]\n"          /* record arg1 = owner (SVC arg0) */
+    "ldr w2, [sp, #0x20]\n"          /* record arg2 = own tag (SVC arg2) */
+    "ldr w3, [sp, #0x30]\n"          /* record arg3 = rc */
+    "ldr x4, [sp, #0x28]\n"          /* record arg4 = caller LR */
+    "bl arb310_record\n"
+    "mov w0, #0\n"                   /* success convention for the caller */
+    "adrp x16, lock292_ok_ret\n"
+    "ldr x16, [x16, :lo12:lock292_ok_ret]\n"
+    "cbnz x16, 216f\n"
     "215:\n"
     "b .Lguard_done\n"
+    "216:\n"                         /* verified lock+0x90: ldp x29,x30; ret */
+    "ldp x29, x30, [sp], #0x40\n"
+    "br x16\n"
     ".Lguard_fail:\n"
     "bl lock292_guard_log\n"         /* log bad lock292_svc to gtid.log */
     "mov w0, #0\n"                   /* pretend success (lock acquired) */
     ".Lguard_done:\n"
-    "ldp x29, x30, [sp], #0x30\n"    /* restore frame (x30 = game caller's
+    "ldp x29, x30, [sp], #0x40\n"    /* restore frame (x30 = game caller's
                                       * LR -- NOT lock+0x50, see below) */
     /* #297: `br` to lock292_ret (lock+0x50) -- RESTORED from #294. The
      * #295 `ret` was a BUG (caught by the Antigravity analysis, verified
@@ -6188,6 +6252,17 @@ void lock292_arm(void) {
   }
   lock292_svc = svc;
   lock292_ret = lock_fn + 0x50;
+  {
+    uint32_t w90 = *(volatile uint32_t *)(lock_fn + 0x90);
+    uint32_t w94 = *(volatile uint32_t *)(lock_fn + 0x94);
+    if (w90 == 0xa8c27bfdu && w94 == 0xd65f03c0u) {
+      lock292_ok_ret = lock_fn + 0x90;
+      debugPrintf("[lock292] #310 fail path returns via lock+0x90 (ldp x29,x30; ret)\n");
+    } else {
+      debugPrintf("[lock292] #310 lock+0x90 not ldp/ret (%08x/%08x), fail path keeps the assert\n",
+                  w90, w94);
+    }
+  }
   int64_t diff = (int64_t)(uintptr_t)&lock292_tramp_log - (int64_t)site;
   if ((diff & 3) || diff < -(128 * 1024 * 1024) || diff >= (128 * 1024 * 1024)) {
     debugPrintf("[lock292] site NRO+0x%x tramp out of b range, patch skipped\n", site - base);
