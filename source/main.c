@@ -1272,6 +1272,8 @@ static void *nx_jobsnoop_thread(void *arg) {
        * tramp without any I/O) are printed here, on this thread, which has
        * never wedged on the file path. */
       { extern void arb310_dump(FILE *f); arb310_dump(sf); }
+      /* #311: NULL message-registry entries skipped by the loop trampoline. */
+      { extern void msg311_dump(FILE *f); msg311_dump(sf); }
     }
     sleep(5);
   }
@@ -1413,6 +1415,149 @@ static void nx_guard155_install(uintptr_t ub) {
               (void *)nx_ret_guard155, (void *)nx_ret_guard155_null);
 }
 
+/* Build #311: the message-definition registry check dereferences a NULL entry.
+ *
+ * Test #310 finally got past the start-up stall AND past the #309 lock
+ * assert: debug.log shows the whole player init (boot.config, il2cpp
+ * metadata, SystemInfo, initJni) and then `[render] nativeRender frame=0
+ * calling...`, and the process died on a DATA ABORT, not a libnx assert:
+ * xd.log pc=libunity+0xc505e8 far=0 esr=0x92000005, faulting thread tid=16854
+ * (Unity Main Thread), and no `[arb310] fail` line was ever recorded -- the
+ * svcArbitrateLock that killed #309 did not fail again.
+ *
+ * libunity+0xc505e8 is inside the function 0xc50370..0xc50778 (FDE from
+ * .eh_frame of THIS libunity), whose .rodata references are
+ * `./Runtime/BaseClasses/MessageIdentifier.cpp`,
+ * "There are conflicting definitions of the message: " and
+ * "There are conflicting options of the message: ". That function walks a
+ * Unity dynamic_array {data, label, size, capacity} held in the global at
+ * 0x172a000+1768 (x29) and validates every registered message:
+ *     c503b8 ldr x8,[x29,#16] / cbz  -> empty list is fine
+ *     c50408 mov x21, x0 (= [x29], the data pointer)
+ *     c5040c ldr x24, [x21]          <- the crash: element 0 == NULL
+ *     c50410 add x0, sp, #0x68 / mov x1, x24 / bl 0xc527b8
+ *     c5041c ldr x8,[sp,#120] / cmp x8, x0 / b.eq 0xc505e8 (conflict tail)
+ *     c506b4 ldr x0,[x29] / ldr x2,[x29,#16] / add x21,x21,#8 / cmp end
+ *     c506c8 b.ne 0xc5040c           <- loop head
+ * The failing instruction was a *copy* of the conflict tail, but the fault
+ * itself is the element load: x24 ([x21]) is 0, so `ldr x24,[x24]` faults on
+ * address 0. The registry is a runtime structure (x29 = 0x55e0000190, our
+ * overcommit arena), so nothing on disk can tell us which entry is null.
+ *
+ * So this build installs a verify-first hook on the loop head (the same
+ * ldr x16,[pc,#8]/br x16/.quad trampoline shape as #120/#155, overwriting
+ * the 4 words at 0xc5040c..0xc50418, i.e. ldr/add/mov/bl). The trampoline:
+ *   - loads x24 = [x21]; if non-NULL it replays the displaced add/mov and
+ *     the displaced `bl 0xc527b8`, then continues at 0xc5041c -- byte-for
+ *     byte the stock behaviour;
+ *   - if x24 is NULL it records the event in bss with NO I/O, advances to
+ *     the stock advance/limit-check at 0xc506b4 (which itself does
+ *     add x21,x21,#8 and compares against [x29] + [x29+16]*8) and keeps
+ *     iterating, so an absent message definition no longer kills the boot.
+ * The record (first hit only, plus a count) is printed by the snoop thread
+ * as `[msg311] ...` in snoop.log: base/size/capacity/label of the array,
+ * the index and slot of the null entry, and how many nulls were skipped.
+ * NO array dereference in the dump -- the pointers are only printed. */
+typedef struct {
+  uintptr_t hit;      /* 1 after the first null entry */
+  uintptr_t nulls;    /* number of null entries skipped */
+  uintptr_t base;     /* [x29]     array data pointer */
+  uintptr_t size;     /* [x29+16]  element count */
+  uintptr_t cap;      /* [x29+24]  capacity */
+  uintptr_t label;    /* [x29+8]   dynamic_array label (printed as a value) */
+  uintptr_t slot;     /* x21 of the first null entry */
+  uintptr_t idx;      /* (slot - base) / 8 */
+} msg311_rec;
+__attribute__((used)) msg311_rec msg311_r;
+volatile uint64_t nx_ret_msg311_cont;   /* -> libunity+0xc5041c (after the bl) */
+volatile uint64_t nx_ret_msg311_skip;   /* -> libunity+0xc506b4 (advance+check) */
+volatile uint64_t nx_ret_msg311_call;   /* -> libunity+0xc527b8 (displaced bl) */
+
+__attribute__((naked)) static void nx_tramp_msg311(void) {
+  __asm__ volatile(
+    "ldr x24, [x21]\n"              /* displaced stock 0xc5040c */
+    "cbnz x24, .Lmsg311_ok\n"
+    /* NULL entry: record, never call anything */
+    "adrp x8, msg311_r\n"
+    "add x8, x8, :lo12:msg311_r\n"
+    "ldr x9, [x8, #8]\n"            /* nulls */
+    "add x9, x9, #1\n"
+    "str x9, [x8, #8]\n"
+    "ldr x9, [x8, #0]\n"            /* hit */
+    "cbnz x9, .Lmsg311_skip\n"
+    "mov x9, #1\n"
+    "str x9, [x8, #0]\n"
+    "ldr x10, [x29]\n"              /* array data */
+    "str x10, [x8, #16]\n"
+    "ldr x10, [x29, #16]\n"         /* size */
+    "str x10, [x8, #24]\n"
+    "ldr x10, [x29, #24]\n"         /* capacity */
+    "str x10, [x8, #32]\n"
+    "ldr x10, [x29, #8]\n"          /* label */
+    "str x10, [x8, #40]\n"
+    "str x21, [x8, #48]\n"          /* slot */
+    "ldr x10, [x29]\n"
+    "sub x10, x21, x10\n"
+    "lsr x10, x10, #3\n"            /* index */
+    "str x10, [x8, #56]\n"
+    ".Lmsg311_skip:\n"
+    "adrp x16, nx_ret_msg311_skip\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg311_skip]\n"
+    "br x16\n"                      /* -> 0xc506b4: advance + limit check */
+    ".Lmsg311_ok:\n"
+    "add x0, sp, #0x68\n"           /* displaced stock 0xc50410 */
+    "mov x1, x24\n"                 /* displaced stock 0xc50414 */
+    "adrp x16, nx_ret_msg311_call\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg311_call]\n"
+    "blr x16\n"                     /* displaced stock 0xc50418 */
+    "adrp x16, nx_ret_msg311_cont\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg311_cont]\n"
+    "br x16\n"                      /* -> 0xc5041c, stock continuation */
+  );
+}
+
+/* snoop thread only (plain fprintf on its own FILE*, never debugPrintf). */
+void msg311_dump(FILE *f) {
+  if (!f || !msg311_r.hit) return;
+  fprintf(f, "[msg311] null msg entry n=%llu idx=%llu slot=0x%llx base=0x%llx "
+             "size=%llu cap=%llu label=0x%llx\n",
+          (unsigned long long)msg311_r.nulls,
+          (unsigned long long)msg311_r.idx,
+          (unsigned long long)msg311_r.slot,
+          (unsigned long long)msg311_r.base,
+          (unsigned long long)msg311_r.size,
+          (unsigned long long)msg311_r.cap,
+          (unsigned long long)msg311_r.label);
+  fflush(f);
+}
+
+#define NX_MSG311_VA 0xc5040cu
+
+static void nx_msg311_install(uintptr_t ub) {
+  static const uint32_t exp[4] = { 0xf94002b8u, 0x9101a3e0u, 0xaa1803e1u, 0x940008e8u };
+  uint32_t cur[4];
+  for (int i = 0; i < 4; i++)
+    cur[i] = *(volatile uint32_t *)(ub + NX_MSG311_VA + 4u * (uint32_t)i);
+  if (memcmp(cur, exp, sizeof cur) != 0) {
+    debugPrintf("[msg311] SKIP: registry loop mismatch (have 0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                cur[0], cur[1], cur[2], cur[3]);
+    return;
+  }
+  nx_ret_msg311_cont = ub + 0xc5041cu;
+  nx_ret_msg311_skip = ub + 0xc506b4u;
+  nx_ret_msg311_call = ub + 0xc527b8u;
+  uint32_t patch[4] = {
+    0x58000050u,  /* ldr x16, [pc, #8] */
+    0xd61f0200u,  /* br x16 */
+    (uint32_t)(uintptr_t)nx_tramp_msg311,
+    (uint32_t)((uintptr_t)nx_tramp_msg311 >> 32),
+  };
+  so_patch_code((void *)(ub + NX_MSG311_VA), patch, sizeof patch);
+  debugPrintf("[msg311] hooked registry loop @ %p -> tramp %p cont %p skip %p\n",
+              (void *)(ub + NX_MSG311_VA), (void *)nx_tramp_msg311,
+              (void *)nx_ret_msg311_cont, (void *)nx_ret_msg311_skip);
+}
+
 /* ---------------------------------------------------------------------------
  * In-memory libunity patch (ported from VLN's nx_patch_unity_regions): the SD
  * card now ships the STOCK libunity.so and the boot patches it after load,
@@ -1525,6 +1670,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   }
   nx_jobcount_install(ub);   /* Build #120: hook job push/schedule/complete entries */
   nx_guard155_install(ub);   /* Build #155: guard trampoline (AFTER branch forces) */
+  nx_msg311_install(ub);     /* Build #311: skip NULL message-registry entries */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
