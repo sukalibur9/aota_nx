@@ -269,7 +269,7 @@ DynLibFunction unity_dynlib_functions[] = {
   { "eglQueryString", (uintptr_t)&eglQueryString },
   { "eglSurfaceAttrib", (uintptr_t)&eglSurfaceAttrib },
   { "eglSwapInterval", (uintptr_t)&eglSwapInterval_log },
-  { "exit", (uintptr_t)&exit },
+  { "exit", (uintptr_t)&exit_logged },   /* #314: log before terminating */
   { "exp", (uintptr_t)&exp },
   { "exp2f", (uintptr_t)&exp2f },
   { "fdopen", (uintptr_t)&fdopen },

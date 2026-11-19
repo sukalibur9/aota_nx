@@ -1248,6 +1248,36 @@ void watch_dump(const char *tag, int fd, long a, long b, const void *buf, long g
   debugPrintf("[io] %s fd=%d a=%ld b=%ld -> %ld  [%s]\n", tag, fd, a, b, got, h);
 }
 
+/* ---------------- #314: base.apk trace ---------------- */
+static int g_apk_fd[2] = { -1, -1 };
+static unsigned g_apk_ops;
+int apk314_is(int fd) {
+  return fd >= 0 && (fd == g_apk_fd[0] || fd == g_apk_fd[1]);
+}
+void apk314_mark(int fd) {
+  if (fd < 0) return;
+  if (g_apk_fd[0] < 0) g_apk_fd[0] = fd;
+  else if (g_apk_fd[1] < 0) g_apk_fd[1] = fd;
+  g_apk_ops = 0;
+  debugPrintf("[apk314] watching fd=%d (base.apk)\n", fd);
+}
+void apk314_clear(int fd) {
+  for (int i = 0; i < 2; i++) if (g_apk_fd[i] == fd) g_apk_fd[i] = -1;
+}
+/* Print the request BEFORE it is served, so a block inside fsdev leaves the
+ * unfinished request as the last line in the log. First 96 ops fully, then
+ * every 32nd -- a zip parse is a handful of ops, a bundle read is thousands. */
+int apk314_begin(const char *op, int fd, long long a, long long n) {
+  unsigned k = g_apk_ops++;
+  int loud = (k < 96) || ((k & 31u) == 0);
+  if (loud) debugPrintf("[apk314] #%u %s fd=%d a=%lld n=%lld ...\n", k, op, fd, a, n);
+  return loud;
+}
+void apk314_done(int loud, const char *op, int fd, long long r) {
+  if (loud || r < 0)
+    debugPrintf("[apk314] %s fd=%d -> %lld%s\n", op, fd, r, r < 0 ? "  *** ERR ***" : "");
+}
+
 /* lseek for arm64: off_t is already 64-bit, so this also services lseek64.
  * lseek64 was previously stubbed to return 0 (no seek) -- that made libunity's
  * archive reader see the main archive as empty/mis-positioned ("Unable to read
@@ -1256,6 +1286,7 @@ long z_lseek(int fd, long off, int whence) {
   if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
   long r = lseek(fd, off, whence);
   if (fd == g_watch_fd) debugPrintf("[io] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
+  if (apk314_is(fd)) debugPrintf("[apk314] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
   return r;
 }
 
@@ -1357,6 +1388,8 @@ int open_fake(const char *path, int flags, ...) {
   }
   if (fd >= 0) {
     rc_mark(fd, ((flags & 3) == 0));      /* cache read-only files only */
+    { const char *b = strrchr(path ? path : "", '/');
+      if (b && !strcmp(b, "/base.apk")) apk314_mark(fd); }
     struct stat _st;
     if (fstat(fd, &_st) == 0)
       debugPrintf("[io] open(%s,0x%x) -> %d size=%lld\n", path, flags, fd, (long long)_st.st_size);
@@ -3248,17 +3281,21 @@ long read_fake(int fd, void *buf, size_t count) {
   {   /* cached path: keeps read()'s file-position semantics intact */
     long cur = lseek(fd, 0, SEEK_CUR);
     if (cur >= 0) {
+      int tr = apk314_is(fd) ? apk314_begin("read", fd, cur, (long long)count) : 0;
       long got = rc_pread(fd, buf, count, (uint64_t)cur);
+      if (tr) apk314_done(tr, "read", fd, got);
       if (got >= 0) { lseek(fd, cur + got, SEEK_SET); return got; }
     }
   }
   size_t total = 0;
+  int tr = apk314_is(fd) ? apk314_begin("read*", fd, (long long)-1, (long long)count) : 0;
   while (total < count) {
     long r = read(fd, (char *)buf + total, count - total);
     if (r < 0) { if (total) break; return -1; }
     if (r == 0) break; /* EOF */
     total += (size_t)r;
   }
+  if (tr) apk314_done(tr, "read*", fd, (long long)total);
   if (count >= (1u << 20))
     debugPrintf("[io] read(fd=%d, %zu) -> %zu%s\n", fd, count, total,
                 total < count ? "  *** SHORT READ ***" : "");
@@ -3278,6 +3315,7 @@ long write_fake(int fd, const void *buf, size_t count) {
 }
 int close_fake(int fd) {
   if (asset_pack_fd_is(fd)) return asset_pack_close_fd(fd);
+  if (apk314_is(fd)) { debugPrintf("[apk314] close fd=%d\n", fd); apk314_clear(fd); }
   rc_mark(fd, 0);                          /* fd numbers are reused: drop its blocks */
   if (fd == g_watch_fd) { debugPrintf("[io] <<< close watched fd=%d\n", fd); g_watch_fd = -1; }
   if (fakefd_is_fake(fd)) return fakefd_close(fd);

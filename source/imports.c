@@ -571,11 +571,12 @@ static int dup2_stub(int a, int b) {
 }
 extern long rc_pread_pub(int fd, void *buf, size_t count, unsigned long long off);
 static long pread_impl(int fd, void *buf, size_t n, long off) {
+  int tr = apk314_is(fd) ? apk314_begin("pread", fd, (long long)off, (long long)n) : 0;
   { long got = rc_pread_pub(fd, buf, n, (unsigned long long)off);
-    if (got >= 0) return got; }
+    if (got >= 0) { if (tr) apk314_done(tr, "pread", fd, got); return got; } }
   long cur = lseek(fd, 0, SEEK_CUR);
-  if (cur < 0) return -1;
-  if (lseek(fd, off, SEEK_SET) < 0) return -1;
+  if (cur < 0) { if (tr) apk314_done(tr, "pread", fd, -1); return -1; }
+  if (lseek(fd, off, SEEK_SET) < 0) { if (tr) apk314_done(tr, "pread", fd, -1); return -1; }
   size_t total = 0;
   while (total < n) {                       /* loop: fsdev can short-read */
     long r = read(fd, (char *)buf + total, n - total);
@@ -583,6 +584,7 @@ static long pread_impl(int fd, void *buf, size_t n, long off) {
     total += (size_t)r;
   }
   lseek(fd, cur, SEEK_SET);
+  if (tr) apk314_done(tr, "pread", fd, (long long)total);
   watch_dump("pread", fd, (long)off, (long)n, buf, (long)total);
   return (long)total;
 }
@@ -606,7 +608,22 @@ static int utimensat_stub(int d, const char *p, const void *t, int f) { (void)d;
 static long sendfile_stub(int o, int i, long *off, size_t c) { (void)o; (void)i; (void)off; (void)c; return -1; }
 static void *fdopendir_stub(int fd) { (void)fd; return NULL; }
 static char *inet_ntoa_stub(uint32_t in) { (void)in; static char s[] = "0.0.0.0"; return s; }
-static void _exit_fake(int code) { (void)code; extern void NX_NORETURN __libnx_exit(int rc); __libnx_exit(0); }
+/* #314: a silent process end is the one failure this port cannot see. Test
+ * #313 stopped right after Unity opened base.apk, with no fault in xd.log and
+ * no creport -- so record the exit paths explicitly before leaving. */
+static void _exit_fake(int code) {
+  debugPrintf("[exit314] _exit(%d) caller=%p\n", code, __builtin_return_address(0));
+  extern void NX_NORETURN __libnx_exit(int rc); __libnx_exit(0);
+}
+void exit_logged(int code) {
+  debugPrintf("[exit314] exit(%d) caller=%p -- engine ended the process\n",
+              code, __builtin_return_address(0));
+  extern void NX_NORETURN __libnx_exit(int rc); __libnx_exit(0);
+}
+void abort_logged(void) {
+  debugPrintf("[exit314] abort() caller=%p -- engine aborted\n", __builtin_return_address(0));
+  abort();
+}
 
 /* NULL-safe string ops. Unity's SystemInfo device-detection feeds the device
  * model/manufacturer (NULL in our fake JNI) straight into compare/search libc
@@ -1270,7 +1287,7 @@ DynLibFunction dynlib_functions[] = {
   { "openlog", (uintptr_t)&ret0_i },
   { "closelog", (uintptr_t)&ret0_i },
   { "syslog", (uintptr_t)&ret0_i },
-  { "abort", (uintptr_t)&abort },
+  { "abort", (uintptr_t)&abort_logged },
   { "_exit", (uintptr_t)&_exit_fake },
 
   // --- memory ---

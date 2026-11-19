@@ -149,6 +149,20 @@ long read_fake(int fd, void *buf, size_t count);
 long z_lseek(int fd, long off, int whence);   /* real lseek; also services lseek64 */
 extern int g_watch_fd;
 void watch_dump(const char *tag, int fd, long a, long b, const void *buf, long got);
+
+/* #314: the base.apk handles. Test #313 died right after Unity opened base.apk
+ * twice (last debug.log line) with no fault dump and no [xd] record, so the
+ * next step is unobservable: no read was logged there. These helpers mark the
+ * apk fds and print their read/lseek traffic. */
+int  apk314_is(int fd);
+void apk314_mark(int fd);
+void apk314_clear(int fd);
+int  apk314_begin(const char *op, int fd, long long a, long long n);
+void apk314_done(int loud, const char *op, int fd, long long r);
+/* #314: log then terminate -- Unity ends the process silently on fatal init
+ * errors, and that is indistinguishable from a wedge in the log. */
+void exit_logged(int code);
+void abort_logged(void);
 long write_fake(int fd, const void *buf, size_t count);
 int  close_fake(int fd);
 int  pipe_fake(int fds[2]);
