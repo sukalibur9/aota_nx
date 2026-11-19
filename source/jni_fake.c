@@ -1684,6 +1684,13 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
    * branch in unity_jni.c (which answers the game-root directory) and the
    * [apk138] handler below (now unreachable for these names, kept as a
    * fallback). */
+  /* [b312] SharedPreferences: see unity_make_prefs(). Answered here, ahead of
+   * every routing quirk, for the same reason as the APK path below -- this
+   * engine mints the id against the bare 'UnityPlayer' label, which no class
+   * gate accepts, so the call used to fall through to act_object and return
+   * NULL. Unity's PlayerPrefs then called edit()/getAll() on nothing. */
+  if (!strcmp(id->name, "getSharedPreferences")) return unity_make_prefs();
+
   if (!strcmp(id->name, "getPackageCodePath") || !strcmp(id->name, "getPackageResourcePath")) {
     static char apk[800];
     snprintf(apk, sizeof apk, "%s/base.apk", managed_path(data_dir()));

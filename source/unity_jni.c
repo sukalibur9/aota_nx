@@ -269,6 +269,18 @@ const char *unity_handle_class(void *p){
 }
 int unity_is_inputstream(void *p){ return is_uh(p, UJ_INPUTSTREAM); }
 
+/* [b312] UnityPlayer.getSharedPreferences(). Called from jni_fake.c's
+ * dispatch_object BEFORE its class gate: this engine mints that method id
+ * against the bare label 'UnityPlayer' (log: `UNMATCHED -> null:
+ * UnityPlayer.edit()`), which unity_owns_class() deliberately does not accept,
+ * so the call would otherwise reach act_object and answer NULL. The handle it
+ * returns is what unity_handle_class() maps to android/content/SharedPreferences,
+ * so every later call on it (edit/getAll/getInt/...) routes here by receiver. */
+void *unity_make_prefs(void){
+  debugPrintf("[prefs] getSharedPreferences -> prefs handle (%d entries)\n", g_kv_n);
+  return uh_new(UJ_PREFS);
+}
+
 /* [cfg146] boot.config memorysetup override. The engine reads
  * bin/Data/boot.config during initJni (AssetManager.open -> Scanner) and
  * takes its allocator block sizes from the memorysetup-*-allocator-block-size
@@ -548,12 +560,7 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
    * and writes through, so answer with a real UJ handle (see unity_handle_class)
    * instead of a label-only object. */
   if (has(cls,"UnityPlayer")){
-    if (has(m,"getSharedPreferences")){
-      const char *name = jni_string_utf(va_arg(va,void*));
-      debugPrintf("[prefs] getSharedPreferences('%s') -> prefs handle (%d entries)\n",
-                  name ? name : "?", g_kv_n);
-      return uh_new(UJ_PREFS);
-    }
+    if (has(m,"getSharedPreferences")) return unity_make_prefs();
     return jni_make_object("UnityPlayer");
   }
 

@@ -72,6 +72,13 @@ int       unity_owns_receiver(void *recv);   /* 1 if recv is a dispatchable UJ h
 const char *unity_handle_class(void *p);     /* class name for UJ handles, or NULL */
 int       unity_is_inputstream(void *p);     /* 1 if p is our InputStream handle */
 
+/* [b312] Real SharedPreferences handle. jni_fake.c calls this from its
+ * dispatch_object for getSharedPreferences(), ahead of the class gate, because
+ * the method id arrives minted against the bare 'UnityPlayer' label (which
+ * unity_owns_class() intentionally does not accept) and the call otherwise
+ * answered NULL -- Unity's PlayerPrefs then used a null object for load/save. */
+void     *unity_make_prefs(void);
+
 /* java.util.Scanner(InputStream, charset). Called from jni_fake.c's constructor
  * dispatcher: Unity reads boot.config as
  *   new Scanner(getAssets().open(...), "UTF-8").useDelimiter("\\A").next()
