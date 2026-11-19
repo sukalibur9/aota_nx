@@ -148,6 +148,29 @@ int gettid_fake(void) {
   return 1;
 }
 
+/* Build #308: who is the main thread? The vsync-counter bind below used to
+ * accept the FIRST futex wait after the render loop opened, whoever made it.
+ * In test #307 that was the il2cpp GC helper idling (tid=8695, caller in
+ * libil2cpp): the pacer then bumped a bogus u64 at that object's +0x58 and
+ * pulsed it 60x/s while the real frame pacer wait stayed unbound. Only the
+ * thread that calls nativeRender can be waiting for a frame to be presented,
+ * so the bind is gated on it. main() records itself right after the log is
+ * up, before any game thread exists. */
+static u64 g_main_gtid = 0;
+
+void port_note_main_thread(void) {
+  u64 tid = 0;
+  if (R_SUCCEEDED(svcGetThreadId(&tid, CUR_THREAD_HANDLE)))
+    g_main_gtid = tid;
+}
+
+int port_is_main_thread(void) {
+  u64 tid = 0;
+  if (!g_main_gtid) return 0;
+  if (R_FAILED(svcGetThreadId(&tid, CUR_THREAD_HANDLE))) return 0;
+  return tid == g_main_gtid;
+}
+
 #define ARM64_SYS_GETTID            178
 #define ARM64_SYS_FUTEX             98
 #define ARM64_SYS_SCHED_SETAFFINITY 122
@@ -227,16 +250,45 @@ void __malloc_unlock(struct _reent *reent) {
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_CMD_MASK    0x7f  // strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256)
 
+/* Build #289: the futex bookkeeping locks below are plain CAS spin locks, NOT
+ * libnx Mutex. libnx mutexLock() publishes the owner's KERNEL HANDLE in the
+ * mutex word and asks svcArbitrateLock to arbitrate; when that call fails
+ * libnx runs svcBreak(BreakReason_Assert) -- a fatal user break, not a
+ * recoverable error. Crash log 01794988221 is exactly that chain:
+ *     PC  svcBreak        (libnx svc.s:234)
+ *     LR  mutexLock       (libnx mutex.c:60, R_FAILED(svcArbitrateLock))
+ *     ret futex_slot_find (libc_shim.c, &futex_tab_lock)
+ *     ret vsync_thread_fn (vsync_fake.c:113)
+ * The kernel refused to arbitrate against the handle stored in
+ * futex_tab_lock, i.e. that word held the handle of a thread that no longer
+ * exists (a game thread that went away while holding it). A CAS lock keeps no
+ * owner handle, so the worst case is a spin -- never a process-killing break.
+ * Spinning yields (svcSleepThread(0)) so the holder still gets the CPU: this
+ * port must never rely on a millisecond timer sleep waking it up. */
+typedef struct { volatile u32 v; } fx_lock_t;
+static inline int fx_trylock(fx_lock_t *l) {
+  u32 expected = 0;
+  return (int)__atomic_compare_exchange_n(&l->v, &expected, 1u, 0,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+static inline void fx_unlock(fx_lock_t *l) {
+  __atomic_store_n(&l->v, 0u, __ATOMIC_RELEASE);
+}
+static inline void fx_lock(fx_lock_t *l) {
+  while (!fx_trylock(l)) svcSleepThread(0);
+}
+
 #define FUTEX_SLOTS 1024  // distinct futex addresses ever waited on; Unity uses dozens
 typedef struct {
   uintptr_t uaddr;  // exact waited-on address; 0 = free slot (sticky once bound)
   u64 gen;          // bumped under m on every FUTEX_WAKE for uaddr
   int refcount;     // waiters currently attached
-  Mutex m;          // serializes the gen handshake against sleep/wake
+  unsigned fakewake; // #288: consecutive fake-wakes with no genuine pulse
+  fx_lock_t m;      // #289: CAS lock, was Mutex -- see the note above
   CondVar cv;       // signaled only for THIS uaddr
 } futex_slot_t;
 static futex_slot_t futex_slots[FUTEX_SLOTS];  // zero-init: all free
-static Mutex futex_tab_lock;                   // guards uaddr/refcount allocation
+static fx_lock_t futex_tab_lock;                // #289: guards uaddr/refcount allocation
 
 // Attach to the slot for uaddr, creating it if needed. Returns NULL only if
 // every slot is in use (practically unreachable at 1024); the caller then
@@ -252,7 +304,7 @@ static futex_slot_t *futex_slot_acquire(volatile int32_t *uaddr) {
    * (free lock) still acquires on the first try. */
   int locked = 0;
   for (int i = 0; i < 1000; i++) {
-    if (mutexTryLock(&futex_tab_lock)) { locked = 1; break; }
+    if (fx_trylock(&futex_tab_lock)) { locked = 1; break; }
     svcSleepThread(0);  /* yield: let the holder run */
   }
   if (!locked) return NULL;  /* caller falls back to the bucket path */
@@ -267,28 +319,61 @@ static futex_slot_t *futex_slot_acquire(volatile int32_t *uaddr) {
         break;
       }
   if (s) s->refcount++;
-  mutexUnlock(&futex_tab_lock);
+  fx_unlock(&futex_tab_lock);
   return s;
 }
 
 static void futex_slot_release(futex_slot_t *s) {
-  mutexLock(&futex_tab_lock);
+  fx_lock(&futex_tab_lock);
   s->refcount--;
   // uaddr stays bound (sticky): a later waiter reuses the slot and captures a
   // fresh gen, so there is no stale-generation hazard; a waker arriving while
   // no one waits still finds the slot and signals an empty condvar (harmless).
-  mutexUnlock(&futex_tab_lock);
+  fx_unlock(&futex_tab_lock);
 }
 
 // Find WITHOUT creating: the wake path must not allocate a slot for an
 // address no one waits on (the pulse is then simply lost, as on Linux).
 static futex_slot_t *futex_slot_find(volatile int32_t *uaddr) {
   futex_slot_t *s = NULL;
-  mutexLock(&futex_tab_lock);
+  fx_lock(&futex_tab_lock);
   for (int i = 0; i < FUTEX_SLOTS; i++)
     if (futex_slots[i].uaddr == (uintptr_t)uaddr) { s = &futex_slots[i]; break; }
-  mutexUnlock(&futex_tab_lock);
+  fx_unlock(&futex_tab_lock);
   return s;
+}
+
+/* Build #288: how many consecutive fake-wakes on one address we tolerate
+ * before reporting a real timeout instead of an invented "woken". 16 x 10 ms
+ * = 160 ms: long enough that a merely delayed producer still wins the race,
+ * short enough that a permanently undriven wait stops lying in under a
+ * fifth of a second. */
+#define FUTEX_ASSIST_LIMIT 16u
+
+/* Build #288: pulse a futex address from a DIFFERENT thread (currently the
+ * vsync pacer, vsync_fake.c). This is what a FUTEX_WAKE does minus the
+ * caller accounting: bump the slot generation under the slot mutex and wake
+ * the slot condvar, so a waiter polling value+generation sees a genuine
+ * pulse. Returns 1 if a waiter was attached, 0 otherwise (a pulse with no
+ * waiter is simply lost, as on Linux).
+ *
+ * The slot mutex is taken with a BOUNDED try-lock: this runs on the pacer
+ * thread, and parking it -- even briefly -- is what the whole #288 change is
+ * about. A missed pulse here costs one frame, never a stalled pacer. */
+int futex_pulse_addr(uintptr_t a) {
+  futex_slot_t *s = futex_slot_find((volatile int32_t *)a);
+  if (!s || s->refcount <= 0) return 0;
+  int locked = 0;
+  for (int i = 0; i < 200; i++) {
+    if (fx_trylock(&s->m)) { locked = 1; break; }
+    svcSleepThread(0);
+  }
+  if (!locked) return 0;
+  s->gen++;
+  s->fakewake = 0;         /* a real wake: the consecutive-timeout count resets */
+  condvarWakeAll(&s->cv);
+  fx_unlock(&s->m);
+  return 1;
 }
 
 // Legacy bucket arrays -- kept ONLY for the slot-table-full fallback below.
@@ -354,7 +439,7 @@ static long futex_wait_bucket_fallback(volatile int32_t *uaddr, int val, const s
 #define FXOWN_N 64
 static uintptr_t fxown_a[FXOWN_N];
 static unsigned  fxown_c[FXOWN_N];
-static Mutex     fxown_lk;
+static fx_lock_t fxown_lk;   /* #289: CAS lock, was Mutex (same panic class) */
 static int fxown_slot(uintptr_t a) {
   int victim = 0; unsigned lo = ~0u;
   for (int i = 0; i < FXOWN_N; i++) {
@@ -366,9 +451,9 @@ static int fxown_slot(uintptr_t a) {
 static void fxown_spin(volatile int32_t *uaddr) {
   uintptr_t a = (uintptr_t)uaddr;
   if (a < 0x2400000000ULL) return;            /* skip job/loader region */
-  mutexLock(&fxown_lk);
+  fx_lock(&fxown_lk);
   int s = fxown_slot(a); unsigned c = ++fxown_c[s];
-  mutexUnlock(&fxown_lk);
+  fx_unlock(&fxown_lk);
   if (c == 300) {
     /* Unity 6000.5.8f1 mutex_lock (libunity.so+0x58a6dc) stores owner thread ID
      * at [mutex+64]. Dump it to identify who holds the mutex we're stuck on. */
@@ -397,9 +482,9 @@ static void fxown_wake(volatile int32_t *uaddr) {
   uintptr_t a = (uintptr_t)uaddr;
   if (a < 0x2400000000ULL) return;
   unsigned c = 0;
-  mutexLock(&fxown_lk);
+  fx_lock(&fxown_lk);
   for (int i = 0; i < FXOWN_N; i++) if (fxown_a[i] == a) { c = fxown_c[i]; fxown_c[i] = 0; break; }
-  mutexUnlock(&fxown_lk);
+  fx_unlock(&fxown_lk);
   if (c >= 300)
     debugPrintf("[fxown] WAKE ua=%p by tid=%d (was stuck %u re-polls)\n", (void *)uaddr, gettid_fake(), c);
 }
@@ -414,6 +499,7 @@ static void fxown_wake(volatile int32_t *uaddr) {
  * the fd kept; a "[wake266] boot" header separates boots. Open failure
  * is silent (fd stays -1, records skipped). */
 static int futex266_wake_fd = -1;
+static unsigned futex266_wake_recs = 0;
 static void futex266_wake_log(volatile int32_t *uaddr, int32_t val, int infinite) {
   if (futex266_wake_fd < 0) {
     futex266_wake_fd = open("sdmc:/switch/aota/wake.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
@@ -422,6 +508,16 @@ static void futex266_wake_log(volatile int32_t *uaddr, int32_t val, int infinite
     ssize_t hw = write(futex266_wake_fd, hdr, 15);
     (void)hw;
   }
+  /* #288: RATE LIMIT. A parked waiter fake-wakes every 10 ms, and every
+   * record is an SD-card write: the unbounded version made the logging itself
+   * a bottleneck and buried the first, interesting cycles (wake.log from the
+   * black-screen boot is thousands of identical lines). Keep the first 128
+   * records, then one per 1024 (~2.4 lines/s per waiter). */
+  if (futex266_wake_recs >= 128 && (futex266_wake_recs & 1023) != 0) {
+    futex266_wake_recs++;
+    return;
+  }
+  futex266_wake_recs++;
   /* Hand-format: "[wake266] FAKEWAKE ua=0x............ val=0x........ timed/infinite"
    * -- no sprintf (newlib reent), just hex digits. Buffer: 24 + 12 + 7 + 8
    * + 1 + 9 = 61 bytes max. */
@@ -464,20 +560,39 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
      * replaces the address filter: by the render loop, a futex wait is
      * the frame pacer, not the job system. One-shot via the NULL check;
      * vsync_bind_counter is idempotent. */
-    if (g_in_render_loop && vsync_get_counter() == NULL) {
-      debugPrintf("[futex263] first render-loop futex wait ua=%p, binding vsync counter\n",
-                  (void *)uaddr);
-      vsync_bind_counter((uintptr_t)uaddr);
+    /* #308: main-thread gate (see port_is_main_thread) plus one bounded
+     * evidence line per distinct attempt: address, value, timeout, caller and
+     * the four u64 words at the address, so the next log shows whether this is
+     * really Unity's {mutex, counter at +0x58} pair or another object. */
+    if (g_in_render_loop && port_is_main_thread()) {
+      static unsigned mlw_n = 0;
+      if (mlw_n < 4 || (mlw_n & 255) == 0) {
+        u64 w[4] = { 0, 0, 0, 0 };
+        if (nx_addr_readable((uintptr_t)uaddr, sizeof(w)))
+          __builtin_memcpy(w, (const void *)uaddr, sizeof(w));
+        u64 tn = 0;
+        if (to) tn = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
+        debugPrintf("[vsync308] main render-loop wait #%u ua=%p val=%d timeout=%llums "
+                    "caller=%p bound=%d words=%llx,%llx,%llx,%llx\n",
+                    mlw_n, (void *)uaddr, val,
+                    (unsigned long long)(tn / 1000000ULL),
+                    __builtin_return_address(0), vsync_get_counter() != NULL,
+                    (unsigned long long)w[0], (unsigned long long)w[1],
+                    (unsigned long long)w[2], (unsigned long long)w[3]);
+      }
+      mlw_n++;
+      if (vsync_get_counter() == NULL)
+        vsync_bind_counter((uintptr_t)uaddr);
     }
     /* diagnostic: log each distinct waited-on address once (who waits for what) */
     {
       static uintptr_t seen_ua[128]; static int seen_n = 0;
-      static Mutex seen_lk;
+      static fx_lock_t seen_lk;  /* #289: CAS lock, was Mutex */
       int seen = 0;
-      mutexLock(&seen_lk);
+      fx_lock(&seen_lk);
       for (int i = 0; i < seen_n; i++) if (seen_ua[i] == (uintptr_t)uaddr) { seen = 1; break; }
       if (!seen && seen_n < 128) { seen_ua[seen_n++] = (uintptr_t)uaddr; }
-      mutexUnlock(&seen_lk);
+      fx_unlock(&seen_lk);
       if (!seen) {
         u64 tns = 0;
         if (to) tns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
@@ -530,7 +645,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     }
 
     long ret = 0;
-    mutexLock(&s->m);
+    fx_lock(&s->m);
     const u64 gen0 = s->gen;
     if (*uaddr != val) {
       errno = EAGAIN; ret = -1;
@@ -589,39 +704,85 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
           debugPrintf("[futex263] pre-poll timed ua=%p tid=%d\n", (void *)uaddr, gettid_fake());
         } }
       while (!done && armTicksToNs(armGetSystemTick() - t0) < eff_ns) {
-        mutexUnlock(&s->m);
+        fx_unlock(&s->m);
         svcSleepThread(0);  /* yield: no timer wakeup to lose */
-        mutexLock(&s->m);
+        fx_lock(&s->m);
         if (*uaddr != val) {
           done = 1;  /* standard wake: value changed */
+          s->fakewake = 0;  /* #288: forward progress, not a timeout */
         } else if (s->gen != gen0) {
           /* Build #97 pulse: woken without a value change. */
           done = 1;
+          s->fakewake = 0;  /* #288: genuine pulse -> real wake, count resets */
           /* Build #92: log 4-frame backtrace to identify the real Unity waiter.
            * __builtin_return_address(0) alone gives a stack artifact (0x127a57c);
-           * we need the deeper call chain. */
-          void *c0 = __builtin_return_address(0);
-          void *c1 = __builtin_return_address(1);
-          void *c2 = __builtin_return_address(2);
-          void *c3 = __builtin_return_address(3);
-          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p\n",
-                      (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
+           * we need the deeper call chain.
+           * #288: rate-limited -- once the vsync pacer drives this wait the
+           * pulse fires every frame, and an SD-card write per frame per
+           * waiter is not affordable. */
+          static unsigned pulse_log = 0;
+          if (pulse_log < 32 || (pulse_log & 511) == 0) {
+            void *c0 = __builtin_return_address(0);
+            void *c1 = __builtin_return_address(1);
+            void *c2 = __builtin_return_address(2);
+            void *c3 = __builtin_return_address(3);
+            debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p\n",
+                        (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
+          }
+          pulse_log++;
         }
         /* else: no wake yet -- re-poll */
       }
       if (!done) {
         if (capped) {
-          /* Fake wake: return 0 (success) as if woken. Unity re-checks *uaddr. */
+          /* Build #288: DISTINGUISH a real wake from a timeout. The first
+           * FUTEX_ASSIST_LIMIT fake-wakes keep the pre-#288 behaviour
+           * (return 0, "woken") because a caller that ignores futex return
+           * codes must not be parked by a single lost pulse. After that the
+           * wait has provably timed out this many times in a row on the same
+           * address -- no value change, no pulse -- so report the timeout the
+           * way Linux would (errno=ETIMEDOUT). Callers that re-check their
+           * predicate lose nothing; callers with a timeout path finally get
+           * control instead of silently re-waiting forever. */
           void *caller = __builtin_return_address(0);
+          const unsigned assists = ++s->fakewake;
+          /* config.h: 0 restores the pre-#288 always-succeed fake wake. */
+          const unsigned assists_limit =
+              OS_FUTEX_TIMEOUT_ESCALATE ? FUTEX_ASSIST_LIMIT : 0xFFFFFFFFu;
           /* #266: lock-free wake record BEFORE the debugPrintf. If
            * g_log_lock is wedged (theory B), the FAKEWAKE print below
            * blocks forever and the log can never prove the waiter cycled;
            * wake.log records it regardless. */
           futex266_wake_log(uaddr, val, 0);
-          debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~10ms tid=%d caller=%p (req %llums)\n",
-                      (void *)uaddr, val, gettid_fake(), caller,
-                      (unsigned long long)(ns / 1000000ULL));
-          ret = 0;
+          /* #291: rate-limited like PULSE. A parked waiter fake-wakes every
+           * 10 ms; an unthrottled line per wake buried the boot tail of the
+           * #289 log (165 KB of FAKEWAKE/SLOT-WAIT, the interesting last lines
+           * pushed off the end). First 32 keeps the address/caller that has no
+           * producer, then one per 256 (~25 lines/s across all waiters), and
+           * the lock-free wake.log channel still records every one. */
+          static unsigned fakewake_log = 0;
+          if (assists <= assists_limit) {
+            if (fakewake_log < 32 || (fakewake_log & 255) == 0)
+              debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~10ms tid=%d caller=%p "
+                          "(req %llums, assist %u/%u)\n",
+                          (void *)uaddr, val, gettid_fake(), caller,
+                          (unsigned long long)(ns / 1000000ULL),
+                          assists, FUTEX_ASSIST_LIMIT);
+            fakewake_log++;
+            ret = 0;
+          } else {
+            /* #288: rate-limited like the other hot lines -- one line at the
+             * transition (which names the address and caller that has no
+             * producer) and then one per 1024 to keep the SD card quiet. */
+            static unsigned timeout_log = 0;
+            if (assists == FUTEX_ASSIST_LIMIT + 1 || (timeout_log & 1023) == 0)
+              debugPrintf("[futex] TIMEOUT ua=%p val=%d after %u fake-wakes tid=%d caller=%p "
+                          "(req %llums, nobody produced)\n",
+                          (void *)uaddr, val, assists, gettid_fake(), caller,
+                          (unsigned long long)(ns / 1000000ULL));
+            timeout_log++;
+            errno = ETIMEDOUT; ret = -1;
+          }
         } else {
           errno = ETIMEDOUT; ret = -1;
         }
@@ -648,34 +809,68 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
           debugPrintf("[futex263] pre-poll infinite ua=%p tid=%d\n", (void *)uaddr, gettid_fake());
         } }
       while (!done && armTicksToNs(armGetSystemTick() - t0i) < 10000000ULL) {  /* #287: 100ms -> 10ms, same experiment as the timed path */
-        mutexUnlock(&s->m);
+        fx_unlock(&s->m);
         svcSleepThread(0);  /* yield: no timer wakeup to lose */
-        mutexLock(&s->m);
+        fx_lock(&s->m);
         if (*uaddr != val) {
           done = 1;
+          s->fakewake = 0;  /* #288: forward progress, not a timeout */
         } else if (s->gen != gen0) {
           done = 1;
-          /* Build #92: 4-frame backtrace for real waiter identification. */
-          void *c0 = __builtin_return_address(0);
-          void *c1 = __builtin_return_address(1);
-          void *c2 = __builtin_return_address(2);
-          void *c3 = __builtin_return_address(3);
-          debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p (infinite wait)\n",
-                      (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
+          s->fakewake = 0;  /* #288: genuine pulse -> real wake, count resets */
+          /* Build #92: 4-frame backtrace for real waiter identification.
+           * #288: rate-limited (see the timed path). */
+          static unsigned pulse_log_i = 0;
+          if (pulse_log_i < 32 || (pulse_log_i & 511) == 0) {
+            void *c0 = __builtin_return_address(0);
+            void *c1 = __builtin_return_address(1);
+            void *c2 = __builtin_return_address(2);
+            void *c3 = __builtin_return_address(3);
+            debugPrintf("[futex] PULSE ua=%p val=%d tid=%d callers=%p,%p,%p,%p (infinite wait)\n",
+                        (void *)uaddr, val, gettid_fake(), c0, c1, c2, c3);
+          }
+          pulse_log_i++;
         }
       }
       if (!done) {
         void *caller = __builtin_return_address(0);
+        const unsigned assists = ++s->fakewake;
+        /* config.h: 0 restores the pre-#288 always-succeed fake wake. */
+        const unsigned assists_limit =
+            OS_FUTEX_TIMEOUT_ESCALATE ? FUTEX_ASSIST_LIMIT : 0xFFFFFFFFu;
         /* #266: lock-free wake record BEFORE the debugPrintf (see the
          * timed path: if g_log_lock is wedged, this is the only record
          * that the waiter cycled). */
         futex266_wake_log(uaddr, val, 1);
-        debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~10ms tid=%d caller=%p (was infinite wait)\n",
-                    (void *)uaddr, val, gettid_fake(), caller);
-        ret = 0;  /* fake wake, not ETIMEDOUT */
+        /* #291: rate-limited, same as the timed path above. */
+        static unsigned fakewake_log_i = 0;
+        if (assists <= assists_limit) {
+          if (fakewake_log_i < 32 || (fakewake_log_i & 255) == 0)
+            debugPrintf("[futex] FAKEWAKE ua=%p val=%d after ~10ms tid=%d caller=%p "
+                        "(was infinite wait, assist %u/%u)\n",
+                        (void *)uaddr, val, gettid_fake(), caller,
+                        assists, FUTEX_ASSIST_LIMIT);
+          fakewake_log_i++;
+          ret = 0;  /* fake wake: one lost pulse must not park a caller forever */
+        } else {
+          /* #288: an infinite Linux wait is ended ONLY by a producer. This
+           * many consecutive 10 ms windows with no value change and no wake
+           * means nothing here will ever produce for this address -- the
+           * black-screen livelock in wake.log (same address FAKEWAKE'd every
+           * ~10 ms, forever). Surface a real timeout instead of spinning
+           * silently: the caller's own timeout path gets control, and the
+           * line names the address and caller that has no producer. */
+          static unsigned timeout_log_i = 0;
+          if (assists == FUTEX_ASSIST_LIMIT + 1 || (timeout_log_i & 1023) == 0)
+            debugPrintf("[futex] TIMEOUT ua=%p val=%d after %u fake-wakes tid=%d caller=%p "
+                        "(infinite wait, no producer)\n",
+                        (void *)uaddr, val, assists, gettid_fake(), caller);
+          timeout_log_i++;
+          errno = ETIMEDOUT; ret = -1;
+        }
       }
     }
-    mutexUnlock(&s->m);
+    fx_unlock(&s->m);
     futex_slot_release(s);
     return ret;
   }
@@ -704,11 +899,12 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     futex_slot_t *s = futex_slot_find(uaddr);
     if (s) {
       int slot_idx = (int)(s - futex_slots);
-      mutexLock(&s->m);
+      fx_lock(&s->m);
       u64 gen_before = s->gen;
       s->gen++;
+      s->fakewake = 0;  /* #288: a real wake clears the consecutive-timeout count */
       condvarWakeAll(&s->cv);
-      mutexUnlock(&s->m);
+      fx_unlock(&s->m);
       debugPrintf("[futex] SLOT-WAKE ua=%p slot=%d gen %llu->%llu refcount=%d tid=%d\n",
                   (void *)uaddr, slot_idx,
                   (unsigned long long)gen_before, (unsigned long long)s->gen,
@@ -868,31 +1064,84 @@ size_t __ctype_get_mb_cur_max_fake(void) { return 1; }
 int __register_atfork_fake(void) { return 0; }
 int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso) { (void)fn; (void)arg; (void)dso; return 0; }
 
+/* #302: bionic's bits/sysconf.h assigns
+ *     _SC_NPROCESSORS_CONF 96+1 (97)
+ *     _SC_NPROCESSORS_ONLN 96+2 (98)
+ *     _SC_PHYS_PAGES       96+3 (99)
+ *     _SC_AVPHYS_PAGES     96+4 (100)
+ * These used to be declared 96/97/98 here -- off by one. A query for ONLN
+ * (98) therefore landed on the PHYS_PAGES arm and reported 131072 "cores",
+ * and PHYS_PAGES (99) fell through to -1. b301's log records the damage:
+ *     Unity: SystemInfo CPU = ARM64, Cores = 0, Memory = 0mb
+ *     Unity: SystemInfo ARM big.LITTLE configuration: 0 big (0x0), 0 little (0x0)
+ * with 26 job workers spawned anyway and the main thread later reading a NULL
+ * name out of Unity's message cache. Every plausible constant (bionic, glibc
+ * and the old alias 96) is answered below so no header can silently fall
+ * through again; anything still unhandled is logged once. */
 #define BIONIC_SC_PAGESIZE 39
 #define BIONIC_SC_PAGE_SIZE 40
-#define BIONIC_SC_NPROCESSORS_CONF 96
-#define BIONIC_SC_NPROCESSORS_ONLN 97
-#define BIONIC_SC_PHYS_PAGES 98
-/* Linux (glibc) values, in case Unity uses those instead of bionic's */
+#define BIONIC_SC_NPROCESSORS_CONF 97
+#define BIONIC_SC_NPROCESSORS_ONLN 98
+#define BIONIC_SC_PHYS_PAGES 99
+#define BIONIC_SC_AVPHYS_PAGES 100
+/* glibc values, in case the engine's headers are not the NDK's */
+#define LINUX_SC_PAGESIZE 30
 #define LINUX_SC_NPROCESSORS_CONF 83
 #define LINUX_SC_NPROCESSORS_ONLN 84
+#define LINUX_SC_PHYS_PAGES 85
+#define LINUX_SC_AVPHYS_PAGES 86
+
+/* #304: bionic sched_getaffinity(pid, cpusetsize, mask). This used to be
+ * z_stub0 in the import table: it returned 0 (success) and never touched the
+ * mask, so the engine's core detection read whatever was in that buffer and
+ * b303 logged
+ *     Unity: SystemInfo ARM big.LITTLE configuration: 1 big (mask: 0x4), 0 little
+ * -- one usable CPU on a 3-core homebrew budget, while sysconf(ONLN) correctly
+ * answered 3. libnx hands homebrew cores 0-2, so publish exactly that and
+ * accept (never reject) pin requests: an affinity call that fails can make the
+ * job system drop workers. */
+int sched_getaffinity_fake(int pid, size_t cpusetsize, void *mask) {
+  (void)pid;
+  if (!mask || cpusetsize == 0) { errno = EINVAL; return -1; }
+  memset(mask, 0, cpusetsize);
+  uint64_t m = 0x7ull;                       /* cores 0,1,2 */
+  memcpy(mask, &m, cpusetsize < sizeof m ? cpusetsize : sizeof m);
+  return 0;
+}
+int sched_setaffinity_fake(int pid, size_t cpusetsize, const void *mask) {
+  (void)pid; (void)cpusetsize; (void)mask;
+  return 0;                                  /* honour nothing, fail nothing */
+}
 
 long sysconf_fake(int name) {
   switch (name) {
     case BIONIC_SC_PAGESIZE:
-    case BIONIC_SC_PAGE_SIZE: return 0x1000;
+    case BIONIC_SC_PAGE_SIZE:
+    case LINUX_SC_PAGESIZE:
+    case 29:
+      return 0x1000;
+    /* 96 is the old (wrong) alias this port used for CONF; keep answering it
+     * so a stale caller still gets a sane core count instead of -1. */
     case BIONIC_SC_NPROCESSORS_CONF:
     case BIONIC_SC_NPROCESSORS_ONLN:
     case LINUX_SC_NPROCESSORS_CONF:
-    case LINUX_SC_NPROCESSORS_ONLN: {
+    case LINUX_SC_NPROCESSORS_ONLN:
+    case 96: {
       static int logged = 0;
       if (!logged) { logged = 1; debugPrintf("[sysconf] NPROCESSORS query name=%d -> 3\n", name); }
       return 3;
     }
     // Report 512 MB (matches synthetic /proc/meminfo MemTotal) to make Unity's
     // DynamicHeap reserve fewer 256MB regions; real backing (arena/OC) holds more.
-    case BIONIC_SC_PHYS_PAGES: return (512ll * 1024 * 1024) / 0x1000;
-    default: return -1;
+    case BIONIC_SC_PHYS_PAGES:
+    case LINUX_SC_PHYS_PAGES: return (512ll * 1024 * 1024) / 0x1000;
+    case BIONIC_SC_AVPHYS_PAGES:
+    case LINUX_SC_AVPHYS_PAGES: return (393ll * 1024 * 1024) / 0x1000;
+    default: {
+      static int unseen = 0;
+      if (unseen < 8) { unseen++; debugPrintf("[sysconf] UNHANDLED name=%d -> -1\n", name); }
+      return -1;
+    }
   }
 }
 long pathconf_fake(const char *path, int name) { (void)path; (void)name; return -1; }
@@ -2711,11 +2960,38 @@ static const char *synthetic_proc(const char *path) {
            "Cached:               0 kB\n"
            "SwapTotal:            0 kB\n"
            "SwapFree:             0 kB\n";
+  /* #302: one blank-line-separated block per core, in the real Android shape.
+   * The old single block (three bare "processor" lines followed by one shared
+   * Features block) is not what a Linux cpuinfo looks like, and b301's engine
+   * printed "Cores = 0" / "0 big, 0 little" right after reading this file. */
   if (!strcmp(path, "/proc/cpuinfo"))
-    return "processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\n"
-           "Features\t: fp asimd aes pmull sha1 sha2 crc32\n"
-           "CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x1\n"
-           "CPU part\t: 0xd07\nCPU revision\t: 1\n";
+    return "processor\t: 0\n"
+           "BogoMIPS\t: 38.40\n"
+           "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n"
+           "CPU implementer\t: 0x41\n"
+           "CPU architecture: 8\n"
+           "CPU variant\t: 0x0\n"
+           "CPU part\t: 0xd03\n"
+           "CPU revision\t: 4\n"
+           "\n"
+           "processor\t: 1\n"
+           "BogoMIPS\t: 38.40\n"
+           "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n"
+           "CPU implementer\t: 0x41\n"
+           "CPU architecture: 8\n"
+           "CPU variant\t: 0x0\n"
+           "CPU part\t: 0xd03\n"
+           "CPU revision\t: 4\n"
+           "\n"
+           "processor\t: 2\n"
+           "BogoMIPS\t: 38.40\n"
+           "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n"
+           "CPU implementer\t: 0x41\n"
+           "CPU architecture: 8\n"
+           "CPU variant\t: 0x0\n"
+           "CPU part\t: 0xd03\n"
+           "CPU revision\t: 4\n"
+           "\n";
   if (strstr(path, "cpu_capacity")) return "1024\n";
   if (strstr(path, "cpuinfo_max_freq") || strstr(path, "scaling_max_freq")) return "1785000\n";
   if (strstr(path, "cpuinfo_min_freq") || strstr(path, "scaling_min_freq")) return "1020000\n";
@@ -3278,7 +3554,7 @@ int sem_post_fake(void **s) {
   /* Build #111: log sem_post to see if the semaphore main waits on ever gets signaled. */
   static int post_log_count = 0;
   if (s && *s) {
-    if (post_log_count < 30) {
+    if (post_log_count < 300) {   /* #301: 30 was too few to see every sem */
       post_log_count++;
       debugPrintf("[sem] post sem=%p count_before=%lld tid=%d caller=%p\n",
                   (void*)*s, (long long)((FakeSem *)*s)->sem.count,
@@ -3288,7 +3564,33 @@ int sem_post_fake(void **s) {
   }
   return 0;
 }
-int sem_wait_fake(void **s) { if (s && *s) { Semaphore *sm=&((FakeSem *)*s)->sem; diag_wait_enter(DIAG_W_SEM,sm); semaphoreWait(sm); diag_wait_exit(); } return 0; }
+int sem_wait_fake(void **s) {
+  if (s && *s) {
+    Semaphore *sm=&((FakeSem *)*s)->sem;
+    /* #301: name every semaphore waiter. Run #300's final stall dump shows
+     * T1129 and T1133 parked in sem_wait with the 49-day "infinite"
+     * timeout (0x31bbea7740, 0x31bc20b600) and T1130/T1131 for 80s/73s
+     * (0x31bc540f40, 0x31bc6e3ac0) while the only sem the log shows being
+     * posted is 0x31b969c240 -- i.e. those four were never posted in the
+     * whole run. Logging the waiter (address, count, tid, caller) makes it
+     * possible to say whether the producer posts a DIFFERENT object or
+     * never runs at all. First wait per distinct address, then 1 per 1024. */
+    static void *seen[64]; static int seen_n = 0; static unsigned calls = 0;
+    int idx = -1;
+    for (int i = 0; i < seen_n; i++) if (seen[i] == (void *)sm) { idx = i; break; }
+    int fresh = 0;
+    if (idx < 0 && seen_n < 64) { seen[idx = seen_n++] = (void *)sm; fresh = 1; }
+    if (fresh || (calls & 1023) == 0)
+      debugPrintf("[sem301] wait sem=%p count=%lld tid=%d caller=%p%s\n",
+                  (void *)sm, (long long)sm->count, gettid_fake(),
+                  __builtin_return_address(0), fresh ? " [new]" : "");
+    calls++;
+    diag_wait_enter(DIAG_W_SEM,sm);
+    semaphoreWait(sm);
+    diag_wait_exit();
+  }
+  return 0;
+}
 int sem_trywait_fake(void **s) { if (s && *s && semaphoreTryWait(&((FakeSem *)*s)->sem)) return 0; errno = EAGAIN; return -1; }
 int sem_getvalue_fake(void **s, int *val) {
   /* Build #111: log sem_getvalue to identify which semaphore main polls in its spin-wait loop. */

@@ -25,9 +25,48 @@
 static Mutex g_log_lock; // libnx Mutex: 0 == unlocked, no init needed
 #endif
 
+static int  g_log_fd = -1;
+static char g_log_path[512];
+
+/* #305: open debug.log WITHOUT the old lazily-inside-the-caller idiom.
+ * b304's exception handler called open() on the fault path; open() allocates a
+ * newlib FILE handle (malloc), newlib's heap lock is an rmutex, and the
+ * faulting thread still held it -- libnx's deadlock detection fired svcBreak
+ * and the crash report showed mutexLock instead of the real fault. The handler
+ * now asks for this fd at boot, so its path never allocates. */
+static int log_fd_open(void) {
+#if DEBUG_LOG
+  if (g_log_fd >= 0) return g_log_fd;
+  {
+    const char *p = LOG_NAME;   /* game_path(): rotating static, copy it */
+    size_t pn = strlen(p);
+    if (pn >= sizeof g_log_path) pn = sizeof g_log_path - 1;
+    memcpy(g_log_path, p, pn);
+    g_log_path[pn] = 0;
+    g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (g_log_fd >= 0) {
+      // Build stamp: identifies which .nro produced this log (date + Vulkan).
+      char hdr[160];
+      int hn = snprintf(hdr, sizeof hdr, "[build] aota_nx built %s %s HAVE_NVK=%d\n",
+                        __DATE__, __TIME__,
+#ifdef HAVE_NVK
+                        1
+#else
+                        0
+#endif
+                        );
+      if (hn > 0) { ssize_t hw = write(g_log_fd, hdr, (size_t)hn); (void)hw; }
+    }
+  }
+#endif
+  return g_log_fd;
+}
+
+int debugLogFd(void) { return log_fd_open(); }
+
 int debugPrintf(char *text, ...) {
 #if DEBUG_LOG
-  static FILE *f = NULL;
+  int fd;
   va_list list;
   /* Build #267: NON-BLOCKING log lock. Test #266 proved the waiter
    * completes its futex wait (wake.log) but then blocks forever inside
@@ -46,25 +85,26 @@ int debugPrintf(char *text, ...) {
     }
     if (!got) return 0;  /* lock wedged: drop this line, keep running */
   }
-  if (!f) {
-    f = fopen(LOG_NAME, "a");   // open once, keep open (SD fopen/close per line is very slow)
-    if (f) {
-      // Build stamp: identifies which .nro produced this log (date + Vulkan).
-      fprintf(f, "[build] aota_nx built %s %s HAVE_NVK=%d\n", __DATE__, __TIME__,
-#ifdef HAVE_NVK
-              1
-#else
-              0
-#endif
-              );
-      fflush(f);
-    }
-  }
-  if (f) {
+  /* #303: raw fd + one write() per line, NOT stdio. b302's watchdog caught the
+   * main thread blocked in
+   *     debugPrintf -> _fflush_r -> fsdev_write -> svcSendSyncRequest
+   * i.e. every line went through newlib's FILE layer, which holds the
+   * process-wide stdio lock while the SD round-trip is in flight, and through
+   * libnx's fs mutex. Any thread paused in that window froze every other
+   * logger (and the watchdog itself) behind it. A plain write() keeps the
+   * crash-surviving "one line, already out the door" property with a much
+   * shorter, lock-only-on-our-side path. */
+  fd = log_fd_open();
+  if (fd >= 0) {
+    char buf[1024];
     va_start(list, text);
-    vfprintf(f, text, list);
+    int n = vsnprintf(buf, sizeof buf, text, list);
     va_end(list);
-    fflush(f); // push each line to disk so we don't lose it if we crash next
+    if (n > 0) {
+      if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;  /* truncated line */
+      ssize_t w = write(fd, buf, (size_t)n);
+      (void)w;
+    }
   }
   mutexUnlock(&g_log_lock);
 #else

@@ -68,6 +68,8 @@ size_t __ctype_get_mb_cur_max_fake(void);
 int __register_atfork_fake(void);
 int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso);
 long sysconf_fake(int name);
+int sched_getaffinity_fake(int pid, size_t cpusetsize, void *mask);
+int sched_setaffinity_fake(int pid, size_t cpusetsize, const void *mask);
 long pathconf_fake(const char *path, int name);
 
 // fs
@@ -217,5 +219,9 @@ int pthread_kill_gc(pthread_t t, int sig);
 
 void *opendir_fake(const char *path);
 int   closedir_fake(void *dirp);
+
+/* Build #308: main-thread identity (used to gate the vsync-counter bind) */
+void port_note_main_thread(void);
+int  port_is_main_thread(void);
 
 #endif

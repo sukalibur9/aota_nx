@@ -2972,9 +2972,23 @@ __attribute__((naked, used)) void createthread185_tramp_create(void) {
     "ldr x16, [x16, :lo12:tls213_tramp_addr]\n"
     "mov x1, x16\n"
     "213:\n"
+    /* #300: capture Thread* (x0) and return through the stub with a bl,
+     * so the created thread's real handle can be registered for the TLS
+     * tag fix before the game StartThreads it. */
+    "adrp x17, tag299_thread_out\n"
+    "str x0, [x17, :lo12:tag299_thread_out]\n"
+    /* The frame is already unwound here (x0-x5 and x30 restored), so park
+     * the caller's LR on the stack across the two calls; blr/ bl would
+     * otherwise clobber it and `ret` would jump into nothing. */
+    "stp x30, xzr, [sp, #-16]!\n"
     "adrp x16, createthread185_stub\n"
     "ldr x16, [x16, :lo12:createthread185_stub]\n"
-    "br x16\n"
+    "blr x16\n"
+    "stp x0, x30, [sp, #-16]!\n"
+    "bl tag299_register_created\n"
+    "ldp x0, x30, [sp], #16\n"
+    "ldr x30, [sp], #16\n"
+    "ret\n"
   );
 }
 
@@ -3124,6 +3138,155 @@ __attribute__((used)) static uintptr_t tls213_setup_fn = 0;
 __attribute__((used)) static uintptr_t tls213_real_entry = 0;
 __attribute__((used)) static uintptr_t tls213_tramp_addr = (uintptr_t)&tls213_entry_tramp;
 
+/* #299: give every game thread its OWN mutex owner tag.
+ *
+ * The crash report of test #292 (Atmosphere 01795001339) proved the tag is
+ * broken: User Break, Result 0xCA8, Break Reason 0x1 = libnx mutexLock's
+ * `svcBreak(BreakReason_Assert,0,0)` (x0=1,x1=0,x2=0), PC = svcBreak,
+ * LR = mutexLock+0x74 (NRO+0x8f2a34), i.e. the exact site libnx reaches
+ * only when svcArbitrateLock() returns R_FAILED:
+ *     if (R_FAILED(svcArbitrateLock(value & ~HANDLE_WAIT_MASK, m, cur_handle)))
+ *         svcBreak(BreakReason_Assert, 0, 0);
+ * That path was unreachable before #294/#298 armed the lock+0x4C tramp: the
+ * older mutex179 tramp returned straight to the game caller (skipping the
+ * rest of mutexLock), so the real slow path had never actually run in this
+ * port. It runs now, and it fails on the FIRST cross-thread contention.
+ *
+ * Root cause: `cur_handle` is ThreadVars.handle (TLS[0x1e4]), and the game's
+ * TLS-setup fn (the fn this wrapper calls) stores a process-global bss value
+ * there -- 33279 = 0x81ff for EVERY game thread (see the gtid.log "gtid="
+ * field, and the diag/lock272 notes). Consequences, all consistent with the
+ * black screen: the kernel cannot tell owner from requester (arbitration
+ * fails), mutexUnlock() succeeds from a thread that does not own the mutex
+ * (it sees its own tag in the word), and the #274/#275 owner==self checks
+ * match for every thread. libnx's contract (nx/source/kernel/thread.c:
+ * `tv->handle = args->t->handle`) is one unique handle per thread.
+ *
+ * This helper rewrites the slot with a per-thread value derived from
+ * tpidrro_el0 (the TLS base, unique per thread and already the port's
+ * proven per-thread identity). It runs ON the new game thread, right after
+ * the TLS-setup fn, touches no newlib state, and logs once per thread to
+ * gtid.log (tag "tag299", id=old tag, gtid=new tag). */
+/* #300: the replacement tag MUST be a real kernel thread handle.
+ *
+ * Run #299 replaced 0x81ff with a tpidrro-derived id and the boot kept
+ * the same "everything stops" signature as #292 (no frame, watchdog
+ * silent after n=1). Reading the libnx contract again explains why: the
+ * value is passed to svcArbitrateLock() as the thread HANDLE, and the
+ * kernel resolves it in this process's handle table. 33279 (0x81ff) and
+ * a TLS-base-derived number are both InvalidHandle, so both builds fail
+ * the same call -- only the asserted value changed. libnx's own threads
+ * therefore carry `Thread.handle` (a 0x3xxxxx handle, see the
+ * [coremask184] setmask lines), which is exactly what this build uses.
+ *
+ * Workers: the creating thread's intercepted threadCreate (see
+ * createthread185_tramp_create) registers (tid, handle) right after the
+ * real svcCreateThread returns, before the game can StartThread, so the
+ * lookup succeeds on the first try. Main: libnx's own slot value is
+ * captured at boot (tag299_capture_main) and re-applied every frame,
+ * because the game's TLS setup overwrites it later in the boot. */
+/* #301: the table was 24 entries and run #300 filled it EXACTLY: the first
+ * 24 game threads registered (tids 1092..1115, tag299reg lines) and every
+ * thread created after them -- BatchDeleteObjects 1118, Loading.AsyncRead
+ * 1119, UnityGfxDeviceWorker 1120, Loading.PreloadManager 1121,
+ * CloudJob.Worker 1122, T1127..T1133 -- logged tag299miss with the old
+ * 0x81ff tag (gtid.log), i.e. the whole asset-loading tail of Unity carried
+ * an INVALID kernel handle into svcArbitrateLock. Size the table for the
+ * whole engine (workers + loading + audio + gfx + the wrapper's own
+ * threads) and reuse the oldest slot instead of silently dropping a
+ * registration if it ever fills again. */
+#define TAG299_TAB 128
+typedef struct { u64 tid; u32 handle; } tag299_ent;
+static tag299_ent tag299_tab[TAG299_TAB];
+static unsigned tag299_tab_n = 0;
+static unsigned tag299_rr = 0;
+/* #301: a registration that does not complete used to return silently, so
+ * run #300 could not say WHY a thread was missing (no Thread* out-pointer /
+ * zero handle / svcGetThreadId failed / table full). Each reason logs
+ * once per occurrence for the first 24 occurrences. */
+static unsigned tag299_skip_n = 0;
+static void tag299_skip(const char *why, uintptr_t id, unsigned extra) {
+  if (tag299_skip_n >= 24) return;
+  tag299_skip_n++;
+  gtid270_log(why, id, extra);
+}
+/* Written by the create tramp (Thread* out-pointer), read by
+ * tag299_register_created immediately after the svcCreateThread stub. */
+__attribute__((used)) uintptr_t tag299_thread_out = 0;
+
+static u32 tag299_lookup(u64 tid) {
+  for (unsigned i = 0; i < tag299_tab_n; i++)
+    if (tag299_tab[i].tid == tid) return tag299_tab[i].handle;
+  return 0;
+}
+
+__attribute__((used)) void tag299_register_created(void) {
+  uintptr_t t = tag299_thread_out;
+  tag299_thread_out = 0;
+  if (!t) { tag299_skip("tag299noout", 0, 0); return; }
+  u32 h = *(volatile u32 *)t;      /* Thread.handle is the first field */
+  if (!h) { tag299_skip("tag299noh", t, 0); return; }
+  u64 tid = 0;
+  if (R_FAILED(svcGetThreadId(&tid, h))) { tag299_skip("tag299noid", (uintptr_t)h, 0); return; }
+  for (unsigned i = 0; i < tag299_tab_n; i++)
+    if (tag299_tab[i].tid == tid) { tag299_tab[i].handle = h; return; }
+  if (tag299_tab_n < TAG299_TAB) {
+    tag299_tab[tag299_tab_n].tid = tid;
+    tag299_tab[tag299_tab_n].handle = h;
+    tag299_tab_n++;
+    gtid270_log("tag299reg", (uintptr_t)h, (unsigned)tid);
+  } else {
+    /* #301: ring reuse -- a dead thread's slot is replaced rather than a
+     * live thread being left with the 0x81ff tag. */
+    tag299_ent *e = &tag299_tab[tag299_rr++ % TAG299_TAB];
+    e->tid = tid;
+    e->handle = h;
+    gtid270_log("tag299reuse", (uintptr_t)h, (unsigned)tid);
+  }
+}
+
+__attribute__((used)) void game_tag299_fix(void) {
+  uintptr_t tp;
+  __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tp));
+  if (!tp) return;
+  volatile uint32_t *slot = (volatile uint32_t *)(tp + 0x1e4);
+  uint32_t old = *slot;
+  u64 own = 0;
+  if (R_FAILED(svcGetThreadId(&own, CUR_THREAD_HANDLE))) return;
+  u32 h = 0;
+  /* The create-side registration runs before StartThread, so this only
+   * waits on a race; bounded, 1ms steps, never on the non-intercepted
+   * libnx threads (they keep libnx's own correct handle anyway). */
+  for (int i = 0; i < 20 && !(h = tag299_lookup(own)); i++)
+    svcSleepThread(1000000ull);
+  if (!h) { gtid270_log("tag299miss", old, (unsigned)own); return; }
+  if (old == h) return;
+  *slot = h;
+  gtid270_log("tag299h", old, h);
+}
+
+/* #300: main thread. Its slot is libnx's at crt0 (a valid handle) until
+ * the game's TLS setup writes the global 0x81ff over it, which is why
+ * the main thread owned mutexes as 33279. Capture the good value first,
+ * then re-apply it whenever the game clobbers it. */
+static u32 tag299_main_handle = 0;
+static unsigned tag299_main_log_n = 0;
+__attribute__((used)) void tag299_capture_main(void) {
+  if (!tag299_main_handle) tag299_main_handle = (u32)threadGetCurHandle();
+  gtid270_log("tag299m0", 0, tag299_main_handle);
+}
+__attribute__((used)) void tag299_fix_main(void) {
+  if (!tag299_main_handle) return;
+  uintptr_t tp;
+  __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tp));
+  if (!tp) return;
+  volatile uint32_t *slot = (volatile uint32_t *)(tp + 0x1e4);
+  uint32_t old = *slot;
+  if (old == tag299_main_handle) return;
+  *slot = tag299_main_handle;
+  if (tag299_main_log_n < 8) { tag299_main_log_n++; gtid270_log("tag299main", old, tag299_main_handle); }
+}
+
 /* Entry wrapper tramp. Runs on the new thread with x0 = the game's thread
  * arg (and x8 as the kernel set it -- the entry reads x8). Saves x0-x3, x8
  * and x30, calls the game TLS-setup fn if found, restores, then branches to
@@ -3139,6 +3302,8 @@ __attribute__((naked, used)) void tls213_entry_tramp(void) {
     "cbz x16, 213f\n"
     "blr x16\n"
     "213:\n"
+    "bl game_tag299_fix\n"           /* #299: unique per-thread mutex tag */
+
     "ldp x8, x30, [sp], #16\n"
     "ldp x2, x3, [sp], #16\n"
     "ldp x0, x1, [sp], #16\n"
@@ -5861,6 +6026,14 @@ __attribute__((used)) void lock292_guard_log(void) {
   gtid270_log("lock292guard", lock292_svc, lock292_guard_n);
 }
 
+/* #299: svcArbitrateLock result on failure. Written before libnx's own
+ * assert (see the tramp); lock-free so it is safe on the waiting thread. */
+static unsigned lock292_fail_n = 0;
+__attribute__((used)) void lock292_fail_log(unsigned rc, uintptr_t lock) {
+  if (lock292_fail_n < 32) gtid270_log("arb299rc", rc, (unsigned)lock);
+  lock292_fail_n++;
+}
+
 __attribute__((naked, used, noinline)) static void lock292_tramp_log(void) {
   __asm__ volatile(
     /* Entry (lock+0x4C, displaced `bl`): x0 = holder id (waiter bit
@@ -5914,6 +6087,16 @@ __attribute__((naked, used, noinline)) static void lock292_tramp_log(void) {
     "cmp w17, w18\n"
     "b.ne .Lguard_fail\n"
     "blr x16\n"                      /* svcArbitrateLock stub; w0 = result */
+    /* #299: libnx asserts (svcBreak) when this returns R_FAILED. Record the
+     * failing rc first (lock-free gtid.log, the crash report only shows the
+     * assert), then let the assert fire -- the rc names the reason. */
+    "cbz w0, 215f\n"
+    "str w0, [sp, #0x28]\n"
+    "mov x0, x1\n"                   /* log arg0 = mutex */
+    "ldr w1, [sp, #0x28]\n"          /* log arg1 = rc */
+    "bl lock292_fail_log\n"
+    "ldr w0, [sp, #0x28]\n"
+    "215:\n"
     "b .Lguard_done\n"
     ".Lguard_fail:\n"
     "bl lock292_guard_log\n"         /* log bad lock292_svc to gtid.log */

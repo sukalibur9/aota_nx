@@ -65,6 +65,7 @@
 #include "config.h"     /* GAME_HOME */
 
 int debugPrintf(char *text, ...);
+extern void xd_stage(const char *tag);   /* #307: lock-free boot stage marker */
 
 /* The two gates, and what we want them to start at. */
 static const struct { const char *key; const char *val; const char *why; }
@@ -81,14 +82,18 @@ void r3_seed_playerprefs(void)
   char path[320];
   snprintf(path, sizeof path, "%s/prefs.kv", GAME_HOME);
 
+  xd_stage("stage:r3-stat");
   struct stat st;
   if (stat(path, &st) == 0) {
+    xd_stage("stage:r3-exists");
     debugPrintf("[r3] prefs.kv already exists (%lld bytes) -- not seeding\n",
                 (long long)st.st_size);
     return;
   }
 
+  xd_stage("stage:r3-fopen");
   FILE *f = fopen(path, "wb");
+  xd_stage("stage:r3-fopen-returned");
   if (!f) {
     debugPrintf("[r3] prefs.kv seed FAILED: fopen(%s) errno=%d\n", path, errno);
     return;

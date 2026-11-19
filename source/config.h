@@ -268,6 +268,16 @@ void game_root_resolve(int argc, char *argv[]);
 
 // flip to 1 (and rebuild) to get file logging (debug.log) for on-hardware debugging
 #define DEBUG_LOG 1   /* ON: writes debug.log next to the .nro */
+
+/* #288: futex fake-wake escalation. An "infinite" FUTEX_WAIT on an address
+ * that nobody ever writes or wakes is the black-screen livelock in wake.log
+ * (FAKEWAKE on the same address every ~10 ms, forever). With this at 1 such a
+ * wait reports a real ETIMEDOUT after 16 consecutive 10 ms fake-wakes instead
+ * of claiming it was woken, so the caller's own timeout path gets control.
+ * Set to 0 to restore the pre-#288 "a fake wake always reports success"
+ * behaviour for an A/B boot: the zero is the only behavioural revert in #288
+ * (the counter-first pulse and the tick-paced vsync thread are independent). */
+#define OS_FUTEX_TIMEOUT_ESCALATE 1
 /* MUST stay 1 until the port boots. With this at 0 the crash handler in
  * nx_exception_dump.c still runs and still calls svcBreak, but every line it
  * writes -- pc/far/esr, all 29 registers, the frame-pointer backtrace -- is

@@ -1,0 +1,13 @@
+# Local reverse-engineering scratch: user-supplied game binaries, never commit.
+.rea_in/
+
+# Build output: rebuilt by `make` / the CI workflow. Released NROs live on
+# Google Drive, never in the repo.
+/aota_nx*.nro
+/aota_nx.elf
+/aota_nx.nacp
+/build/
+/a/
+
+# On-hardware logs and dumps collected per test run.
+/runs/

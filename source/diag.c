@@ -23,6 +23,32 @@
 #define DIAG_POLL_NS       (1000ull * 1000ull * 1000ull)   /* watchdog tick: 1s */
 #define DIAG_STALL_NS      (6000ull * 1000ull * 1000ull)   /* declare stall: 6s  */
 #define DIAG_REDUMP_NS     (6000ull * 1000ull * 1000ull)   /* re-dump cadence    */
+/* #291: periodic snapshots. Test #290 (build #289) proved the progress
+ * heartbeat is blind to the boot park: g_last_progress is only refreshed
+ * BETWEEN nativeRender calls, so while frame 0 runs for minutes the stall
+ * timer does fire -- yet debug.log held no [wd] STALL at all, while the
+ * frame-0 park left the log mid-nativeRender. Whatever silences the dump
+ * (wedged poll sleep, dropped line, dump path) must not also hide the
+ * thread table, so take a bounded series of UNCONDITIONAL snapshots in the
+ * first minute. Six dumps at 10s intervals: their presence proves the
+ * watchdog thread runs and shows where frame 0 sits; their ABSENCE is just
+ * as informative (the watchdog never got scheduled). */
+#define DIAG_STATE_NS      (2000ull * 1000ull * 1000ull)   /* snapshot cadence   */
+#define DIAG_STATE_DUMPS   10
+/* #292: test #291 answered "did the watchdog thread start?" -- wd290.log holds
+ * exactly one line, "[wd291] watchdog thread running", and then NOTHING, not
+ * even the first STATE #1 at 10 s. Either the first 1 s poll sleep never
+ * returned or the whole process (every thread, including this one) stopped at
+ * the same moment debug.log did. Three markers settle it without guessing:
+ *   [wd292] awake n=..        printed right after each poll sleep returns
+ *                             -> a frozen n means the sleep never returns;
+ *   [wd] snap <name>: pause   printed before svcSetThreadActivity, so a dump
+ *                             that hangs names the exact thread it hung on;
+ *   [s292] alive n=..         an independent sentinel thread on its own file
+ *                             -> silence there means a process-wide freeze,
+ *                             not a watchdog-only problem.
+ * First snapshot at 2 s instead of 10 s: the process died inside the first
+ * seconds of the render loop, earlier than any 10 s cadence could observe. */
 
 typedef struct {
   volatile int          in_use;
@@ -51,6 +77,7 @@ static DiagThread       g_threads[DIAG_MAX_THREADS];
 static Mutex            g_reg_lock;     /* zero-init libnx Mutex == unlocked       */
 static __thread DiagThread *self;       /* this thread's slot (host TLS)           */
 
+static volatile int      g_dump_periodic;   /* #291: header text selector      */
 static volatile int      g_frame = -1;
 static volatile uint64_t g_last_progress;   /* tick of last diag_frame()           */
 static volatile int      g_wd_started;
@@ -146,12 +173,16 @@ const char *diag_self_name(void) {
  * unregistering mid-sample cannot corrupt the read. Threads whose context
  * read fails are skipped silently (a dead handle, or a thread exiting). */
 void diag_sample_all_pcs(char *buf, size_t n) {
-  struct { Handle h; char name[32]; } snap[DIAG_MAX_THREADS];
+  struct { Handle h; int parked; char name[32]; } snap[DIAG_MAX_THREADS];
   int count = 0;
   mutexLock(&g_reg_lock);
   for (int i = 0; i < DIAG_MAX_THREADS && count < DIAG_MAX_THREADS; i++) {
     if (!g_threads[i].in_use) continue;
     snap[count].h = g_threads[i].handle;
+    /* #304: same rule as snapshot_thread -- sampling a RUNNING thread means
+     * pausing it, and pausing one that sits in an fs IPC request wedges the FS
+     * service for the whole process. Only parked threads are sampled. */
+    snap[count].parked = (g_threads[i].wait_kind != DIAG_W_NONE);
     memcpy(snap[count].name, g_threads[i].name, sizeof snap[count].name);
     snap[count].name[sizeof snap[count].name - 1] = 0;
     count++;
@@ -160,7 +191,7 @@ void diag_sample_all_pcs(char *buf, size_t n) {
   size_t used = 0;
   if (n) buf[0] = 0;
   for (int i = 0; i < count; i++) {
-    if (!snap[i].h || snap[i].h == threadGetCurHandle()) continue;
+    if (!snap[i].h || snap[i].h == threadGetCurHandle() || !snap[i].parked) continue;
     ThreadContext ctx;
     Result pr = svcSetThreadActivity(snap[i].h, ThreadActivity_Paused);
     Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&ctx, snap[i].h) : pr;
@@ -206,6 +237,9 @@ int diag_sample_holder_pc(uintptr_t holder_tp, uint64_t *out_pc, uint64_t *out_l
   for (int i = 0; i < DIAG_MAX_THREADS; i++) {
     if (!g_threads[i].in_use) continue;
     if (g_threads[i].tp != holder_tp) continue;
+    /* #304: only a holder parked in a shim may be paused; pausing one that is
+     * running (e.g. inside fsdev_write) kills every later SD write. */
+    if (g_threads[i].wait_kind == DIAG_W_NONE) return 0;
     h = g_threads[i].handle;
     break;
   }
@@ -351,7 +385,10 @@ static void wd290_log(const char *fmt, ...) {
   va_end(ap);
   if (n <= 0) return;
   if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
-  debugPrintf("%s", buf);
+  /* #303: no debugPrintf mirror. The watchdog must not touch stdio: if it
+   * blocks on the stdio lock while a thread is paused, the whole process stops
+   * (b302 did exactly that). wd290.log is written with the same raw fd/log
+   * discipline as wake.log, so nothing is lost -- only the duplicate is. */
   wd290_open();
   if (wd290_fd < 0) return;
   ssize_t w = write(wd290_fd, buf, (size_t)n);
@@ -461,11 +498,33 @@ static void snapshot_thread(DiagThread *t) {
   /* Only the main render/UI thread and the async loaders matter for the swap/load
    * hang; the ~30 idle Job.Worker/GC threads just slow the dump so it can't re-fire
    * on the real wedge. Skip their context entirely (they're in the summary table). */
-  int want = (strstr(t->name, "Main") || strstr(t->name, "Preload") ||
-              strstr(t->name, "AsyncRead") || t->is_main_engine);
+    int want = (strstr(t->name, "Main") || strstr(t->name, "Preload") ||
+              strstr(t->name, "AsyncRead"));
+  /* #303: engine helper threads (AssetGarbageCollectorHelper 1560 in b302) are
+   * table-only now. Pausing one wedged the freeze probe itself: it held the
+   * libnx fs mutex mid-SD-write, and the watchdog's next write never returned. */
   if (!want) return;
+  /* #304: NEVER pause a thread that is running arbitrary code. b303 paused
+   * Unity Main Thread exactly once -- inside fsdev_write (PC=NRO+0x907ec0
+   * svcSendSyncRequest, LR into serviceDispatchImpl) -- and from that moment on
+   * no SD write in the process ever completed again: debug.log, sentinel.log and
+   * wd290.log all stop while the game kept running. Interrupting an fs IPC
+   * request leaves the FS service holding that session, so every later write
+   * blocks forever. Only sample threads that are parked inside one of our own
+   * sync shims, where a pause cannot land in the middle of an fs request. */
+  if (t->wait_kind == DIAG_W_NONE) return;
+
   ThreadContext ctx;
+  /* #292: if the dump hangs, the last marker names the thread it hung on. */
+  wd290_log("[wd] snap %s tid=%llu: pause...\n", t->name[0] ? t->name : "?",
+            (unsigned long long)t->tid);
   Result pr = svcSetThreadActivity(t->handle, ThreadActivity_Paused);
+  /* #303: NOTHING may be logged between pause and resume. b302 froze exactly
+   * here -- the previous build logged "paused rc=..." from inside the paused
+   * window, and that write needs the libnx fs mutex which the paused thread was
+   * holding, so the watchdog blocked forever with the game suspended behind it.
+   * Everything below is buffered and reaches the SD card only after the thread
+   * is running again. */
   Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&ctx, t->handle) : pr;
   if (R_FAILED(gr)) {
     if (R_SUCCEEDED(pr)) svcSetThreadActivity(t->handle, ThreadActivity_Runnable);
@@ -475,6 +534,8 @@ static void snapshot_thread(DiagThread *t) {
   /* Collect while PAUSED (consistent stack), but into the buffer only -- no
    * logging until the thread is resumed (see dump_emit above). */
   g_dump_len = 0; g_dump_buf[0] = 0;
+  dump_emit("[wd] snap %s: paused rc=0x%x, ctx read while stopped\n",
+            t->name[0] ? t->name : "?", pr);
   g_scan_stack = 1;
   dump_thread_context(t->name[0] ? t->name : "?", &ctx);
   g_scan_stack = 0;
@@ -485,7 +546,13 @@ static void snapshot_thread(DiagThread *t) {
 
 static void dump_threads(int episode, uint64_t now) {
   uint64_t stalled_ns = tick_to_ns(now - g_last_progress);
-  wd290_log("\n[wd] ===== STALL #%d : no frame progress for %llu.%llus (last frame=%d) =====\n",
+  if (g_dump_periodic)
+    wd290_log("\n[wd] ===== STATE #%d : periodic snapshot, no frame progress for "
+              "%llu.%llus (last frame=%d) =====\n",
+              episode, (unsigned long long)(stalled_ns / 1000000000ull),
+              (unsigned long long)((stalled_ns % 1000000000ull) / 100000000ull), g_frame);
+  else
+    wd290_log("\n[wd] ===== STALL #%d : no frame progress for %llu.%llus (last frame=%d) =====\n",
               episode, (unsigned long long)(stalled_ns / 1000000000ull),
               (unsigned long long)((stalled_ns % 1000000000ull) / 100000000ull), g_frame);
   {
@@ -534,10 +601,11 @@ static void dump_threads(int episode, uint64_t now) {
   wd290_log("[wd] legend: d_* = delta since previous dump (0/0/0 == hard-parked; "
               "d_spin>0 == alive on futex; d_wait>d_wake == entered a wait it hasn't left)\n");
   /* native backtrace: where each thread is wedged inside libunity/il2cpp/NRO */
-  wd290_log("[wd] --- thread CPU contexts (frame-pointer backtrace) ---\n");
+  wd290_log("[wd] --- thread CPU contexts (parked threads only, see #304) ---\n");
   for (int i = 0; i < DIAG_MAX_THREADS; i++) {
     if (g_threads[i].in_use) snapshot_thread(&g_threads[i]);
   }
+  wd290_log("[wd] ===== end of dump #%d =====\n", episode);
   wd290_log("\n");
 }
 
@@ -545,11 +613,34 @@ static void watchdog_main(void *unused) {
   (void)unused;
   int episode = 0;
   uint64_t last_dump = 0;
+  int state_dumps = 0;
+  uint64_t start = now_tick();
   /* prime so we don't false-trigger before the first frame */
   if (g_last_progress == 0) g_last_progress = now_tick();
+  /* #291: prove the thread itself got scheduled, before it ever sleeps. */
+  wd290_log("[wd291] watchdog thread running (state snapshots every %llus, max %d)\n",
+            (unsigned long long)(DIAG_STATE_NS / 1000000000ull), DIAG_STATE_DUMPS);
+  int loops = 0;
   for (;;) {
     svcSleepThread(DIAG_POLL_NS);
     uint64_t now = now_tick();
+    /* #292: proof the poll sleep returns. n stuck at 1 == the sleep never
+     * came back; n climbing while nothing else logs == the game wedged but the
+     * scheduler (and this thread) is alive. */
+    loops++;
+    if (loops <= 8 || (loops % 30) == 0)
+      wd290_log("[wd292] awake n=%d frame=%d idle_ms=%llu\n", loops, g_frame,
+                (unsigned long long)(tick_to_ns(now - g_last_progress) / 1000000ull));
+    /* #291: unconditional early snapshots -- see DIAG_STATE_NS. */
+    if (state_dumps < DIAG_STATE_DUMPS &&
+        tick_to_ns(now - start) >= (uint64_t)(state_dumps + 1) * DIAG_STATE_NS) {
+      state_dumps++;
+      g_dump_periodic = 1;
+      dump_threads(state_dumps, now);
+      g_dump_periodic = 0;
+      last_dump = now;
+      continue;
+    }
     uint64_t idle = now - g_last_progress;
     if (tick_to_ns(idle) >= DIAG_STALL_NS) {
       if (last_dump == 0 || tick_to_ns(now - last_dump) >= DIAG_REDUMP_NS) {
@@ -561,6 +652,23 @@ static void watchdog_main(void *unused) {
       last_dump = 0;
     }
   }
+}
+
+/* #292 sentinel: an independent thread whose only job is to prove process
+ * liveness. It never touches the log lock, the futex shims or diag state, so
+ * its file going quiet means EVERYTHING stopped -- not just the watchdog. */
+static void sentinel_main(void *unused) {
+  (void)unused;
+  int fd = open("sdmc:/switch/aota/sentinel.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+  if (fd < 0) return;
+  ssize_t w0 = write(fd, "[s292] boot\n", 12); (void)w0;
+  for (int n = 1; n <= 600; n++) {
+    svcSleepThread(1000ull * 1000ull * 1000ull);
+    char buf[48];
+    int len = snprintf(buf, sizeof buf, "[s292] alive n=%d\n", n);
+    if (len > 0) { ssize_t w = write(fd, buf, (size_t)len); (void)w; }
+  }
+  close(fd);
 }
 
 void diag_watchdog_start(void) {
@@ -597,4 +705,9 @@ void diag_watchdog_start(void) {
                 (unsigned long long)(DIAG_STALL_NS / 1000000000ull));
   else
     debugPrintf("[wd] watchdog FAILED to start rc=0x%x\n", rc);
+  /* #292: second, independent liveness witness (own file, own thread). */
+  { static Thread s_thr;
+    Result src = threadCreate(&s_thr, sentinel_main, NULL, NULL, 0x4000, 0x2C, -2);
+    debugPrintf("[wd292] sentinel threadCreate rc=0x%x\n", src);
+    if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr)); }
 }

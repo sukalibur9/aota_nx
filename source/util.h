@@ -13,6 +13,11 @@
 
 int debugPrintf(char *text, ...);
 
+/* #305: debug.log's raw fd, opened eagerly at boot so the exception handler
+ * never has to call open() (which mallocs) on the fault path. -1 if the log
+ * could not be opened. */
+int debugLogFd(void);
+
 /* #270: lock-free gtid record (see util.c). Writes one line per call
  * to sdmc:/switch/aota/gtid.log; raw open/write, no g_log_lock.
  * #272: each line also carries the caller's tpidrro_el0 (tp=), the true

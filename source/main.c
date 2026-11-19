@@ -116,6 +116,8 @@ extern void dispatch182_arm(void);
 extern void worker183_arm(void);
 extern void coremask184_arm(void);
 extern void createthread185_arm(void);
+extern void tag299_capture_main(void);   /* #300: main thread's real handle */
+extern void tag299_fix_main(void);
 extern void tls213_arm(void);
 extern void entry195_arm(void);
 extern void work217_arm(void);
@@ -2955,24 +2957,47 @@ __attribute__((naked, used, noinline)) static unsigned game_tls_tid(void) {
   );
 }
 
+/* #307: boot stage markers go out on the lock-free probe channel
+ * (nx_exception_dump.c), which syncs after every line, so the last stage in
+ * debug.log/xd.log names the call that never returned. */
+extern void xd_stage(const char *tag);
+
 int main(int argc, char *argv[]) {
+  /* #300: grab libnx's main-thread handle before the game's TLS setup
+   * overwrites TLS[0x1e4] with its process-global id. */
+  tag299_capture_main();
   /* First: work out which folder we live in. Everything else -- debug.log, the
    * config file, the modules, the assets -- hangs off this, so nothing may
    * touch a path before it runs. */
   game_root_resolve(argc, argv);
+  /* #305: open the exception-dump channels and arm the dumper thread HERE, on a
+   * healthy process. b304 lost its dump because the handler's own open() hit
+   * the newlib heap rmutex the faulting thread still held (open -> malloc ->
+   * rmutex -> libnx deadlock svcBreak, reported as result 0xCA8). */
+  { extern void xd_log_init(void); xd_log_init(); }
+  xd_stage("stage:xd-init-returned");
+  /* #308: record this thread's id before any game thread exists. The vsync
+   * counter bind accepts only waits made by this thread (test #307 bound the
+   * il2cpp GC helper's idle futex and pulsed it 60x/s). */
+  { extern void port_note_main_thread(void); port_note_main_thread(); }
+  xd_stage("stage:main-thread-noted");
   /* Seed the two PlayerPrefs gates that keep Play Games / CloudSave dormant,
    * before anything can touch SharedPreferences. No-op if prefs.kv exists.
    * See playgames_stub.c for why this matters (it prevents a boot hang). */
   { extern void r3_seed_playerprefs(void); r3_seed_playerprefs(); }
+  xd_stage("stage:r3-returned");
   /* Movie playback for the ending cutscenes. Records the root only -- no
    * threads, no GL, no ffmpeg work until the game actually asks. */
   os_video_init(DATA_ROOT);
+  xd_stage("stage:video-returned");
   socketInitializeDefault();
+  xd_stage("stage:socket-returned");
   debugPrintf("[boot] === aota_nx start ===\n");
   /* #207: start the raw-SVC heartbeat + poll thread HERE (log open, root
    * resolved, libnx initialized). #206 proved this site works; the thread
    * itself now prints nothing (ring buffer reported by the sweeper). */
   { extern void raw207_start(void); raw207_start(); }
+  xd_stage("stage:raw207-returned");
 
   /* Load config.txt. When the file is missing, autogenerate a documented one
    * with the defaults; when it holds retired options -- screen_width,
@@ -3728,6 +3753,10 @@ int main(int argc, char *argv[]) {
   int frame = 0;
   while (appletMainLoop() && !jni_quit_requested) {
     diag_frame(frame);   // heartbeat: lets the watchdog see progress (or its absence)
+    /* #300: the game's TLS setup rewrites TLS[0x1e4] on the main thread;
+     * keep libnx's real handle in place so mutexLock's arbitration has a
+     * valid owner handle. Bounded: the slot settles within a few frames. */
+    if (frame < 600) tag299_fix_main();
     nx_time_tick();      // advance our managed-Time clock once per frame
     /* fbstub42: the engine clock is now fixed at its true source by the
      * TimeManager::Update entry hook (installed at boot, see nx_install_time_fix):

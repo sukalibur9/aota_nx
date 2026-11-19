@@ -23,6 +23,7 @@
 #include <zlib.h>
 #include <switch.h>
 #include <unistd.h>      /* dup */
+#include "libc_shim.h"   /* #304: sched_getaffinity_fake/sched_setaffinity_fake */
 /* Log the swap interval. This is how the game actually sets its frame rate: it
  * has no Application.targetFrameRate call at all, it picks
  * QualitySettings.vSyncCount (1 or 2) from RecommendedPlatformSettings.runAt60,
@@ -322,8 +323,8 @@ DynLibFunction unity_dynlib_functions[] = {
   { "raise", (uintptr_t)&raise },
   { "recvmsg", (uintptr_t)&z_stub0 },
   { "scalbn", (uintptr_t)&scalbn },
-  { "sched_getaffinity", (uintptr_t)&z_stub0 },
-  { "sched_setaffinity", (uintptr_t)&z_stub0 },
+  { "sched_getaffinity", (uintptr_t)&sched_getaffinity_fake },   /* #304 */
+  { "sched_setaffinity", (uintptr_t)&sched_setaffinity_fake },   /* #304 */
   { "sem_getvalue", (uintptr_t)&z_stub0 },
   { "sendmsg", (uintptr_t)&z_stub0 },
   { "setbuf", (uintptr_t)&setbuf },

@@ -16,6 +16,31 @@
  * chasing a specific Unity UI job crash. They are harmless to dump on any
  * fault -- treat them as generic stack context rather than as meaningful field
  * names for this title.
+ *
+ * Build #305 (2026-11-19): THE FAULT PATH MUST NOT ALLOCATE OR LOCK.
+ * Test #304's crash report was not the game's fault at all: the handler ran,
+ * its first dump line went through the (correctly non-blocking) debugPrintf and
+ * was dropped, and then xd_raw_write's lazy open() took the process down:
+ *
+ *   svcBreak  <- mutexLock <- rmutexLock <- _malloc_r <- _memalign_r
+ *             <- __wrap_malloc <- __alloc_handle <- _open_r <- open
+ *             <- xd_raw_write <- __libnx_exception_handler
+ *
+ * open() allocates a FILE/handle, newlib's heap lock is an rmutex, and the
+ * faulting thread still held it (the fault itself was inside the allocator),
+ * so libnx's same-thread deadlock detection fired svcBreak(0x1) and
+ * Atmosphere reported mutexLock (result 0xCA8) instead of the real fault --
+ * the second time this build lost its dump to its own diagnostics.
+ * So from #305:
+ *   1. xd.log's fd and debug.log's fd are opened at boot (xd_log_init), never
+ *      from the handler;
+ *   2. the whole dump is built in ONE static buffer with hand-rolled integer
+ *      formatting -- no vsnprintf/snprintf (newlib's vfprintf can malloc);
+ *   3. the buffer is handed to a pre-created dumper thread over a libnx Event
+ *      and the handler waits for it with a 2 s bound, so a wedged FS service
+ *      cannot park the faulting thread forever;
+ *   4. a reentrancy guard makes a fault inside the handler emit one fixed
+ *      line and stop, instead of recursing.
  */
 #include <switch.h>
 #include <stdio.h>
@@ -23,39 +48,175 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <elf.h>
 #include "util.h"
 #include "so_util.h"
 
-/* #274: lock-free [xd] mirror (same idiom as gtid270_log /
- * futex266_wake_log: fd opened once, one write per line, no stdio, no
- * malloc, no g_log_lock). Best effort -- the fault handler must never
- * hang on logging, so open/write failures are silently ignored. */
-static int xd_fd = -1;
+#define XD_BUF_SIZE 0x4000
 
-static void xd_raw_write(const char *buf, size_t len) {
-  if (xd_fd < 0) {
-    xd_fd = open("sdmc:/switch/aota/xd.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (xd_fd < 0) return;
+/* The finished dump, built here by the handler and written by the dumper. */
+static char xd_buf[XD_BUF_SIZE];
+static size_t xd_len;
+static volatile int xd_busy;   /* handler already running (reentrancy guard) */
+
+static int xd_fd = -1;         /* sdmc:/switch/aota/xd.log, opened at boot */
+
+static Thread xd_thr;
+static Event  xd_evt;          /* "buffer ready" */
+static Event  xd_evt_done;     /* "written" */
+static int    xd_thr_ok;
+static int    xd_evt_ok;       /* #307: both events really created */
+
+/* ---- no-malloc formatting into xd_buf -------------------------------- */
+
+static void bch(char c) {
+  if (xd_len + 1 < sizeof xd_buf) xd_buf[xd_len++] = c;
+}
+
+static void bs(const char *s) {
+  while (*s) bch(*s++);
+}
+
+/* lowercase hex; `digits` = minimum width, zero padded (0 = natural width) */
+static void bhex(u64 v, int digits) {
+  char d[16];
+  int n = 0;
+  if (!v) d[n++] = '0';
+  while (v) {
+    unsigned x = (unsigned)(v & 0xF);
+    d[n++] = (char)(x < 10 ? '0' + x : 'a' + x - 10);
+    v >>= 4;
   }
-  const char *p = buf;
+  for (int i = n; i < digits; i++) bch('0');
+  while (n) bch(d[--n]);
+}
+
+/* decimal; width = minimum field width, `left` pads on the right */
+static void bdec(long long v, int width, char pad, int plus, int left) {
+  char d[24];
+  int n = 0;
+  unsigned long long u = v < 0 ? (unsigned long long)(-v) : (unsigned long long)v;
+  do { d[n++] = (char)('0' + (u % 10)); u /= 10; } while (u);
+  int sign = (v < 0) ? 1 : (plus ? 1 : 0);
+  int total = n + sign;
+  if (!left) for (int i = total; i < width; i++) bch(pad);
+  if (v < 0) bch('-'); else if (plus) bch('+');
+  while (n) bch(d[--n]);
+  if (left) for (int i = total; i < width; i++) bch(' ');
+}
+
+/* ---- the dumper ------------------------------------------------------ */
+
+static void xd_write_all(int fd, const char *p, size_t len) {
   while (len > 0) {
-    ssize_t w = write(xd_fd, p, len);
+    ssize_t w = write(fd, p, len);
     if (w <= 0) return;
     p += w;
     len -= (size_t)w;
   }
 }
 
-static void xd_print(const char *fmt, ...) {
-  char buf[256];
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(buf, sizeof buf, fmt, ap);
-  va_end(ap);
-  if (n < 0) return;
-  if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
-  debugPrintf("%s", buf);
-  xd_raw_write(buf, (size_t)n);
+/* #306: boot probe. Test #305 died with debug.log stopped one line after
+ * "[root] game root" and gtid.log stopped at its boot line, i.e. inside (or
+ * immediately after) xd_log_init -- the very first thing main() does after the
+ * root is resolved. Nothing else in that window changed between #304 and #305.
+ * Each step of xd_log_init writes one raw tagged line here, with the Result of
+ * the call, so one boot run names the call that never returns (or fails).
+ * No lock, no malloc: only the already-open fds and write(). */
+static void xd_probe(const char *tag, long v) {
+  char b[96];
+  size_t k = 0;
+  char d[16];
+  int n = 0;
+  unsigned long long u = (unsigned long long)v;
+  b[k++] = '['; b[k++] = 'x'; b[k++] = 'i'; b[k++] = ']'; b[k++] = ' ';
+  while (*tag && k < sizeof b - 24) b[k++] = *tag++;
+  b[k++] = ' '; b[k++] = '='; b[k++] = ' ';
+  if (!u) d[n++] = '0';
+  while (u) { unsigned x = (unsigned)(u & 0xF); d[n++] = (char)(x < 10 ? '0' + x : 'a' + x - 10); u >>= 4; }
+  while (n) b[k++] = d[--n];
+  b[k++] = '\n';
+  int dbg = debugLogFd();
+  if (dbg >= 0) xd_write_all(dbg, b, k);
+  if (xd_fd >= 0 && xd_fd != dbg) xd_write_all(xd_fd, b, k);
+  /* #307: the tail of test #306's debug.log was mangled ("[xi] tstart = 0"
+   * missing, "done = 0" cut to "e = 0"): a hung process never closes the fds,
+   * so FAT's directory entry keeps an older size than the data clusters.
+   * Sync after every probe -- there are only a handful per boot -- so the last
+   * line always names the real point of death. */
+  if (dbg >= 0) fsync(dbg);
+  if (xd_fd >= 0 && xd_fd != dbg) fsync(xd_fd);
+}
+
+/* #307: exported stage marker for main(). Same lock-free channel as the boot
+ * probes; with the sync above, the last "stage" line is trustworthy even
+ * after a hard power-off. */
+void xd_stage(const char *tag) { xd_probe(tag, 0); }
+
+/* #305: pre-created at boot (xd_log_init), so the fault path allocates nothing.
+ * Writes the buffer to the mirror and to debug.log, then signals completion.
+ * If libnx's FS service is wedged, this thread blocks -- never the handler. */
+static void xd_dumper_main(void *arg) {
+  (void)arg;
+  xd_probe("dumper-alive", 0);        /* #306: the thread really started */
+  for (;;) {
+    /* #307: never spin. #306's eventCreate returned 0x10801 (a failure), so
+     * this wait ran on a garbage handle and returned instantly: a 100%
+     * busy-loop on a real game thread's core. Sleep before retrying. */
+    if (R_FAILED(eventWait(&xd_evt, UINT64_MAX))) {
+      svcSleepThread(20000000ULL);
+      continue;
+    }
+    size_t n = xd_len;
+    int dbg = debugLogFd();
+    if (xd_fd >= 0) xd_write_all(xd_fd, xd_buf, n);
+    if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, xd_buf, n);
+    eventFire(&xd_evt_done);
+  }
+}
+
+/* Called from main() right after the game root is resolved: open both log
+ * channels and start the dumper thread while the process is healthy. */
+void xd_log_init(void) {
+  xd_probe("enter", 0);
+  if (xd_fd < 0)
+    xd_fd = open("sdmc:/switch/aota/xd.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+  xd_probe("xdfd", xd_fd);
+  (void)debugLogFd();          /* open debug.log now, not on the fault path */
+  xd_probe("dbgfd", debugLogFd());
+  if (xd_thr_ok) return;
+  Result   rc = eventCreate(&xd_evt, true);        /* auto-clear: one fire, one write */
+  xd_probe("evt", rc);
+  if (R_SUCCEEDED(rc)) xd_evt_ok = 1;
+  rc = eventCreate(&xd_evt_done, true);
+  xd_probe("evtdone", rc);
+  /* #307: #306 showed both eventCreate calls failing (0x10801) while the
+   * thread started anyway. Without events the dumper can never be signalled,
+   * so do not start it -- the handler's own pre-opened-fd path is the fallback
+   * (xd_finish's else branch) and needs no thread at all. */
+  if (R_FAILED(rc) || !xd_evt_ok) { xd_probe("no-events", 1); return; }
+  rc = threadCreate(&xd_thr, xd_dumper_main, NULL, NULL, 0x4000, 0x2C, -2);
+  xd_probe("tcreate", rc);
+  if (R_SUCCEEDED(rc)) {
+    rc = threadStart(&xd_thr);
+    xd_probe("tstart", rc);
+    if (R_SUCCEEDED(rc)) xd_thr_ok = 1;
+  }
+  xd_probe("done", xd_thr_ok);   /* last line before r3_seed_playerprefs */
+}
+
+static void xd_finish(void) {
+  if (xd_thr_ok) {
+    __sync_synchronize();
+    eventFire(&xd_evt);
+    /* Bounded: libnx's fs write can block behind a wedged FS session, and the
+     * process must still reach svcBreak so creport fires. */
+    eventWait(&xd_evt_done, 2000000000ULL);
+  } else {
+    int dbg = debugLogFd();
+    if (xd_fd >= 0) xd_write_all(xd_fd, xd_buf, xd_len);
+    if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, xd_buf, xd_len);
+  }
 }
 
 /* libnx user exception handling: providing these symbols + the handler enables it */
@@ -77,50 +238,87 @@ static int xd_readable(uintptr_t addr, size_t len) {
   return 1;
 }
 
-/* "libunity.so+0x1234" style annotation; falls back to raw hex */
+/* "libunity.so+0x1234" style annotation; falls back to raw hex.
+ * #305: hand-formatted -- snprintf may allocate through vfprintf. */
 static const char *xd_sym(u64 v, char *buf, size_t n) {
   so_module *m = so_find_module_by_addr((const void *)v);
-  if (m)
-    snprintf(buf, n, "%s+0x%lx", m->name, (unsigned long)(v - (uintptr_t)m->load_virtbase));
-  else
-    snprintf(buf, n, "%016lx", (unsigned long)v);
+  size_t k = 0;
+  char d[16];
+  int nd = 0;
+  u64 rest;
+  if (m) {
+    for (const char *s = m->name; *s && k + 4 < n; s++) buf[k++] = *s;
+    buf[k++] = '+'; buf[k++] = '0'; buf[k++] = 'x';
+    rest = v - (uintptr_t)m->load_virtbase;
+  } else {
+    buf[k++] = '0'; buf[k++] = 'x';
+    rest = v;
+  }
+  if (!rest) d[nd++] = '0';
+  while (rest) {
+    unsigned x = (unsigned)(rest & 0xF);
+    d[nd++] = (char)(x < 10 ? '0' + x : 'a' + x - 10);
+    rest >>= 4;
+  }
+  while (nd && k + 1 < n) buf[k++] = d[--nd];
+  buf[k] = 0;
   return buf;
 }
 
 static void xd_dump_range(const char *tag, uintptr_t base, size_t bytes) {
   if (!xd_readable(base, bytes)) {
-    xd_print("[xd] %s @%p: UNREADABLE\n", tag, (void *)base);
+    bs("[xd] "); bs(tag); bs(" @0x"); bhex((u64)base, 0);
+    bs(": UNREADABLE\n");
     return;
   }
-  char s[64];
   for (size_t off = 0; off < bytes; off += 0x20) {
     const u64 *q = (const u64 *)(base + off);
-    xd_print("[xd] %s+%03zx: %016lx %016lx %016lx %016lx\n",
-                tag, off, (unsigned long)q[0], (unsigned long)q[1],
-                (unsigned long)q[2], (unsigned long)q[3]);
-    (void)s;
+    bs("[xd] "); bs(tag); bs("+"); bhex((u64)off, 3); bs(": ");
+    bhex(q[0], 16); bs(" "); bhex(q[1], 16); bs(" ");
+    bhex(q[2], 16); bs(" "); bhex(q[3], 16); bs("\n");
   }
 }
 
 void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   char b1[96], b2[96], b3[96];
+
+  /* #305: a fault while dumping would recurse forever; say so once, raw. */
+  if (xd_busy) {
+    static const char nested[] = "[xd] nested fault inside exception handler\n";
+    int fd = xd_fd >= 0 ? xd_fd : debugLogFd();
+    if (fd >= 0) xd_write_all(fd, nested, sizeof nested - 1);
+    svcBreak(BreakReason_Panic, 0, 0);
+    for (;;) svcSleepThread(1000000000ULL);
+  }
+  xd_busy = 1;
+  xd_len = 0;
+
   u64 fault_tid = 0;
   svcGetThreadId(&fault_tid, CUR_THREAD_HANDLE);
-  xd_print("[xd] ================= USER EXCEPTION =================\n");
-  xd_print("[xd] faulting thread tid=%llu\n", (unsigned long long)fault_tid);
-  xd_print("[xd] desc=0x%x pc=%s far=%016lx esr=%08x\n",
-              ctx->error_desc, xd_sym(ctx->pc.x, b1, sizeof b1),
-              (unsigned long)ctx->far.x, ctx->esr);
-  xd_print("[xd] lr=%s sp=%016lx fp=%016lx\n",
-              xd_sym(ctx->lr.x, b2, sizeof b2),
-              (unsigned long)ctx->sp.x, (unsigned long)ctx->fp.x);
-  for (int i = 0; i < 28; i += 4)
-    xd_print("[xd] x%-2d %016lx  x%-2d %016lx  x%-2d %016lx  x%-2d %016lx\n",
-                i, (unsigned long)ctx->cpu_gprs[i].x,
-                i + 1, (unsigned long)ctx->cpu_gprs[i + 1].x,
-                i + 2, (unsigned long)ctx->cpu_gprs[i + 2].x,
-                i + 3, (unsigned long)ctx->cpu_gprs[i + 3].x);
-  xd_print("[xd] x28 %016lx\n", (unsigned long)ctx->cpu_gprs[28].x);
+  bs("[xd] ================= USER EXCEPTION =================\n");
+  bs("[xd] faulting thread tid="); bdec((long long)fault_tid, 0, '0', 0, 0);
+  bs("\n");
+  bs("[xd] desc=0x"); bhex((u64)ctx->error_desc, 0);
+  bs(" pc="); bs(xd_sym(ctx->pc.x, b1, sizeof b1));
+  bs(" far="); bhex(ctx->far.x, 16);
+  bs(" esr="); bhex((u64)ctx->esr, 8);
+  bs("\n");
+  bs("[xd] lr="); bs(xd_sym(ctx->lr.x, b2, sizeof b2));
+  bs(" sp="); bhex(ctx->sp.x, 16);
+  bs(" fp="); bhex(ctx->fp.x, 16);
+  bs("\n");
+  for (int i = 0; i < 28; i += 4) {
+    bs("[xd] x"); bdec(i, 2, ' ', 0, 1); bs(" ");
+    bhex(ctx->cpu_gprs[i].x, 16);
+    bs("  x"); bdec(i + 1, 2, ' ', 0, 1); bs(" ");
+    bhex(ctx->cpu_gprs[i + 1].x, 16);
+    bs("  x"); bdec(i + 2, 2, ' ', 0, 1); bs(" ");
+    bhex(ctx->cpu_gprs[i + 2].x, 16);
+    bs("  x"); bdec(i + 3, 2, ' ', 0, 1); bs(" ");
+    bhex(ctx->cpu_gprs[i + 3].x, 16);
+    bs("\n");
+  }
+  bs("[xd] x28 "); bhex(ctx->cpu_gprs[28].x, 16); bs("\n");
 
   /* Faulting instruction bytes (pc-16 .. pc+20): lets us decode the exact
    * access (base register, offset, width) without a disassembler on hand. */
@@ -128,11 +326,13 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
     u64 pcb = ctx->pc.x & ~3ull;
     if (pcb >= 16 && xd_readable(pcb - 16, 40)) {
       const u32 *w = (const u32 *)(pcb - 16);
-      for (int i = 0; i < 10; i++)
-        xd_print("[xd] ins%+d %s: %08x\n", (i - 4) * 4,
-                    xd_sym(pcb - 16 + (u64)(i * 4), b3, sizeof b3), w[i]);
+      for (int i = 0; i < 10; i++) {
+        bs("[xd] ins"); bdec((i - 4) * 4, 0, '0', 1, 0);
+        bs(" "); bs(xd_sym(pcb - 16 + (u64)(i * 4), b3, sizeof b3));
+        bs(": "); bhex((u64)w[i], 8); bs("\n");
+      }
     } else {
-      xd_print("[xd] ins: code bytes around pc UNREADABLE\n");
+      bs("[xd] ins: code bytes around pc UNREADABLE\n");
     }
   }
 
@@ -143,7 +343,8 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
     uintptr_t nfp = ((uintptr_t *)fp)[0];
     uintptr_t rlr = ((uintptr_t *)fp)[1];
     if (!rlr) break;
-    xd_print("[xd]   bt[%d] %s\n", d, xd_sym(rlr, b3, sizeof b3));
+    bs("[xd]   bt["); bdec(d, 0, '0', 0, 0); bs("] ");
+    bs(xd_sym(rlr, b3, sizeof b3)); bs("\n");
     if (nfp <= fp) break;
     fp = nfp;
   }
@@ -151,6 +352,35 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   /* the whole stack frame: every [sp+slot] the crash block reads */
   uintptr_t sp = (uintptr_t)ctx->sp.x;
   xd_dump_range("SP", sp, 0x200);
+
+  /* #302: recover the caller chain without an unwinder. The x29 walk above
+   * dies on the first frame that has no canonical frame pointer (Unity is
+   * built -fomit-frame-pointer; b301's bt[0] came out as 0x9), so scan the
+   * top 4 KB of the faulting stack for words pointing into a module's
+   * EXECUTABLE segment instead. Every live return address is such a word. */
+  {
+    int printed = 0;
+    for (size_t off = 0; off < 0x1000 && printed < 24; off += 8) {
+      uintptr_t a = sp + off;
+      if (!xd_readable(a, 8)) break;
+      uintptr_t v = *(const uintptr_t *)a;
+      if (v < 0x1000) continue;
+      so_module *m = so_find_module_by_addr((const void *)v);
+      if (!m) continue;
+      int is_exec = 0;
+      for (int i = 0; i < m->phnum; i++) {
+        if (!(m->phdr[i].p_flags & PF_X)) continue;
+        uintptr_t lo = (uintptr_t)m->load_virtbase + m->phdr[i].p_vaddr;
+        if (v >= lo && v < lo + m->phdr[i].p_memsz) { is_exec = 1; break; }
+      }
+      if (!is_exec) continue;
+      char b4[96];
+      bs("[xd] stk+"); bhex((u64)off, 3); bs(" ");
+      bs(xd_sym(v, b4, sizeof b4)); bs("\n");
+      printed++;
+    }
+    if (!printed) bs("[xd] stk: no module code pointers in the top 4 KB\n");
+  }
 
   /* dump the struct at x1 (for the 0x124400c list crash: x1 is the list head) */
   {
@@ -167,14 +397,18 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
     uintptr_t elem_idx  = ((uintptr_t *)(sp + 0x50))[0];
     uintptr_t jobdata   = ((uintptr_t *)(sp + 0x28))[0];
     uintptr_t outbase   = ((uintptr_t *)(sp + 0x10))[0];
-    xd_print("[xd] elem_base=%016lx idx=%lu jobdata=%016lx outbase=%016lx\n",
-                (unsigned long)elem_base, (unsigned long)elem_idx,
-                (unsigned long)jobdata, (unsigned long)outbase);
+    bs("[xd] elem_base="); bhex((u64)elem_base, 16);
+    bs(" idx="); bdec((long long)elem_idx, 0, '0', 0, 0);
+    bs(" jobdata="); bhex((u64)jobdata, 16);
+    bs(" outbase="); bhex((u64)outbase, 16);
+    bs("\n");
     if (elem_idx < 0x10000 && elem_base)
       xd_dump_range("ELEM", elem_base + elem_idx * 0x70, 0x70);
     if (jobdata) xd_dump_range("JOB", jobdata, 0x60);
   }
-  xd_print("[xd] ============== END EXCEPTION DUMP ==============\n");
+  bs("[xd] ============== END EXCEPTION DUMP ==============\n");
+
+  xd_finish();
 
   /* re-raise so the process still aborts and Atmosphere writes its report */
   svcBreak(BreakReason_Panic, 0, 0);

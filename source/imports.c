@@ -290,8 +290,9 @@ int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
      * the game's vsync counter lives at mutex+0x58 in game memory. The
      * waits counter is shared with the timedwait fake, so exactly one of
      * the two fakes fires the bind at n==200. */
+    /* #308: main thread only -- see port_is_main_thread in libc_shim.c. */
     if (n == 200 && cond127_tab[s].sigs == 0 && g_in_render_loop &&
-        vsync_get_counter() == NULL) {
+        port_is_main_thread() && vsync_get_counter() == NULL) {
       debugPrintf("[vsync260] hot condwait bind attempt: cnd slot=%p mtx slot=%p (*mtx=%p) waits=%u sigs=%u\n",
                   (void *)cnd, (void *)mtx, (void *)*mtx, n, cond127_tab[s].sigs);
       vsync_bind_counter((uintptr_t)mtx);
@@ -342,7 +343,7 @@ int pthread_cond_timedwait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx, con
      * shared, so exactly one of the two fakes fires the bind at n==200. */
     unsigned n260 = cond127_tab[s].waits;
     if (n260 == 200 && cond127_tab[s].sigs == 0 && g_in_render_loop &&
-        vsync_get_counter() == NULL) {
+        port_is_main_thread() && vsync_get_counter() == NULL) {
       debugPrintf("[vsync260] hot condwait bind attempt: cnd slot=%p mtx slot=%p (*mtx=%p) waits=%u sigs=%u\n",
                   (void *)cnd, (void *)mtx, (void *)*mtx, n260, cond127_tab[s].sigs);
       vsync_bind_counter((uintptr_t)mtx);
