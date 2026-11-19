@@ -1457,10 +1457,30 @@ static void nx_guard155_install(uintptr_t ub) {
  * The record (first hit only, plus a count) is printed by the snoop thread
  * as `[msg311] ...` in snoop.log: base/size/capacity/label of the array,
  * the index and slot of the null entry, and how many nulls were skipped.
- * NO array dereference in the dump -- the pointers are only printed. */
+ * NO array dereference in the dump -- the pointers are only printed.
+ *
+ * Test #312 (PlayerPrefs fix) reached this loop again and the crash moved one
+ * step further: xd.log pc=libunity+0xc507e8 far=0x18 esr=0x92000005 on the
+ * Unity Main Thread, i.e. `ldr w8,[x0,#24]` with x0=0 inside the comparator
+ * `0xc507e8` that the introsort at `0xc52ff8` calls as `blr x21` with the
+ * ELEMENT VALUES as x0/x1 (c53078: ldr x1,[x24]; c53080: ldr x0,[x8,#8]).
+ * That proves the registry is a dynamic_array<T*> and that skipping a NULL
+ * only moves the fault from the conflict check to the sort (twice, x0 and x1
+ * were both 0) and later to the per-entry `ldrb w14,[x13,#24]` index pass.
+ *
+ * So #313 removes the NULL slots instead of tolerating them: the null path of
+ * the trampoline calls nx_msg313_drop(), which shifts the remaining pointers
+ * down by one, decrements [x29+16] (the element count) and re-enters the loop
+ * head with x21 unchanged, so the shifted-in entry is validated next.  The
+ * loop limit is recomputed from [x29] and [x29+16] on every stock iteration
+ * (0xc506b4), so the shortened array is walked consistently; nothing else
+ * holds array slots (entries are referenced by pointer), and the post-sort
+ * pass only rewrites entry->index from the new order.  If the slot does not
+ * look like a removable NULL pointer the trampoline falls back to the old
+ * #311 advance path, so a surprise layout can never loop forever. */
 typedef struct {
   uintptr_t hit;      /* 1 after the first null entry */
-  uintptr_t nulls;    /* number of null entries skipped */
+  uintptr_t nulls;    /* number of null entries dropped (#313) */
   uintptr_t base;     /* [x29]     array data pointer */
   uintptr_t size;     /* [x29+16]  element count */
   uintptr_t cap;      /* [x29+24]  capacity */
@@ -1472,6 +1492,30 @@ __attribute__((used)) msg311_rec msg311_r;
 volatile uint64_t nx_ret_msg311_cont;   /* -> libunity+0xc5041c (after the bl) */
 volatile uint64_t nx_ret_msg311_skip;   /* -> libunity+0xc506b4 (advance+check) */
 volatile uint64_t nx_ret_msg311_call;   /* -> libunity+0xc527b8 (displaced bl) */
+volatile uint64_t nx_ret_msg311_head;   /* -> libunity+0xc5040c (loop head) */
+
+/* Build #313: drop the NULL element at `slot` from the dynamic_array
+ * {data,label,count,capacity} at `hdr` and shrink count by one.  Returns 1 on
+ * success (caller re-enters the loop head with x21 unchanged) or 0 when the
+ * slot cannot be validated, in which case the caller keeps the #311 skip.
+ * Callee-saved registers are preserved by the C ABI, and the target function
+ * keeps the array header in x29 and its cursor in x21 across this call.
+ * No I/O here: the trampoline runs on the Unity Main Thread. */
+__attribute__((used, noinline)) static int nx_msg313_drop(uintptr_t hdr, uintptr_t slot) {
+  if (!hdr) return 0;
+  uintptr_t *a = (uintptr_t *)*(volatile uintptr_t *)hdr;
+  uintptr_t n = *(volatile uintptr_t *)(hdr + 16);
+  uintptr_t cap = *(volatile uintptr_t *)(hdr + 24);
+  uintptr_t off = slot - (uintptr_t)a;
+  if (!a || !n || n > cap || (off & 7u)) return 0;
+  uintptr_t i = off >> 3;
+  if (i >= n) return 0;
+  if (a[i] != 0) return 0;            /* only a real NULL element is dropped */
+  for (uintptr_t k = i; k + 1 < n; k++) a[k] = a[k + 1];
+  a[n - 1] = 0;
+  *(volatile uintptr_t *)(hdr + 16) = n - 1;
+  return 1;
+}
 
 __attribute__((naked)) static void nx_tramp_msg311(void) {
   __asm__ volatile(
@@ -1500,6 +1544,16 @@ __attribute__((naked)) static void nx_tramp_msg311(void) {
     "sub x10, x21, x10\n"
     "lsr x10, x10, #3\n"            /* index */
     "str x10, [x8, #56]\n"
+    /* #313: remove the NULL slot and validate the shifted-in entry next */
+    "mov x0, x29\n"
+    "mov x1, x21\n"
+    "adrp x16, nx_msg313_drop\n"
+    "add x16, x16, :lo12:nx_msg313_drop\n"
+    "blr x16\n"
+    "cbz w0, .Lmsg311_skip\n"
+    "adrp x16, nx_ret_msg311_head\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg311_head]\n"
+    "br x16\n"                      /* -> 0xc5040c, same index again */
     ".Lmsg311_skip:\n"
     "adrp x16, nx_ret_msg311_skip\n"
     "ldr x16, [x16, :lo12:nx_ret_msg311_skip]\n"
@@ -1519,7 +1573,7 @@ __attribute__((naked)) static void nx_tramp_msg311(void) {
 /* snoop thread only (plain fprintf on its own FILE*, never debugPrintf). */
 void msg311_dump(FILE *f) {
   if (!f || !msg311_r.hit) return;
-  fprintf(f, "[msg311] null msg entry n=%llu idx=%llu slot=0x%llx base=0x%llx "
+  fprintf(f, "[msg311] null msg entry dropped=%llu idx=%llu slot=0x%llx base=0x%llx "
              "size=%llu cap=%llu label=0x%llx\n",
           (unsigned long long)msg311_r.nulls,
           (unsigned long long)msg311_r.idx,
@@ -1546,6 +1600,7 @@ static void nx_msg311_install(uintptr_t ub) {
   nx_ret_msg311_cont = ub + 0xc5041cu;
   nx_ret_msg311_skip = ub + 0xc506b4u;
   nx_ret_msg311_call = ub + 0xc527b8u;
+  nx_ret_msg311_head = ub + 0xc5040cu;
   uint32_t patch[4] = {
     0x58000050u,  /* ldr x16, [pc, #8] */
     0xd61f0200u,  /* br x16 */
@@ -1553,9 +1608,10 @@ static void nx_msg311_install(uintptr_t ub) {
     (uint32_t)((uintptr_t)nx_tramp_msg311 >> 32),
   };
   so_patch_code((void *)(ub + NX_MSG311_VA), patch, sizeof patch);
-  debugPrintf("[msg311] hooked registry loop @ %p -> tramp %p cont %p skip %p\n",
+  debugPrintf("[msg311] hooked registry loop @ %p -> tramp %p cont %p skip %p head %p\n",
               (void *)(ub + NX_MSG311_VA), (void *)nx_tramp_msg311,
-              (void *)nx_ret_msg311_cont, (void *)nx_ret_msg311_skip);
+              (void *)nx_ret_msg311_cont, (void *)nx_ret_msg311_skip,
+              (void *)nx_ret_msg311_head);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1670,7 +1726,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   }
   nx_jobcount_install(ub);   /* Build #120: hook job push/schedule/complete entries */
   nx_guard155_install(ub);   /* Build #155: guard trampoline (AFTER branch forces) */
-  nx_msg311_install(ub);     /* Build #311: skip NULL message-registry entries */
+  nx_msg311_install(ub);     /* Build #311/#313: drop NULL message-registry entries */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
