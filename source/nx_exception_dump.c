@@ -410,7 +410,10 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
    * as zero; the object one hop away names the subsystem. Dump the pointees of
    * the registers that held live pointers, and their first field, so the log
    * shows which object had NULL at offset 0 without another build. */
-  if (ctx->far.x < 0x10000) {
+  /* #317: also cover a small NEGATIVE far (data abort at base + (-8) with a
+   * NULL base), which #316's `far < 0x10000` test skipped -- far is unsigned
+   * here, so 0xfffffff8 never dumped anything. */
+  if (ctx->far.x < 0x10000 || ctx->far.x >= (u64)-0x10000) {
     static const int regs[] = { 8, 9, 19, 20, 21, 22, 24, 25, 26, 27 };
     char tag[8];
     for (unsigned r = 0; r < sizeof regs / sizeof regs[0]; r++) {
@@ -425,6 +428,38 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
         bs("[xd] R"); bdec(regs[r], 0, '0', 0, 0); bs("->0x"); bhex((u64)q, 0); bs("\n");
         xd_dump_range(tag, q, 0x40);
       }
+    }
+  }
+  /* #317: the libunity set() hook's record. Written by the trampoline into bss
+   * without I/O, so it is here even when debug.log dropped the live line. */
+  {
+    typedef struct {
+      uintptr_t calls, anom, idx, obj, a, b, caller, data, count, cap, data2, skip;
+      uintptr_t first_idx[8], first_lr[8], first_n;
+    } View317;
+    extern const void *nx_msg317_rec_ptr(void);
+    const View317 *v = (const View317 *)nx_msg317_rec_ptr();
+    if (v && v->calls) {
+      bs("[xd] msg317 calls="); bdec((long long)v->calls, 0, '0', 0, 0);
+      bs(" skip="); bdec((long long)v->anom, 0, '0', 0, 0);
+      bs(" idx=");  bdec((long long)v->idx, 0, '0', 0, 0);
+      bs(" data="); bhex((u64)v->data, 16);
+      bs(" count="); bdec((long long)v->count, 0, '0', 0, 0);
+      bs(" cap=");  bdec((long long)v->cap, 0, '0', 0, 0);
+      bs(" data2="); bhex((u64)v->data2, 16);
+      bs(" obj=");  bhex((u64)v->obj, 16);
+      bs(" a=");    bhex((u64)v->a, 16);
+      bs(" b=");    bhex((u64)v->b, 16);
+      bs(" lr=");   bhex((u64)v->caller, 16);
+      bs("\n");
+      for (uintptr_t i = 0; i < v->first_n && i < 8; i++) {
+        bs("[xd] msg317 call"); bdec((long long)i, 0, '0', 0, 0);
+        bs(" idx="); bdec((long long)v->first_idx[i], 0, '0', 0, 0);
+        bs(" lr=");  bhex((u64)v->first_lr[i], 16);
+        bs("\n");
+      }
+      if (v->obj && xd_readable(v->obj, 0x50)) xd_dump_range("L317", v->obj, 0x50);
+      if (v->data && xd_readable(v->data, 0x40)) xd_dump_range("D317", v->data, 0x40);
     }
   }
   bs("[xd] ============== END EXCEPTION DUMP ==============\n");

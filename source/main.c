@@ -1775,6 +1775,146 @@ static void nx_msg315_install(uintptr_t ub) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Build #317: the #316 crash is a two-array element write with a negative
+ * index on an empty (data == NULL) list.
+ *
+ *   tid=1239 (Unity Main Thread) pc=libunity+0xc43ec8 far=fffffffffffffff8
+ *   esr=92000044, ins `str x22,[x8,w21,sxtw #3]` with x8 = [x20] = 0 and
+ *   w21 = -1.  lr=+0xeab27c -> the tail branch at 0xc44210 into 0xc43e5c.
+ *
+ * 0xc43e5c is `set(list, idx, a, b)`: it stores a into list->data[idx] and b
+ * into list->data2[idx], extending both arrays first when idx >= count.  With
+ * idx = -1 the extension asks for 0 elements (idx+1), so it is a no-op, and
+ * the stock code then stores at data[-1] -> NULL base - 8.  The index comes
+ * from a global (0xc441f0: `ldr w1,[x21,#28]`, x21 = *(0x16e8160)); a -1 in
+ * that table means "unset", which this call path does not expect during
+ * il2cpp's metadata init right after global-metadata.dat is read.
+ *
+ * So this build hooks the function entry (verify-first: the four displaced
+ * prologue words are compared before patching) and skips a call that cannot
+ * be stored anywhere: idx < 0, or no backing array.  The stock path is
+ * unchanged for every normal call (idx >= 0 with a live array).  The first
+ * eight calls and the first skipped call are recorded in bss with NO I/O on
+ * the hot path; the exception dump prints them (`[xd] msg317 ...`), so the
+ * record survives even if debug.log's non-blocking lock is held at fault
+ * time.  The four displaced words are replayed before resuming at 0xc43e6c,
+ * so a normal call is byte-for-byte the stock prologue. */
+typedef struct {
+  uintptr_t calls;
+  uintptr_t anom;          /* calls skipped (idx < 0 or data == NULL) */
+  uintptr_t idx;           /* first skipped call */
+  uintptr_t obj;
+  uintptr_t a;
+  uintptr_t b;
+  uintptr_t caller;
+  uintptr_t data;
+  uintptr_t count;
+  uintptr_t cap;
+  uintptr_t data2;
+  uintptr_t skip;
+  uintptr_t first_idx[8];  /* first eight calls: index ... */
+  uintptr_t first_lr[8];   /* ... and return address */
+  uintptr_t first_n;
+} msg317_rec;
+__attribute__((used)) msg317_rec msg317_r;
+volatile uint64_t nx_ret_msg317_resume;   /* -> libunity+0xc43e6c (after prologue) */
+
+/* Trampoline helper.  Runs on whatever thread calls set(): no I/O unless the
+ * call is skipped (then one line, best-effort), and never dereferences obj
+ * beyond its header. */
+__attribute__((used, noinline)) static int nx_msg317_trace(uintptr_t obj, int64_t idx,
+                                                           uintptr_t a, uintptr_t b,
+                                                           uintptr_t caller) {
+  uintptr_t data = 0, data2 = 0, count = 0, cap = 0;
+  if (obj && (obj & 7u) == 0) {
+    volatile uintptr_t *o = (volatile uintptr_t *)obj;
+    data = o[0]; count = o[2]; cap = o[3]; data2 = o[4];
+  }
+  uintptr_t n = msg317_r.calls++;
+  if (n < 8) {
+    msg317_r.first_idx[n] = (uintptr_t)idx;
+    msg317_r.first_lr[n] = caller;
+    if (n + 1 > msg317_r.first_n) msg317_r.first_n = n + 1;
+  }
+  if (idx >= 0 && data) return 0;              /* stock path */
+  if (!msg317_r.anom) {
+    msg317_r.idx = (uintptr_t)idx;
+    msg317_r.obj = obj;
+    msg317_r.a = a;
+    msg317_r.b = b;
+    msg317_r.caller = caller;
+    msg317_r.data = data;
+    msg317_r.count = count;
+    msg317_r.cap = cap;
+    msg317_r.data2 = data2;
+    msg317_r.skip = 1;
+    debugPrintf("[msg317] skip set obj=%p idx=%lld data=%p count=%llu cap=%llu data2=%p a=%p b=%p caller=+0x%llx\n",
+                (void *)obj, (long long)idx, (void *)data,
+                (unsigned long long)count, (unsigned long long)cap,
+                (void *)data2, (void *)a, (void *)b, (unsigned long long)caller);
+  }
+  msg317_r.anom++;
+  return 1;
+}
+
+__attribute__((naked)) static void nx_tramp_msg317(void) {
+  __asm__ volatile(
+    "sub sp, sp, #0x40\n"
+    "str x30, [sp, #0]\n"
+    "stp x0, x1, [sp, #8]\n"
+    "stp x2, x3, [sp, #24]\n"
+    "mov x4, x30\n"                     /* caller (lr already in x30 at entry) */
+    "sxtw x1, w1\n"                     /* index is an int */
+    "adrp x16, nx_msg317_trace\n"
+    "add x16, x16, :lo12:nx_msg317_trace\n"
+    "blr x16\n"
+    "ldr x30, [sp, #0]\n"
+    "ldp x0, x1, [sp, #8]\n"
+    "ldp x2, x3, [sp, #24]\n"
+    "add sp, sp, #0x40\n"
+    "cbnz w0, .Lmsg317_skip\n"
+    /* displaced stock prologue (0xc43e5c .. 0xc43e68) */
+    "sub sp, sp, #0x40\n"
+    "stp x30, x23, [sp, #16]\n"
+    "stp x22, x21, [sp, #32]\n"
+    "stp x20, x19, [sp, #48]\n"
+    "adrp x16, nx_ret_msg317_resume\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg317_resume]\n"
+    "br x16\n"                          /* -> 0xc43e6c */
+    ".Lmsg317_skip:\n"
+    "ret\n"                             /* store nothing: sp/lr are untouched */
+  );
+}
+
+/* xd (lock-free writer) reads the record through this accessor. */
+const void *nx_msg317_rec_ptr(void) { return (const void *)&msg317_r; }
+
+#define NX_MSG317_VA 0xc43e5cu
+
+static void nx_msg317_install(uintptr_t ub) {
+  static const uint32_t exp[4] = { 0xd10103ffu, 0xa9015ffeu, 0xa90257f6u, 0xa9034ff4u };
+  uint32_t cur[4];
+  for (int i = 0; i < 4; i++)
+    cur[i] = *(volatile uint32_t *)(ub + NX_MSG317_VA + 4u * (uint32_t)i);
+  if (memcmp(cur, exp, sizeof cur) != 0) {
+    debugPrintf("[msg317] SKIP: set() entry mismatch (have 0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                cur[0], cur[1], cur[2], cur[3]);
+    return;
+  }
+  nx_ret_msg317_resume = ub + 0xc43e6cu;
+  uint32_t patch[4] = {
+    0x58000050u,  /* ldr x16, [pc, #8] */
+    0xd61f0200u,  /* br x16 */
+    (uint32_t)(uintptr_t)nx_tramp_msg317,
+    (uint32_t)((uintptr_t)nx_tramp_msg317 >> 32),
+  };
+  so_patch_code((void *)(ub + NX_MSG317_VA), patch, sizeof patch);
+  debugPrintf("[msg317] hooked set() @ %p -> tramp %p resume %p\n",
+              (void *)(ub + NX_MSG317_VA), (void *)nx_tramp_msg317,
+              (void *)nx_ret_msg317_resume);
+}
+
+/* ---------------------------------------------------------------------------
  * In-memory libunity patch (ported from VLN's nx_patch_unity_regions): the SD
  * card now ships the STOCK libunity.so and the boot patches it after load,
  * instead of distributing a pre-modified binary. 23 instruction words, from a
@@ -1888,6 +2028,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   nx_guard155_install(ub);   /* Build #155: guard trampoline (AFTER branch forces) */
   nx_msg311_install(ub);     /* Build #311/#313: drop NULL message-registry entries */
   nx_msg315_install(ub);     /* Build #315: compact the array right before the sort */
+  nx_msg317_install(ub);     /* Build #317: skip set() with idx<0 / no array */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
