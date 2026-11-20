@@ -2513,7 +2513,17 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
     aligned = (q != NULL);
   }
   if (!q) q = memalign(MMAP_PAGE, alloc);
-  if (!q) return NULL;
+  if (!q) {
+    /* #316: never fail silently -- an unserved big reserve is what the engine
+     * NULL-derefs a few instructions later, so name the size and the heap
+     * state in one line. */
+    unsigned hu = 0, hf = 0;
+    mem287_heap_mb(&hu, &hf);
+    debugPrintf("[fb316] memalign FAILED: %u KB (alloc %u KB) heap %u/%u MB, blocks %d/%u MB\n",
+                (unsigned)(length >> 10), (unsigned)(alloc >> 10), hu, hf,
+                g_fb_n, (unsigned)(g_fb_bytes >> 20));
+    return NULL;
+  }
   if (alloc < len) {
     if (fb_phantom_add((uint8_t *)q + alloc, len - alloc))
       debugPrintf("[fb129] kept-only fallback: %u KB request -> %u KB allocated (+%u MB phantom)\n",

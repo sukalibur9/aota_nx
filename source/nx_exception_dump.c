@@ -406,6 +406,27 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
       xd_dump_range("ELEM", elem_base + elem_idx * 0x70, 0x70);
     if (jobdata) xd_dump_range("JOB", jobdata, 0x60);
   }
+  /* #316: NULL-ish faults are a dereference through a pointer that read back
+   * as zero; the object one hop away names the subsystem. Dump the pointees of
+   * the registers that held live pointers, and their first field, so the log
+   * shows which object had NULL at offset 0 without another build. */
+  if (ctx->far.x < 0x10000) {
+    static const int regs[] = { 8, 9, 19, 20, 21, 22, 24, 25, 26, 27 };
+    char tag[8];
+    for (unsigned r = 0; r < sizeof regs / sizeof regs[0]; r++) {
+      uintptr_t p = (uintptr_t)ctx->cpu_gprs[regs[r]].x;
+      if (p < 0x1000 || !xd_readable(p, 8)) continue;
+      tag[0] = 'R'; tag[1] = '0' + (char)(regs[r] / 10);
+      tag[2] = '0' + (char)(regs[r] % 10); tag[3] = 0;
+      xd_dump_range(tag, p, 0x40);
+      uintptr_t q = *(const uintptr_t *)p;          /* one hop: field 0 */
+      if (q >= 0x1000 && xd_readable(q, 8)) {
+        tag[0] = 'R'; tag[1] = '>'; tag[2] = 0;
+        bs("[xd] R"); bdec(regs[r], 0, '0', 0, 0); bs("->0x"); bhex((u64)q, 0); bs("\n");
+        xd_dump_range(tag, q, 0x40);
+      }
+    }
+  }
   bs("[xd] ============== END EXCEPTION DUMP ==============\n");
 
   xd_finish();
