@@ -681,6 +681,59 @@ static void sentinel_main(void *unused) {
   close(fd);
 }
 
+/* Build #318: the #292 sentinel writes through newlib/fsdev -- the same fs
+ * session behind every other log line. Test #317 went black with debug.log,
+ * wd290.log AND sentinel.log all stopping within ~250 ms of each other, so
+ * either the process ended (nothing left to write) or that fs session wedged
+ * (every later write blocks forever); the logs cannot tell the two apart.
+ * This third witness opens its own FsFile (a separate fs IPC session: no
+ * newlib, no fsdev, no g_log_lock, no registry lock) and keeps ticking, which
+ * separates the cases:
+ *   alive.log keeps growing -> process alive, the fsdev/log path wedged
+ *   alive.log stops too     -> the process itself is gone
+ * It also carries the main engine thread's wait beacon and the #317 hook
+ * counters (calls/anomalies), so a surviving channel still names the state. */
+void nx_msg317_stats(uint64_t *calls, uint64_t *anom);   /* main.c */
+
+static void alive2_main(void *unused) {
+  (void)unused;
+  FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
+  if (!fs) return;
+  (void)fsFsCreateFile(fs, "/switch/aota/alive.log", 0, 0);   /* EEXIST is fine */
+  FsFile f;
+  if (R_FAILED(fsFsOpenFile(fs, "/switch/aota/alive.log", FsOpenMode_Write, &f)))
+    return;
+  (void)fsFileSetSize(&f, 0);
+  s64 off = 0;
+  for (int n = 1; n <= 2400; n++) {
+    svcSleepThread(250ull * 1000ull * 1000ull);
+    uint64_t mtid = 0, mwait = 0;
+    int mkind = -1;
+    for (int i = 0; i < DIAG_MAX_THREADS; i++) {
+      if (g_threads[i].in_use && g_threads[i].is_main_engine) {
+        mtid  = g_threads[i].tid;
+        mkind = g_threads[i].wait_kind;
+        mwait = (uint64_t)(uintptr_t)g_threads[i].wait_obj;
+        break;
+      }
+    }
+    uint64_t c317 = 0, a317 = 0;
+    nx_msg317_stats(&c317, &a317);
+    char buf[176];
+    int len = snprintf(buf, sizeof buf,
+                       "[a318] n=%d frame=%d idle_ms=%llu main=%llu/%s/0x%llx c317=%llu/%llu\n",
+                       n, diag_frame_now(),
+                       (unsigned long long)(tick_to_ns(now_tick() - g_last_progress) / 1000000ull),
+                       (unsigned long long)mtid, wait_kind_name(mkind),
+                       (unsigned long long)mwait,
+                       (unsigned long long)c317, (unsigned long long)a317);
+    if (len <= 0) continue;
+    if (R_FAILED(fsFileWrite(&f, off, buf, (size_t)len, FsWriteOption_Flush))) return;
+    off += len;
+  }
+  fsFileClose(&f);
+}
+
 void diag_watchdog_start(void) {
   if (g_wd_started) return;
   g_wd_started = 1;
@@ -720,4 +773,9 @@ void diag_watchdog_start(void) {
     Result src = threadCreate(&s_thr, sentinel_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[wd292] sentinel threadCreate rc=0x%x\n", src);
     if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr)); }
+  /* #318: third, session-independent witness (see alive2_main). */
+  { static Thread a_thr;
+    Result arc = threadCreate(&a_thr, alive2_main, NULL, NULL, 0x4000, 0x2C, -2);
+    debugPrintf("[a318] alive2 threadCreate rc=0x%x\n", arc);
+    if (R_SUCCEEDED(arc)) debugPrintf("[a318] alive2 start rc=0x%x\n", threadStart(&a_thr)); }
 }

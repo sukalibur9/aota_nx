@@ -1289,6 +1289,12 @@ DynLibFunction dynlib_functions[] = {
   { "syslog", (uintptr_t)&ret0_i },
   { "abort", (uintptr_t)&abort_logged },
   { "_exit", (uintptr_t)&_exit_fake },
+  /* #318: #314 wrapped abort/_exit but not the plain exit the engine is most
+   * likely to call on an asset-load failure -- that path ended the process
+   * silently (no [exit314], no fault dump, no creport in test #317). */
+  { "exit", (uintptr_t)&exit_logged },
+  { "_Exit", (uintptr_t)&_exit_fake },
+  { "quick_exit", (uintptr_t)&_exit_fake },
 
   // --- memory ---
   { "malloc", (uintptr_t)&malloc },

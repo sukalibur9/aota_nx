@@ -1889,6 +1889,14 @@ __attribute__((naked)) static void nx_tramp_msg317(void) {
 /* xd (lock-free writer) reads the record through this accessor. */
 const void *nx_msg317_rec_ptr(void) { return (const void *)&msg317_r; }
 
+/* #318: the surviving liveness channel (diag.c alive2) reports these without
+ * knowing the record layout -- whether set() is being called at all, and how
+ * many calls took the skip path. */
+void nx_msg317_stats(uint64_t *calls, uint64_t *anom) {
+  if (calls) *calls = (uint64_t)msg317_r.calls;
+  if (anom)  *anom  = (uint64_t)msg317_r.anom;
+}
+
 #define NX_MSG317_VA 0xc43e5cu
 
 static void nx_msg317_install(uintptr_t ub) {
