@@ -634,14 +634,22 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       int slot_idx = (int)(s - futex_slots);
       static const volatile int *last_logged_ua = NULL;
       static int last_logged_val = 0;
-      int cur_val = *uaddr;
-      if (uaddr != last_logged_ua || cur_val != last_logged_val) {
+      /* #320: this trace was written for the black-screen deadlock hunt and
+       * it is now pure cost -- test #319 filled 1.9 MB of debug.log with it
+       * (18,918 lines, ~90% of the file) while the title screen ran at ~1 FPS.
+       * Keep the evidence, lose the volume: the first 300 events, then every
+       * 512th, so a new deadlock still shows up as a trend in the log. */
+      static unsigned swait;
+      const int cur_val = *uaddr;
+      const int show = (swait < 300) || ((swait & 511) == 0);
+      if (show && (uaddr != last_logged_ua || cur_val != last_logged_val)) {
         debugPrintf("[futex] SLOT-WAIT ua=%p slot=%d gen=%llu refcount=%d tid=%d caller=%p val=%d\n",
                     (void *)uaddr, slot_idx, (unsigned long long)s->gen,
                     s->refcount, gettid_fake(), __builtin_return_address(0), cur_val);
         last_logged_ua = uaddr;
         last_logged_val = cur_val;
       }
+      swait++;
     }
 
     long ret = 0;
@@ -882,9 +890,11 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
     {
       static int wake_logged = 0;
       wake_logged++;
-      /* Log first 200, then only wakes to addresses with active waiters */
+      /* #320: same volume problem as SLOT-WAIT (this one had no cap at all and
+       * printed for every wake to an address with waiters -- 3,000+ lines in
+       * test #319). First 100, then every 1024th. */
       futex_slot_t *chk = futex_slot_find(uaddr);
-      if (wake_logged <= 200 || (chk && chk->refcount > 0)) {
+      if (wake_logged <= 100 || (wake_logged & 1023) == 0) {
         debugPrintf("[futex] WAKE#%d ua=%p n=%d tid=%d caller=%p %s\n",
                     wake_logged, (void *)uaddr, val, gettid_fake(),
                     __builtin_return_address(0),
@@ -905,10 +915,15 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       s->fakewake = 0;  /* #288: a real wake clears the consecutive-timeout count */
       condvarWakeAll(&s->cv);
       fx_unlock(&s->m);
-      debugPrintf("[futex] SLOT-WAKE ua=%p slot=%d gen %llu->%llu refcount=%d tid=%d\n",
-                  (void *)uaddr, slot_idx,
-                  (unsigned long long)gen_before, (unsigned long long)s->gen,
-                  s->refcount, gettid_fake());
+      /* #320: gate this too -- it printed on every single wake in test #319
+       * (3,000+ lines, all for one address). First 200, then every 512th. */
+      static unsigned swake;
+      if (swake < 200 || (swake & 511) == 0)
+        debugPrintf("[futex] SLOT-WAKE ua=%p slot=%d gen %llu->%llu refcount=%d tid=%d\n",
+                    (void *)uaddr, slot_idx,
+                    (unsigned long long)gen_before, (unsigned long long)s->gen,
+                    s->refcount, gettid_fake());
+      swake++;
     } else {
       debugPrintf("[futex] SLOT-WAKE-MISS ua=%p (no slot bound) tid=%d\n",
                   (void *)uaddr, gettid_fake());

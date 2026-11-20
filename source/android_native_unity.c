@@ -612,10 +612,17 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
   /* [inp144] heartbeat: the feed runs at 60 Hz on its own thread since
    * [inp285], so every 60 calls is ~1s -- the events_total trend separates
    * "nothing is being injected" from "injected but unread" in one glance
-   * at the log. */
+   * at the log.
+   * #320: events_total stayed at exactly 1 for all of test #319 -- the run's
+   * only injection was the first-frame neutral joystick event -- so the pad
+   * itself is now printed alongside. held/down are libnx's raw masks: if
+   * they change while events_total does not, the feed is at fault; if they
+   * never change, libnx is not seeing the controller at all. */
   if ((s_calls % 60) == 1)
-    debugPrintf("[inp144] feed calls=%u events_total=%u live=%d\n",
-                s_calls, g_events_total, g_live_n);
+    debugPrintf("[inp144] feed calls=%u events_total=%u live=%d held=0x%llx down=0x%llx style=0x%llx\n",
+                s_calls, g_events_total, g_live_n,
+                (unsigned long long)held, (unsigned long long)bdown,
+                (unsigned long long)padGetStyleSet(&g_pad));
 }
 
 /* ---- [inp285] feed thread --------------------------------------------------

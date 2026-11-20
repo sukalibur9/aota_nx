@@ -18,6 +18,11 @@
 #include <math.h>
 #include <SDL2/SDL.h>
 
+#if defined(__SWITCH__)
+#include <malloc.h>
+#include <switch.h>          /* [aud320] audout: the console's own audio output */
+#endif
+
 #include "opensles.h"
 #include "util.h"
 
@@ -572,10 +577,144 @@ void opensles_movie_end(void) {
 // Kept separate from g_dev (the OpenSL software mixer, which a Unity title never
 // opens) so the two paths can't interfere.
 
+/* --------------------------------------------------------------------------
+ * Build #320: real output, via libnx audout.
+ *
+ * What test #319 proved, with numbers rather than a guess: the SDL device
+ * reported PLAYING (audst=1) and its queue sat at exactly 8,390,656 B -- the
+ * #284 cap -- in every one of the run's samples. Byte for byte, not one
+ * buffer was ever drained, while FMOD pushed ~46k buffers of 1024 samples a
+ * second into it (~1000x realtime). So the sink accepted audio and played
+ * none of it, and the un-paced mixer thread spun a whole core flat. That
+ * also fits the other two symptoms: the title screen ran at ~1 FPS (the
+ * watchdog recorded frames 40..46 over eight 6-second stall windows) and
+ * input was ignored because the frame loop never got around to it.
+ *
+ * audout is the console's own audio output -- the very API SDL's switch
+ * driver wraps -- so drive it directly: a feeder thread keeps up to 6 x
+ * 1024-frame buffers in flight, and the producer blocks once the ring is
+ * full. FMOD's write path is then realtime-paced by construction: sound
+ * comes out, and the spin that starved the rest of the process is gone.
+ * ------------------------------------------------------------------------ */
+#if defined(__SWITCH__)
+#define NXA_RATE         48000
+#define NXA_CH           2
+#define NXA_FRAME_BYTES  (NXA_CH * 2)
+#define NXA_CHUNK_FRAMES 1024
+#define NXA_BUF_BYTES    (((NXA_CHUNK_FRAMES * NXA_FRAME_BYTES) + 0xFFFu) & ~0xFFFu)
+#define NXA_SLOTS        6
+#define NXA_RING_FRAMES  (NXA_CHUNK_FRAMES * NXA_SLOTS)   /* ~128 ms of slack */
+
+static volatile int    g_nxa_up;                  /* audout open + feeder up */
+static int             g_nxa_in_ch = 2;           /* channels FMOD hands us */
+static Thread          g_nxa_th;
+static AudioOutBuffer  g_nxa_buf[NXA_SLOTS];
+static u8             *g_nxa_mem[NXA_SLOTS];
+static s16             g_nxa_ring[NXA_RING_FRAMES * NXA_CH];
+static volatile u64    g_nxa_wi, g_nxa_ri;         /* frame counters, monotonic */
+static volatile u32    g_nxa_append, g_nxa_starve;
+
+/* Feeder: moves the ring into audout buffers and reclaims them as they finish.
+ * audoutWaitPlayFinish is what makes the whole thing realtime -- it returns
+ * only when the console has actually played something back. */
+static void nxa_feed(void *arg) {
+  (void)arg;
+  int inflight = 0, rr = 0;
+  debugPrintf("[aud320] feeder up: device %u Hz, %u ch, fmt=%d\n",
+              audoutGetSampleRate(), audoutGetChannelCount(),
+              (int)audoutGetPcmFormat());
+  while (g_nxa_up) {
+    /* Reclaim whatever the console finished. */
+    if (inflight > 0) {
+      AudioOutBuffer *rel = NULL;
+      u32 nrel = 0;
+      if (R_SUCCEEDED(audoutWaitPlayFinish(&rel, &nrel, 4000000ULL)) && nrel) {
+        inflight -= (int)nrel;
+        if (inflight < 0) inflight = 0;
+      }
+    }
+    const u64 avail = g_nxa_wi - g_nxa_ri;
+    if (inflight >= NXA_SLOTS || avail == 0) {
+      if (avail == 0) g_nxa_starve++;
+      svcSleepThread(1000000ULL);   /* 1 ms */
+      continue;
+    }
+    const int frames = avail > NXA_CHUNK_FRAMES ? NXA_CHUNK_FRAMES : (int)avail;
+    s16 *dst = (s16 *)g_nxa_mem[rr];
+    for (int i = 0; i < frames; i++) {
+      const u64 r = (g_nxa_ri + (u64)i) % NXA_RING_FRAMES;
+      dst[i * 2]     = g_nxa_ring[r * 2];
+      dst[i * 2 + 1] = g_nxa_ring[r * 2 + 1];
+    }
+    AudioOutBuffer *b = &g_nxa_buf[rr];
+    b->next        = NULL;
+    b->buffer      = g_nxa_mem[rr];
+    b->buffer_size = NXA_BUF_BYTES;
+    b->data_size   = (u64)frames * NXA_FRAME_BYTES;
+    b->data_offset = 0;
+    if (R_SUCCEEDED(audoutAppendAudioOutBuffer(b))) {
+      g_nxa_ri += (u64)frames;
+      g_nxa_append++;
+      inflight++;
+      rr = (rr + 1) % NXA_SLOTS;
+    } else {
+      svcSleepThread(1000000ULL);
+    }
+  }
+  debugPrintf("[aud320] feeder exit (appended=%u)\n", g_nxa_append);
+}
+
+/* Returns 1 on success, 0 if audout is unavailable (SDL fallback then runs). */
+static int nxa_start(int channels) {
+  if (g_nxa_up) return 1;
+  g_nxa_in_ch = (channels == 1) ? 1 : 2;
+  Result rc = audoutInitialize();
+  if (R_FAILED(rc)) {
+    debugPrintf("[aud320] audoutInitialize=0x%x -> SDL fallback\n", rc);
+    return 0;
+  }
+  if (audoutGetSampleRate() != NXA_RATE || audoutGetChannelCount() != NXA_CH)
+    debugPrintf("[aud320] WARNING audout reports %u Hz / %u ch, expected 48000/2\n",
+                audoutGetSampleRate(), audoutGetChannelCount());
+  rc = audoutStartAudioOut();
+  if (R_FAILED(rc)) {
+    debugPrintf("[aud320] audoutStartAudioOut=0x%x -> SDL fallback\n", rc);
+    audoutExit();
+    return 0;
+  }
+  for (int i = 0; i < NXA_SLOTS; i++) {
+    g_nxa_mem[i] = (u8 *)memalign(0x1000, NXA_BUF_BYTES);
+    if (!g_nxa_mem[i]) {
+      debugPrintf("[aud320] buffer alloc failed at slot %d -> SDL fallback\n", i);
+      for (int k = 0; k < i; k++) { free(g_nxa_mem[k]); g_nxa_mem[k] = NULL; }
+      audoutStopAudioOut();
+      audoutExit();
+      return 0;
+    }
+    memset(g_nxa_mem[i], 0, NXA_BUF_BYTES);
+  }
+  g_nxa_wi = g_nxa_ri = 0;
+  g_nxa_append = g_nxa_starve = 0;
+  g_nxa_up = 1;
+  rc = threadCreate(&g_nxa_th, nxa_feed, NULL, NULL, 0x8000, 0x2C, -2);
+  if (R_FAILED(rc) || R_FAILED(threadStart(&g_nxa_th))) {
+    debugPrintf("[aud320] feeder thread failed (0x%x) -> SDL fallback\n", rc);
+    g_nxa_up = 0;
+    for (int i = 0; i < NXA_SLOTS; i++) { free(g_nxa_mem[i]); g_nxa_mem[i] = NULL; }
+    audoutStopAudioOut();
+    audoutExit();
+    return 0;
+  }
+  debugPrintf("[aud320] audout sink open: 48 kHz stereo, in_ch=%d, ring=%d frames\n",
+              g_nxa_in_ch, NXA_RING_FRAMES);
+  return 1;
+}
+#endif /* __SWITCH__ */
+
 static SDL_AudioDeviceID g_fmod_dev = 0;
 static int g_fmod_dev_rate = 0;
 
-int audio_fmod_open(int rate, int channels) {
+static int fmod_sdl_open(int rate, int channels) {
   if (g_fmod_dev)
     return g_fmod_dev_rate;
   if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
@@ -604,9 +743,42 @@ int audio_fmod_open(int rate, int channels) {
   return g_fmod_dev_rate;
 }
 
+int audio_fmod_open(int rate, int channels) {
+#if defined(__SWITCH__)
+  if (nxa_start(channels)) return NXA_RATE;
+  debugPrintf("[aud320] audout unavailable, using the SDL sink\n");
+#endif
+  return fmod_sdl_open(rate, channels);
+}
+
 // Append PCM (S16, interleaved) to the device queue. Returns currently queued
 // bytes after the append, so the caller can pace itself to realtime.
 uint32_t audio_fmod_write(const void *pcm, int bytes) {
+#if defined(__SWITCH__)
+  if (g_nxa_up) {
+    const s16 *s = (const s16 *)pcm;
+    const int in_ch = g_nxa_in_ch;
+    if (!s || bytes <= 0) return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
+    const int frames = bytes / (in_ch * 2);
+    for (int i = 0; i < frames; i++) {
+      /* Full ring == the console is only this far into what we handed it, so
+       * waiting here IS the realtime pacing (what AudioTrack.write did on
+       * Android). Bounded by g_nxa_up so a dead feeder can never hang us. */
+      while (g_nxa_wi - g_nxa_ri >= NXA_RING_FRAMES) {
+        if (!g_nxa_up) break;
+        svcSleepThread(500000ULL);   /* 0.5 ms */
+      }
+      if (!g_nxa_up) break;
+      const s16 l = s[i * in_ch];
+      const s16 r = (in_ch > 1) ? s[i * in_ch + 1] : l;
+      const u64 w = g_nxa_wi % NXA_RING_FRAMES;
+      g_nxa_ring[w * 2 + 0] = l;
+      g_nxa_ring[w * 2 + 1] = r;
+      g_nxa_wi++;
+    }
+    return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
+  }
+#endif
   if (!g_fmod_dev || bytes <= 0)
     return g_fmod_dev ? SDL_GetQueuedAudioSize(g_fmod_dev) : 0;
   SDL_QueueAudio(g_fmod_dev, pcm, (Uint32)bytes);
@@ -614,6 +786,9 @@ uint32_t audio_fmod_write(const void *pcm, int bytes) {
 }
 
 uint32_t audio_fmod_queued(void) {
+#if defined(__SWITCH__)
+  if (g_nxa_up) return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
+#endif
   return g_fmod_dev ? SDL_GetQueuedAudioSize(g_fmod_dev) : 0;
 }
 
@@ -624,6 +799,9 @@ uint32_t audio_fmod_queued(void) {
  * (SDL_AUDIO_STOPPED=0), or never opened (-1). Called from the snoop thread
  * every 5s alongside audio_fmod_queued(). */
 int audio_fmod_status(void) {
+#if defined(__SWITCH__)
+  if (g_nxa_up) return 1;   /* audout running: same "playing" value the snoop line reports */
+#endif
   if (!g_fmod_dev) return -1;
   return (int)SDL_GetAudioDeviceStatus(g_fmod_dev);
 }
@@ -986,6 +1164,15 @@ uint32_t slCreateEngine(void **pEngine, uint32_t numOptions, const void *pEngine
 
 void opensles_shutdown(void) {
   opensles_movie_end();
+#if defined(__SWITCH__)
+  if (g_nxa_up) {
+    g_nxa_up = 0;
+    threadWaitForExit(&g_nxa_th);
+    threadClose(&g_nxa_th);
+    audoutStopAudioOut();
+    audoutExit();
+  }
+#endif
   if (g_dev) {
     SDL_CloseAudioDevice(g_dev);
     g_dev = 0;
