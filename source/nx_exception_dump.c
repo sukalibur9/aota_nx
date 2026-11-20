@@ -57,6 +57,13 @@
 /* The finished dump, built here by the handler and written by the dumper. */
 static char xd_buf[XD_BUF_SIZE];
 static size_t xd_len;
+/* #319: bytes of xd_buf already handed to write(). The buffer is delivered in
+ * one shot from xd_finish, but test #318 proved that shot can be lost: the
+ * handler fired, xd.log kept only the two nested-fault lines, and no dump line
+ * ever appeared -- the dumper thread never confirmed within the 2 s bound, and
+ * the re-raised svcBreak killed the process before anything else ran. Whatever
+ * prefix has been flushed is therefore never written twice. */
+static size_t xd_flushed;
 static volatile int xd_busy;   /* handler already running (reentrancy guard) */
 
 static int xd_fd = -1;         /* sdmc:/switch/aota/xd.log, opened at boot */
@@ -116,6 +123,19 @@ static void xd_write_all(int fd, const char *p, size_t len) {
   }
 }
 
+/* #319: write the not-yet-delivered tail of xd_buf to both channels and mark it
+ * delivered. Used by the dumper, by xd_finish's fallback, and by the nested-fault
+ * path (which is the only place a partial dump can still be recovered). */
+static void xd_flush_pending(void) {
+  if (xd_len <= xd_flushed) return;
+  size_t n = xd_len - xd_flushed;
+  const char *p = xd_buf + xd_flushed;
+  int dbg = debugLogFd();
+  xd_flushed = xd_len;
+  if (xd_fd >= 0) xd_write_all(xd_fd, p, n);
+  if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, p, n);
+}
+
 /* #306: boot probe. Test #305 died with debug.log stopped one line after
  * "[root] game root" and gtid.log stopped at its boot line, i.e. inside (or
  * immediately after) xd_log_init -- the very first thing main() does after the
@@ -167,10 +187,7 @@ static void xd_dumper_main(void *arg) {
       svcSleepThread(20000000ULL);
       continue;
     }
-    size_t n = xd_len;
-    int dbg = debugLogFd();
-    if (xd_fd >= 0) xd_write_all(xd_fd, xd_buf, n);
-    if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, xd_buf, n);
+    xd_flush_pending();
     eventFire(&xd_evt_done);
   }
 }
@@ -211,12 +228,15 @@ static void xd_finish(void) {
     eventFire(&xd_evt);
     /* Bounded: libnx's fs write can block behind a wedged FS session, and the
      * process must still reach svcBreak so creport fires. */
-    eventWait(&xd_evt_done, 2000000000ULL);
-  } else {
-    int dbg = debugLogFd();
-    if (xd_fd >= 0) xd_write_all(xd_fd, xd_buf, xd_len);
-    if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, xd_buf, xd_len);
+    if (R_SUCCEEDED(eventWait(&xd_evt_done, 2000000000ULL))) return;
+    /* #319: Test #318 reached this point with the dumper never confirming --
+     * most likely because the panic froze every other thread first -- and the
+     * dump was thrown away with the process. The nested-fault lines DID reach
+     * xd.log through this same fd from inside the handler, so the channel works
+     * from here even when the dumper thread is gone: write it ourselves instead
+     * of losing the only record of the fault. */
   }
+  xd_flush_pending();
 }
 
 /* libnx user exception handling: providing these symbols + the handler enables it */
@@ -282,16 +302,34 @@ static void xd_dump_range(const char *tag, uintptr_t base, size_t bytes) {
 void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   char b1[96], b2[96], b3[96];
 
-  /* #305: a fault while dumping would recurse forever; say so once, raw. */
+  /* #305: a fault while dumping would recurse forever; say so once, raw.
+   * #319: TWO ways to get here, and #318 could not tell them apart: a fault
+   * inside the dump (the first pass died part-way), or the re-raised svcBreak
+   * at the end of a completed dump coming back as a fresh user exception.
+   * Deliver the partial buffer first -- the first pass never reaches xd_finish
+   * on the fault path -- then name this pass's own context, so one run says
+   * which of the two it was and where the handler stopped. */
   if (xd_busy) {
-    static const char nested[] = "[xd] nested fault inside exception handler\n";
-    int fd = xd_fd >= 0 ? xd_fd : debugLogFd();
-    if (fd >= 0) xd_write_all(fd, nested, sizeof nested - 1);
+    if (xd_len > XD_BUF_SIZE - 192) xd_len = XD_BUF_SIZE - 192;
+    if (xd_flushed > xd_len) xd_flushed = xd_len;
+    size_t had = xd_len;
+    bs("\n[xd] ==== nested exception inside handler ====\n");
+    bs("[xd] nested desc=0x"); bhex((u64)ctx->error_desc, 0);
+    bs(" pc="); bhex(ctx->pc.x, 16);
+    bs(" lr="); bhex(ctx->lr.x, 16);
+    bs(" far="); bhex(ctx->far.x, 16);
+    bs(" esr="); bhex((u64)ctx->esr, 8);
+    bs(" sp="); bhex(ctx->sp.x, 16);
+    bs(" x0="); bhex(ctx->cpu_gprs[0].x, 16);
+    bs(" dumped="); bdec((long long)had, 0, '0', 0, 0);
+    bs("\n");
+    xd_flush_pending();
     svcBreak(BreakReason_Panic, 0, 0);
     for (;;) svcSleepThread(1000000000ULL);
   }
   xd_busy = 1;
   xd_len = 0;
+  xd_flushed = 0;
 
   u64 fault_tid = 0;
   svcGetThreadId(&fault_tid, CUR_THREAD_HANDLE);
