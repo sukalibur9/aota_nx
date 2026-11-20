@@ -1274,6 +1274,8 @@ static void *nx_jobsnoop_thread(void *arg) {
       { extern void arb310_dump(FILE *f); arb310_dump(sf); }
       /* #311: NULL message-registry entries skipped by the loop trampoline. */
       { extern void msg311_dump(FILE *f); msg311_dump(sf); }
+      /* #315: NULL registry slots compacted just before the introsort. */
+      { extern void msg315_dump(FILE *f); msg315_dump(sf); }
     }
     sleep(5);
   }
@@ -1615,6 +1617,164 @@ static void nx_msg311_install(uintptr_t ub) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Build #315: the registry array still reaches the introsort at 0xc52ff8 with
+ * NULL element pointers. Test #314 (xd.log) faulted at libunity+0xc507e8,
+ * far=0x18, esr=0x92000005 -- `ldr w8,[x0,#24]` in the comparator with x0=0
+ * and x1=0. The comparator is the introsort callback, and the sort passes the
+ * ELEMENT VALUES (c53078 `ldr x1,[x24]`, c53080 `ldr x0,[x8,#8]`), so two
+ * slots of the array were 0 while the loop at 0xc5040c had walked the array
+ * without seeing one. Dropping them at the loop head (#313) is therefore not
+ * enough: the array can hold NULLs the cursor never visits (count/capacity
+ * resize, or slots cleared after the cursor passed).
+ *
+ * So this build compacts the whole array immediately before the sort: the
+ * four words at 0xc506dc (nop / adr x3,<cmp> / mov x1,x21 / bl 0xc52ff8) are
+ * replaced by the usual ldr/br trampoline, which
+ *   - calls nx_msg315_presort(x29): clamps count to capacity, drops every NULL
+ *     element in place, zeroes the vacated tail, writes the new count back;
+ *   - reloads data/count, recomputes end = data + count*8, reloads the
+ *     comparator address (0xc507e8) and calls the STOCK introsort;
+ *   - resumes at 0xc506ec (the per-entry `str w9,[x13,#28]` index pass),
+ *     which then also cannot dereference a NULL entry.
+ * x20/x19 are already restored from the frame at 0xc506cc and stay untouched;
+ * the C helper preserves the callee-saved registers and the trampoline uses
+ * only x0-x3 and x16. The first call prints one line to debug.log (base,
+ * capacity, count before/after, dropped NULLs, the first eight NULL indices
+ * and what the #313 loop-head drop had seen); later calls only accumulate in
+ * bss, which the snoop thread prints as `[msg315]`. */
+typedef struct {
+  uintptr_t calls;
+  uintptr_t base;
+  uintptr_t size_before;
+  uintptr_t size_after;
+  uintptr_t cap;
+  uintptr_t nulls;       /* total NULL elements dropped before the sort */
+  uintptr_t head_nulls;  /* msg311_r.nulls at the first call */
+  uintptr_t head_hit;    /* msg311_r.hit   at the first call */
+  uintptr_t idx[8];      /* first eight NULL indices of the first call */
+} msg315_rec;
+__attribute__((used)) msg315_rec msg315_r;
+volatile uint64_t nx_ret_msg315_sort;   /* -> libunity+0xc52ff8 (introsort) */
+volatile uint64_t nx_ret_msg315_cmp;    /* -> libunity+0xc507e8 (comparator) */
+volatile uint64_t nx_ret_msg315_after;  /* -> libunity+0xc506ec (index pass) */
+
+__attribute__((used, noinline)) static uintptr_t nx_msg315_presort(uintptr_t hdr) {
+  if (!hdr) return 0;
+  uintptr_t a   = *(volatile uintptr_t *)hdr;
+  uintptr_t n   = *(volatile uintptr_t *)(hdr + 16);
+  uintptr_t cap = *(volatile uintptr_t *)(hdr + 24);
+  const int first = (msg315_r.calls == 0);
+  msg315_r.calls++;
+  if (first) {
+    msg315_r.base = a;
+    msg315_r.size_before = n;
+    msg315_r.cap = cap;
+    msg315_r.head_nulls = msg311_r.nulls;
+    msg315_r.head_hit = msg311_r.hit;
+    for (int i = 0; i < 8; i++) msg315_r.idx[i] = ~(uintptr_t)0;
+  }
+  if (!a) { if (first) msg315_r.size_after = 0; return 0; }
+  if (cap && n > cap) n = cap;          /* count may never exceed capacity */
+  uintptr_t w = 0, dropped = 0;
+  for (uintptr_t i = 0; i < n; i++) {
+    uintptr_t v = *(volatile uintptr_t *)(a + 8u * i);
+    if (!v) {
+      if (first && dropped < 8) msg315_r.idx[dropped] = i;
+      dropped++;
+      continue;
+    }
+    if (w != i) *(volatile uintptr_t *)(a + 8u * w) = v;
+    w++;
+  }
+  for (uintptr_t i = w; i < n; i++) *(volatile uintptr_t *)(a + 8u * i) = 0;
+  *(volatile uintptr_t *)(hdr + 16) = w;
+  msg315_r.nulls += dropped;
+  if (first) {
+    msg315_r.size_after = w;
+    debugPrintf("[msg315] pre-sort compact base=%p cap=%llu count=%llu->%llu nulls=%llu "
+                "head_null=%llu head_hit=%llu idx=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                (void *)a, (unsigned long long)cap,
+                (unsigned long long)msg315_r.size_before, (unsigned long long)w,
+                (unsigned long long)dropped,
+                (unsigned long long)msg311_r.nulls,
+                (unsigned long long)msg311_r.hit,
+                (unsigned long long)msg315_r.idx[0], (unsigned long long)msg315_r.idx[1],
+                (unsigned long long)msg315_r.idx[2], (unsigned long long)msg315_r.idx[3],
+                (unsigned long long)msg315_r.idx[4], (unsigned long long)msg315_r.idx[5],
+                (unsigned long long)msg315_r.idx[6], (unsigned long long)msg315_r.idx[7]);
+  }
+  return w;
+}
+
+__attribute__((naked)) static void nx_tramp_msg315(void) {
+  __asm__ volatile(
+    "mov x0, x29\n"                     /* array header */
+    "adrp x16, nx_msg315_presort\n"
+    "add x16, x16, :lo12:nx_msg315_presort\n"
+    "blr x16\n"
+    "ldr x2, [x29, #16]\n"              /* count after compaction */
+    "ldr x0, [x29]\n"                   /* data */
+    "add x1, x0, x2, lsl #3\n"          /* end */
+    "adrp x16, nx_ret_msg315_cmp\n"
+    "ldr x3, [x16, :lo12:nx_ret_msg315_cmp]\n"
+    "adrp x16, nx_ret_msg315_sort\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg315_sort]\n"
+    "blr x16\n"                         /* displaced stock 0xc506e8 */
+    "adrp x16, nx_ret_msg315_after\n"
+    "ldr x16, [x16, :lo12:nx_ret_msg315_after]\n"
+    "br x16\n"                          /* -> 0xc506ec */
+  );
+}
+
+/* snoop thread only (plain fprintf on its own FILE*, never debugPrintf). */
+void msg315_dump(FILE *f) {
+  if (!f || !msg315_r.calls) return;
+  fprintf(f, "[msg315] pre-sort calls=%llu base=0x%llx cap=%llu count=%llu->%llu "
+             "nulls=%llu head_null=%llu head_hit=%llu idx=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          (unsigned long long)msg315_r.calls,
+          (unsigned long long)msg315_r.base,
+          (unsigned long long)msg315_r.cap,
+          (unsigned long long)msg315_r.size_before,
+          (unsigned long long)msg315_r.size_after,
+          (unsigned long long)msg315_r.nulls,
+          (unsigned long long)msg315_r.head_nulls,
+          (unsigned long long)msg315_r.head_hit,
+          (unsigned long long)msg315_r.idx[0], (unsigned long long)msg315_r.idx[1],
+          (unsigned long long)msg315_r.idx[2], (unsigned long long)msg315_r.idx[3],
+          (unsigned long long)msg315_r.idx[4], (unsigned long long)msg315_r.idx[5],
+          (unsigned long long)msg315_r.idx[6], (unsigned long long)msg315_r.idx[7]);
+  fflush(f);
+}
+
+#define NX_MSG315_VA 0xc506dcu
+
+static void nx_msg315_install(uintptr_t ub) {
+  static const uint32_t exp[4] = { 0xd503201fu, 0x10000843u, 0xaa1503e1u, 0x94000a44u };
+  uint32_t cur[4];
+  for (int i = 0; i < 4; i++)
+    cur[i] = *(volatile uint32_t *)(ub + NX_MSG315_VA + 4u * (uint32_t)i);
+  if (memcmp(cur, exp, sizeof cur) != 0) {
+    debugPrintf("[msg315] SKIP: pre-sort mismatch (have 0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                cur[0], cur[1], cur[2], cur[3]);
+    return;
+  }
+  nx_ret_msg315_sort  = ub + 0xc52ff8u;
+  nx_ret_msg315_cmp   = ub + 0xc507e8u;
+  nx_ret_msg315_after = ub + 0xc506ecu;
+  uint32_t patch[4] = {
+    0x58000050u,  /* ldr x16, [pc, #8] */
+    0xd61f0200u,  /* br x16 */
+    (uint32_t)(uintptr_t)nx_tramp_msg315,
+    (uint32_t)((uintptr_t)nx_tramp_msg315 >> 32),
+  };
+  so_patch_code((void *)(ub + NX_MSG315_VA), patch, sizeof patch);
+  debugPrintf("[msg315] hooked pre-sort @ %p -> tramp %p sort %p cmp %p after %p\n",
+              (void *)(ub + NX_MSG315_VA), (void *)nx_tramp_msg315,
+              (void *)nx_ret_msg315_sort, (void *)nx_ret_msg315_cmp,
+              (void *)nx_ret_msg315_after);
+}
+
+/* ---------------------------------------------------------------------------
  * In-memory libunity patch (ported from VLN's nx_patch_unity_regions): the SD
  * card now ships the STOCK libunity.so and the boot patches it after load,
  * instead of distributing a pre-modified binary. 23 instruction words, from a
@@ -1727,6 +1887,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   nx_jobcount_install(ub);   /* Build #120: hook job push/schedule/complete entries */
   nx_guard155_install(ub);   /* Build #155: guard trampoline (AFTER branch forces) */
   nx_msg311_install(ub);     /* Build #311/#313: drop NULL message-registry entries */
+  nx_msg315_install(ub);     /* Build #315: compact the array right before the sort */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
