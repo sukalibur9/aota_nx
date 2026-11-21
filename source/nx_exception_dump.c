@@ -123,6 +123,18 @@ static void xd_write_all(int fd, const char *p, size_t len) {
   }
 }
 
+/* #324: commit the bytes, do not just queue them. Test #323 crashed with the
+ * handler's own svcBreak and xd.log holding ONLY the boot probes: not one
+ * "[xd] USER EXCEPTION" line -- while #320's identical report kept the whole
+ * dump. The dump is written to an fd that is never closed (the process breaks),
+ * so on FAT the directory entry can still carry the old size and the tail is
+ * lost with the cache. fsync after every flush makes the next crash readable. */
+static void xd_sync(void) {
+  int dbg = debugLogFd();
+  if (xd_fd >= 0) fsync(xd_fd);
+  if (dbg >= 0 && dbg != xd_fd) fsync(dbg);
+}
+
 /* #319: write the not-yet-delivered tail of xd_buf to both channels and mark it
  * delivered. Used by the dumper, by xd_finish's fallback, and by the nested-fault
  * path (which is the only place a partial dump can still be recovered). */
@@ -134,6 +146,7 @@ static void xd_flush_pending(void) {
   xd_flushed = xd_len;
   if (xd_fd >= 0) xd_write_all(xd_fd, p, n);
   if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, p, n);
+  xd_sync();   /* #324: queue is not delivery -- commit before we break */
 }
 
 /* #306: boot probe. Test #305 died with debug.log stopped one line after
@@ -345,6 +358,10 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   bs(" sp="); bhex(ctx->sp.x, 16);
   bs(" fp="); bhex(ctx->fp.x, 16);
   bs("\n");
+  /* #324: deliver the beacon (tid/desc/pc/lr/far/esr/sp/fp) to disk BEFORE the
+   * long dump. Test #323 lost the entire dump, so the fault identity must not
+   * depend on the rest of this function or on the dumper thread surviving. */
+  xd_flush_pending();
   for (int i = 0; i < 28; i += 4) {
     bs("[xd] x"); bdec(i, 2, ' ', 0, 1); bs(" ");
     bhex(ctx->cpu_gprs[i].x, 16);
@@ -503,6 +520,7 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   bs("[xd] ============== END EXCEPTION DUMP ==============\n");
 
   xd_finish();
+  xd_sync();   /* #324: same reason -- the tail must exist before svcBreak */
 
   /* re-raise so the process still aborts and Atmosphere writes its report */
   svcBreak(BreakReason_Panic, 0, 0);
