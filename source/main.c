@@ -1923,6 +1923,77 @@ static void nx_msg317_install(uintptr_t ub) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Build #322: the #320/#321 crash is a NULL internal-error shader.
+ *
+ * Test #321 reproduced #320 exactly (pc=libunity+0x11f2fd0, far=0x30, x0=0,
+ * tid=3024 Unity Main Thread, identical stack), so it is deterministic, not the
+ * boot-time log volume #321 was testing. 0x11f2fd0 is a two-word getter,
+ * `ldr x0,[x0,#48]; ret` -- field 0x30 of `this` -- and its only caller in the
+ * backtrace is 0xe72fcc:
+ *
+ *   e72fe0  add x0, x0, #0x30    ; lock the material's shader slot
+ *   e72fe4  bl  0x7c4a50
+ *   e72fe8  mov x20, x0
+ *   e72fec  mov x21, x0
+ *   e72ff0  cbnz x0, 0xe72ffc    ; slot already has an object -> use it
+ *   e72ff4  bl  0x11f2ecc        ; else GetOrCreateInternalErrorShader()
+ *   e72ff8  mov x21, x0
+ *   e72ffc  mov x0, x21
+ *   e73000  bl  0x11f2fd0        ; ldr x0,[x0,#48]   <-- faults on NULL
+ *   e73004  cbz x0, 0xe7311c     ; Unity's OWN null check, one step too late
+ *
+ * 0x11f2ecc is the lazy internal-error shader: it packs the descriptor
+ * {0x1b11e4, 27} and calls 0xe2f908. The three bytes at 0x1b11e4 are
+ * "Internal-ErrorShader.shader" (27 chars), and `str x0,[x19,#1544]` caches the
+ * result -- including a NULL. This run's log shows exactly that failure right
+ * before the fault, in both crashing builds and in neither earlier one:
+ *
+ *   Unity: The resource Internal-ErrorShader.shader could not be loaded
+ *          from the resource file!   (x3)
+ *
+ * So 0xe72fcc hands a NULL argument to the getter four bytes before the
+ * instruction that would have coped with a NULL result. x0 == x21 at
+ * 0xe72ffc on BOTH incoming paths (the cbnz path never touched either, and the
+ * create path just did `mov x21, x0`), so the `mov x0, x21` can become the
+ * missing check while the non-null path stays bit-for-bit identical:
+ *
+ *   cbz x21, 0xe7311c           ; 0xb4000915
+ *
+ * 0xe7311c is a plain epilogue (ldp x20,x19 / ldp x22,x21 / ldp x24,x23 /
+ * ldr x30,[sp],#64 / ret) that returns x0 (still 0) -- the exact state the
+ * stock `cbz x0,0xe7311c` produces when the shader is missing. Verify-first:
+ * the three words at 0xe72ffc are compared before anything is written.
+ *
+ * This does not conjure the missing shader; it makes the engine take the
+ * failure path it already implements instead of faulting on it. The next log
+ * shows whether the run survives without that fallback -- and if it does not,
+ * which site it reaches next.
+ * ------------------------------------------------------------------------- */
+#define NX_ERRS322_VA 0xe72ffcu
+
+static void nx_errs322_install(uintptr_t ub) {
+  static const uint32_t exp[3] = { 0xaa1503e0u, 0x940dfff4u, 0xb40008c0u };
+  static const uint32_t guarded[3] = { 0xb4000915u, 0x940dfff4u, 0xb40008c0u };
+  uint32_t cur[3];
+  for (int i = 0; i < 3; i++)
+    cur[i] = *(volatile uint32_t *)(ub + NX_ERRS322_VA + 4u * (uint32_t)i);
+  if (memcmp(cur, guarded, sizeof cur) == 0) {
+    debugPrintf("[errs322] guard @%p already applied -- ok\n",
+                (void *)(ub + NX_ERRS322_VA));
+    return;
+  }
+  if (memcmp(cur, exp, sizeof cur) != 0) {
+    debugPrintf("[errs322] SKIP: mismatch (have 0x%08x 0x%08x 0x%08x)\n",
+                cur[0], cur[1], cur[2]);
+    return;
+  }
+  uint32_t w = guarded[0];
+  so_patch_code((void *)(ub + NX_ERRS322_VA), &w, sizeof w);
+  debugPrintf("[errs322] guard @%p: cbz x21 -> 0x%x (no Internal-ErrorShader)\n",
+              (void *)(ub + NX_ERRS322_VA), (unsigned)(ub + 0xe7311cu));
+}
+
+/* ---------------------------------------------------------------------------
  * In-memory libunity patch (ported from VLN's nx_patch_unity_regions): the SD
  * card now ships the STOCK libunity.so and the boot patches it after load,
  * instead of distributing a pre-modified binary. 23 instruction words, from a
@@ -2037,6 +2108,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   nx_msg311_install(ub);     /* Build #311/#313: drop NULL message-registry entries */
   nx_msg315_install(ub);     /* Build #315: compact the array right before the sort */
   nx_msg317_install(ub);     /* Build #317: skip set() with idx<0 / no array */
+  nx_errs322_install(ub);    /* Build #322: take the null branch for a missing error shader */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
