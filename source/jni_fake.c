@@ -706,6 +706,156 @@ static void proxy_invoke(void *proxy, void *cls, void *method, void *args) {
 static void proxy_run_runnable(void *runnable) {
   proxy_invoke(runnable, intern_class("java/lang/Runnable"), get_id("java/lang/Runnable", "run", "()V", 0), (void *)0);
 }
+
+/* ---------------------------------------------------------------------------
+ * #325: Unity's own startup gate -- "Your device does not match the hardware
+ * requirements of this application."
+ *
+ * Test #324 finally named the black screen: the error dialog is built from
+ * inside the FIRST nativeRender (right after the Internal-ErrorShader loads),
+ * through UnityPlayer.setTitle/setMessage. #322 had the very same pair, so this
+ * is not new: every build since then has been parking on it. Both methods were
+ * UNMATCHED and returned null, so nothing was ever shown and the engine went on
+ * to wait (the `[cond] WAIT ... Unity Main Thread` that follows) for a decision
+ * that could never arrive. Frame 0 then never returns -> black screen, no crash.
+ *
+ * So answer the whole dialog family instead of null: a builder that accepts its
+ * setters, an AlertDialog for create(), and show() pressing the affirmative
+ * button (Continue/OK) through the OnClickListener proxy that Unity itself
+ * created just before the dialog. Everything is logged with [dlg325], so the
+ * next test shows the real button labels and whether the press releases the
+ * engine.
+ * ------------------------------------------------------------------------- */
+static void *g_dlg325_builder = NULL;
+static void *g_dlg325_dialog  = NULL;
+static void *g_dlg325_listener[3];              /* positive, negative, neutral */
+static char  g_dlg325_btn[3][40];
+static int   g_dlg325_pressed = -1;
+
+static void *dlg325_builder_obj(void) {
+  if (!g_dlg325_builder)
+    g_dlg325_builder = jni_make_object("android/app/AlertDialog$Builder");
+  return g_dlg325_builder;
+}
+static void *dlg325_dialog_obj(void) {
+  if (!g_dlg325_dialog)
+    g_dlg325_dialog = jni_make_object("android/app/AlertDialog");
+  return g_dlg325_dialog;
+}
+/* Case-insensitive substring without relying on strcasestr in newlib. */
+static int dlg325_has_ci(const char *hay, const char *needle) {
+  if (!hay || !needle || !needle[0]) return 0;
+  for (const char *p = hay; *p; p++) {
+    const char *a = p, *b = needle;
+    while (*a && *b) {
+      char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+      char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+      if (ca != cb) break;
+      a++; b++;
+    }
+    if (!*b) return 1;
+  }
+  return 0;
+}
+static const char *dlg325_str(void *s) {
+  if (s && *(uint32_t *)s == TAG_STRING) return ((FakeString *)s)->utf;
+  return "";
+}
+/* Method id the peer will accept for onClick: reuse whatever id the engine
+ * already minted for this (name,sig), whatever class label it used -- the
+ * bridge compares methodIDs by pointer. */
+static FakeID *dlg325_id_any(const char *name, const char *sig) {
+  for (int i = 0; i < id_count; i++)
+    if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig))
+      return &id_pool[i];
+  return get_id("android/content/DialogInterface$OnClickListener", name, sig, 0);
+}
+static void dlg325_press(void) {
+  if (g_dlg325_pressed >= 0) return;
+  int pick = -1;
+  for (int i = 0; i < 3 && pick < 0; i++) {
+    const char *t = g_dlg325_btn[i];
+    if (!t[0]) continue;
+    if (dlg325_has_ci(t, "continue") || dlg325_has_ci(t, "ok") ||
+        dlg325_has_ci(t, "yes") || dlg325_has_ci(t, "ignore") ||
+        dlg325_has_ci(t, "retry")) pick = i;
+  }
+  if (pick < 0)
+    for (int i = 0; i < 3 && pick < 0; i++) {
+      const char *t = g_dlg325_btn[i];
+      if (t[0] && !dlg325_has_ci(t, "abort") && !dlg325_has_ci(t, "quit") &&
+          !dlg325_has_ci(t, "exit") && !dlg325_has_ci(t, "cancel")) pick = i;
+    }
+  if (pick < 0 && g_dlg325_btn[0][0]) pick = 0;
+  if (pick < 0) {
+    debugPrintf("[dlg325] show: no button recorded -> nothing to press\n");
+    return;
+  }
+  void *listener = g_dlg325_listener[pick];
+  debugPrintf("[dlg325] show: press '%s' (idx %d) listener=%p\n",
+              g_dlg325_btn[pick], pick, listener);
+  g_dlg325_pressed = pick;
+  if (!listener) return;
+  void *args = j_NewObjectArray(fake_env, 2, (void *)0, (void *)0);
+  FakeObjArray *fa = args;
+  if (fa && fa->tag == TAG_OBJARR) {
+    fa->items[0] = dlg325_dialog_obj();
+    fa->items[1] = jni_make_object("java/lang/Integer");
+  }
+  proxy_invoke(listener, intern_class("android/content/DialogInterface$OnClickListener"),
+               dlg325_id_any("onClick", "(Landroid/content/DialogInterface;I)V"), args);
+}
+/* Returns 1 when the call belonged to the dialog family (and sets *out). */
+static int dlg325_object(void *recv, const FakeID *id, va_list va, void **out) {
+  const char *n = id->name;
+  *out = NULL;
+  if (!strcmp(n, "setTitle") || !strcmp(n, "setMessage") ||
+      strstr(n, "Button") || strstr(n, "ChoiceItems") ||
+      !strcmp(n, "setIcon") || !strcmp(n, "setView") ||
+      !strcmp(n, "setItems") || !strcmp(n, "setAdapter") ||
+      !strcmp(n, "setCancelable") || !strcmp(n, "setCanceledOnTouchOutside") ||
+      !strcmp(n, "setOnCancelListener") || !strcmp(n, "setOnDismissListener") ||
+      !strcmp(n, "setInverseBackgroundForced")) {
+    char text[80] = "";
+    void *listener = NULL;
+    if (strstr(id->sig, "Ljava/lang/CharSequence;"))
+      snprintf(text, sizeof text, "%s", dlg325_str(va_arg(va, void *)));
+    if (strstr(id->sig, "$OnClickListener;"))
+      listener = va_arg(va, void *);
+    int idx = strcmp(n, "setPositiveButton") == 0 ? 0 :
+              strcmp(n, "setNegativeButton") == 0 ? 1 :
+              strcmp(n, "setNeutralButton")  == 0 ? 2 : -1;
+    if (idx >= 0) {
+      snprintf(g_dlg325_btn[idx], sizeof g_dlg325_btn[idx], "%s", text);
+      g_dlg325_listener[idx] = listener;
+      debugPrintf("[dlg325] %s(\"%s\", listener=%p) -> builder\n", n, text, listener);
+    } else {
+      debugPrintf("[dlg325] %s(\"%.60s\") -> builder\n", n, text);
+    }
+    *out = dlg325_builder_obj();
+    return 1;
+  }
+  if (!strcmp(n, "create") && sig_returns(id->sig, "Landroid/app/AlertDialog;")) {
+    debugPrintf("[dlg325] create -> AlertDialog %p\n", (void *)dlg325_dialog_obj());
+    *out = dlg325_dialog_obj();
+    return 1;
+  }
+  return 0;
+}
+/* Void half: show()/dismiss() live here. */
+static void dlg325_void(void *recv, const FakeID *id, va_list va) {
+  (void)recv; (void)va;
+  if (!g_dlg325_builder) return;   /* no dialog family in play: not ours */
+  if (!strcmp(id->name, "show")) {
+    debugPrintf("[dlg325] show cls=%s recv=%p\n", id->cls, recv);
+    dlg325_press();
+    return;
+  }
+  if (!strcmp(id->name, "dismiss") || !strcmp(id->name, "cancel") ||
+      !strcmp(id->name, "hide")) {
+    debugPrintf("[dlg325] %s\n", id->name);
+  }
+}
 /* Message.sendToTarget(): the factory's HandlerThread never pumps its Looper, so the
    message is never delivered to callback.handleMessage(msg). Deliver it ourselves to
    the most-recently created proxy (the Handler$Callback the factory just built). */
@@ -1667,6 +1817,7 @@ static const char *recv_class(void *recv){
 
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   log_app_upcall(id);
+  { void *dlg; if (dlg325_object(recv, id, va, &dlg)) return dlg; }   /* #325 */
 
   /* Build #98: trace all JNI method calls (deduplicated). Unity stalls after
    * basic GL init (build #97: 0 eglSwapBuffers, main "running" but no frame
@@ -1985,6 +2136,7 @@ static float dispatch_float(void *recv, const FakeID *id, va_list va) {
 #define AUD284_QUEUE_CAP_B (8u * 1024u * 1024u)
 static void dispatch_void(void *recv, const FakeID *id, va_list va) {
   log_app_upcall(id);
+  dlg325_void(recv, id, va);   /* #325: show()/dismiss() of the startup dialog */
   /* [aud143] org/fmod/AudioDevice write/close: FMOD's native output thread
    * hands us a jshortArray it created and filled through this same fake
    * env (NewShortArray + SetShortArrayRegion -> FakePriArray), so the PCM
