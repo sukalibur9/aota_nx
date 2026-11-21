@@ -641,7 +641,15 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * 512th, so a new deadlock still shows up as a trend in the log. */
       static unsigned swait;
       const int cur_val = *uaddr;
-      const int show = (swait < 300) || ((swait & 511) == 0);
+      /* #321: test #320 crashed with frame=0 during Unity's built-in resource
+       * load, before the audio sink was ever opened -- and every run that
+       * booted (b317/b318/b319) produced this trace at full volume during
+       * boot. Keep #320's volume cut only once the render loop is running;
+       * the boot phase prints exactly as it did in the runs that worked, so
+       * this build tests one variable: whether the boot-time trace volume
+       * (and the timing it imposes) is what changed. */
+      const int show = !g_in_render_loop ||
+                       (swait < 300) || ((swait & 511) == 0);
       if (show && (uaddr != last_logged_ua || cur_val != last_logged_val)) {
         debugPrintf("[futex] SLOT-WAIT ua=%p slot=%d gen=%llu refcount=%d tid=%d caller=%p val=%d\n",
                     (void *)uaddr, slot_idx, (unsigned long long)s->gen,
@@ -894,7 +902,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
        * printed for every wake to an address with waiters -- 3,000+ lines in
        * test #319). First 100, then every 1024th. */
       futex_slot_t *chk = futex_slot_find(uaddr);
-      if (wake_logged <= 100 || (wake_logged & 1023) == 0) {
+      if (!g_in_render_loop || wake_logged <= 100 || (wake_logged & 1023) == 0) {
         debugPrintf("[futex] WAKE#%d ua=%p n=%d tid=%d caller=%p %s\n",
                     wake_logged, (void *)uaddr, val, gettid_fake(),
                     __builtin_return_address(0),
@@ -918,7 +926,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       /* #320: gate this too -- it printed on every single wake in test #319
        * (3,000+ lines, all for one address). First 200, then every 512th. */
       static unsigned swake;
-      if (swake < 200 || (swake & 511) == 0)
+      if (!g_in_render_loop || swake < 200 || (swake & 511) == 0)
         debugPrintf("[futex] SLOT-WAKE ua=%p slot=%d gen %llu->%llu refcount=%d tid=%d\n",
                     (void *)uaddr, slot_idx,
                     (unsigned long long)gen_before, (unsigned long long)s->gen,
