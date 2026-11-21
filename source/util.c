@@ -83,7 +83,42 @@ int debugPrintf(char *text, ...) {
       if (mutexTryLock(&g_log_lock)) { got = 1; break; }
       svcSleepThread(0);  /* yield: let the holder run */
     }
-    if (!got) return 0;  /* lock wedged: drop this line, keep running */
+    if (!got) {
+      /* Build #326: never go blind again. Test #325's debug.log stopped in the
+       * middle of asset loading (1647 lines, last one an apk314 read that has no
+       * completion) while the lock-free xd.log kept recording stage markers all
+       * the way to stage:render0-call -- and sentinel.log, which prints through
+       * this function, stopped at n=5. So g_log_lock had been wedged (the GC
+       * suspends threads with pthread_kill; a thread frozen between try-lock and
+       * unlock keeps it forever) and every later line of that run was dropped
+       * silently. Keep the drop decision, but park the line in a separate fd so
+       * the run still has a log. No lock here on purpose: this is the path taken
+       * *when* the lock is unusable. */
+      static int alt_fd = -1;
+      if (alt_fd < 0) {
+        alt_fd = open(game_path("drop.log"),
+                      O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (alt_fd >= 0) {
+          const char *hdr =
+            "[drop326] debug.log lock wedged: the lines below could not go there\n";
+          ssize_t hw = write(alt_fd, hdr, strlen(hdr));
+          (void)hw;
+        }
+      }
+      if (alt_fd >= 0) {
+        char alt[1024];
+        va_list list2;
+        va_start(list2, text);
+        int n2 = vsnprintf(alt, sizeof alt, text, list2);
+        va_end(list2);
+        if (n2 > 0) {
+          if (n2 > (int)sizeof alt - 1) n2 = (int)sizeof alt - 1;
+          ssize_t w2 = write(alt_fd, alt, (size_t)n2);
+          (void)w2;
+        }
+      }
+      return 0;
+    }
   }
   /* #303: raw fd + one write() per line, NOT stdio. b302's watchdog caught the
    * main thread blocked in

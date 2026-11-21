@@ -1994,6 +1994,60 @@ static void nx_errs322_install(uintptr_t ub) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Build #326: silence PlayerInitEngineGraphics' advisory "hardware" dialog.
+ *
+ * Test #324 finally showed what the black screen was waiting on: a JNI dialog
+ * titled "Error" with the message "Your device does not match the hardware
+ * requirements of this application." built from inside the first nativeRender.
+ * The message is a single literal in libunity.so (vaddr 0xfff58) and the code
+ * that passes it to the error reporter is one site, at 0x11088b8, inside
+ * PlayerInitEngineGraphics:
+ *
+ *   11088a0  mov  w0, wzr
+ *   11088a4  bl   0xe35d9c        ; w0 = GPU-supported?
+ *   11088a8  tbnz w0, #0, 0x11088d4 ; supported: skip the dialog
+ *   11088ac  "Error" / "Your device does not match ..." -> 0x1123b9c
+ *   11088c8  bl   0x10e337c
+ *   11088cc  add  x0, x0, #0x68
+ *   11088d0  bl   0x10e72d4        ; build + show the dialog (blocks)
+ *   11088d4  "PlayerInitEngineGraphics OK" -- the SAME continuation
+ *
+ * So Unity treats this check as advisory: both arms meet again at 0x11088d4 and
+ * the engine prints "PlayerInitEngineGraphics OK" either way. Only the modal
+ * dialog in between can stop it, and on this port it always does -- our Java
+ * alert-dialog side hands back null, so nothing is displayed and the main
+ * thread parks in a condition wait for a button that can never be pressed.
+ *
+ * The fix is therefore not a capability guess but the branch Unity itself takes
+ * when the check passes: turn the conditional `tbnz` at 0x11088a8 into the
+ * unconditional `b 0x11088d4`. Nothing else in the function changes and the
+ * genuinely fatal "Unable to initialize the Unity Engine." path (0x11087a8) is
+ * deliberately left alone. Verify-first: the exact stock word is checked
+ * before anything is written.
+ * ------------------------------------------------------------------------- */
+#define NX_GPU326_VA 0x11088a8u
+
+static void nx_gpu326_install(uintptr_t ub) {
+  const uint32_t exp    = 0x37000160u;  /* tbnz w0, #0, 0x11088d4 */
+  const uint32_t to     = 0x1400000bu;  /* b         0x11088d4    */
+  volatile uint32_t *p = (volatile uint32_t *)(ub + NX_GPU326_VA);
+  uint32_t cur = *p;
+  if (cur == to) {
+    debugPrintf("[gpu326] skip-dialog @%p already applied -- ok\n",
+                (void *)(ub + NX_GPU326_VA));
+    return;
+  }
+  if (cur != exp) {
+    debugPrintf("[gpu326] SKIP: mismatch @%p (have 0x%08x want 0x%08x)\n",
+                (void *)(ub + NX_GPU326_VA), cur, exp);
+    return;
+  }
+  so_patch_code((void *)(ub + NX_GPU326_VA), &to, sizeof to);
+  debugPrintf("[gpu326] hardware-check dialog skipped @%p: 0x%08x -> 0x%08x (b 0x%x)\n",
+              (void *)(ub + NX_GPU326_VA), cur, to, (unsigned)(ub + 0x11088d4u));
+}
+
+/* ---------------------------------------------------------------------------
  * In-memory libunity patch (ported from VLN's nx_patch_unity_regions): the SD
  * card now ships the STOCK libunity.so and the boot patches it after load,
  * instead of distributing a pre-modified binary. 23 instruction words, from a
@@ -2109,6 +2163,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   nx_msg315_install(ub);     /* Build #315: compact the array right before the sort */
   nx_msg317_install(ub);     /* Build #317: skip set() with idx<0 / no array */
   nx_errs322_install(ub);    /* Build #322: take the null branch for a missing error shader */
+  nx_gpu326_install(ub);     /* Build #326: skip the advisory hardware-check dialog */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
 }
