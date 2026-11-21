@@ -514,6 +514,33 @@ static void snapshot_thread(DiagThread *t) {
    * sync shims, where a pause cannot land in the middle of an fs request. */
   if (t->wait_kind == DIAG_W_NONE) return;
 
+  /* #323: never pause the MAIN thread. #304 lost a whole boot to one pause that
+   * landed inside an fs IPC request; and the main thread's location is exactly
+   * what is unknown at a frame-0 stall (b322: xd.log has stage:render0-call but
+   * not render0-returned). Read its context WITHOUT pausing: a thread parked in
+   * a syscall (futex/condvar) is not running, and svcGetThreadContext3 answers
+   * for it; a failed read means it is executing userspace code, which is itself
+   * the answer we need (engine code, not one of our shims). The raw mirror is
+   * written BEFORE debugPrintf, so a wedged stdio lock cannot eat the record. */
+  if (strstr(t->name, "Main")) {
+    ThreadContext mctx;
+    Result mgr = svcGetThreadContext3(&mctx, t->handle);
+    g_dump_len = 0; g_dump_buf[0] = 0;
+    if (R_FAILED(mgr))
+      dump_emit("[wd] snap %s: no context rc=0x%x -- RUNNING userspace code "
+                "(not parked in a syscall)\n", t->name[0] ? t->name : "?", mgr);
+    else {
+      dump_emit("[wd] snap %s: context read WITHOUT pausing (parked in a syscall)\n",
+                t->name[0] ? t->name : "?");
+      g_scan_stack = 1;
+      dump_thread_context(t->name[0] ? t->name : "?", &mctx);
+      g_scan_stack = 0;
+    }
+    wd290_write_raw(g_dump_buf, g_dump_len);
+    debugPrintf("%s", g_dump_buf);
+    return;
+  }
+
   ThreadContext ctx;
   /* #292: if the dump hangs, the last marker names the thread it hung on. */
   wd290_log("[wd] snap %s tid=%llu: pause...\n", t->name[0] ? t->name : "?",

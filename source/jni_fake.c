@@ -925,6 +925,25 @@ void kbd_push_result(const char *text, int cancelled) {
   else           { if (g_u_softClosed) ((fn_v)g_u_softClosed)(fake_env, cls); }
 }
 static void *act_object(const FakeID *id, va_list va) {
+  /* #323: this build reaches libunity's Android dialog builder exactly once
+   * during frame 0 (JNI: UnityPlayer.setTitle / .setMessage) and every call in
+   * the chain answers null, so no dialog can exist and nothing can dismiss it.
+   * libunity dispatches that dialog block indirectly (no bl reaches it), so the
+   * TEXT is the only thing that names which code path -- and which failure --
+   * wants a box on screen. Record it through xd_stage as well: in #322's log the
+   * tail is gone by this point, and xd_stage writes its own fsynced raw fd, so a
+   * wedged stdio lock cannot lose the one line that matters. */
+  if (!strcmp(id->name, "setTitle") || !strcmp(id->name, "setMessage") ||
+      !strcmp(id->name, "setPositiveButton") || !strcmp(id->name, "setNegativeButton")) {
+    extern void xd_stage(const char *tag);
+    const char *s = first_string_arg(id->sig, va);
+    if (!s) s = "";
+    debugPrintf("[dlg323] %s.%s(\"%s\")\n", id->cls, id->name, s);
+    char tag[96];
+    snprintf(tag, sizeof tag, "dlg323 %s.%s [%.40s]", id->cls, id->name,
+             s[0] ? s : "(none)");
+    xd_stage(tag);
+  }
   if (g_kbd_trace) { g_kbd_trace--;
     debugPrintf("[kbd] after-kbd obj call: %s.%s sig=%s\n",
                 id->cls[0] ? id->cls : "?", id->name[0] ? id->name : "?",
