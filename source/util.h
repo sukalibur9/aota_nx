@@ -43,6 +43,13 @@ void cpu_boost(int on);
 int ret0(void);
 int retm1(void);
 
+/* #329: the flusher's progress counters. A producer-visible "bytes queued"
+ * value and the number of completed SD writes tell an outside witness whether
+ * the log path died (queued climbing, seq frozen) or merely went quiet. */
+unsigned long log_flush_seq(void);
+unsigned long log_ring_queued(void);
+unsigned long log_dropped_lines(void);
+
 /* Point TPIDR_EL0 at a zeroed per-thread block so the engine's stack-protector
  * prologues (which read the canary from TPIDR_EL0+0x28) have a valid, stable
  * bionic TLS. `buf` must outlive the thread. libnx keeps its own thread state in

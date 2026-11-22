@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <fcntl.h>  /* #329: open() for the base.apk verification read */
 #include <zlib.h>   /* [apk169] inflate for zip-deflate + gzip (linked: -lz) */
 #include <switch.h>
 #include <SDL2/SDL.h>
@@ -3503,11 +3504,70 @@ static void apk169_scan(void) {
               apk169_files, apk169_bytes, apk169_inflated, apk169_matches, apk169_logged);
 }
 
+/* ================= #329: verify base.apk is readable end to end ==========
+ * Test #328 died ~0.4 s into nativeRender frame 0, on the first read of
+ * sdmc:/switch/aota/base.apk. From that request on every fs channel in the
+ * process (debug.log, wd290.log, sentinel.log, alive.log) went silent at once,
+ * which is what ONE unanswered request on the shared fs session looks like:
+ * everything issued afterwards queues behind it forever. The offsets differ
+ * per run (#325 194 MB, #327 358 MB, #326 563 MB, #328 the 22-byte zip EOCD at
+ * the very end), and #319 read the same file hundreds of times and rendered 44
+ * frames, so nothing here is a fixed bad region -- which is exactly why this
+ * build separates the two candidates before touching the engine path again.
+ *
+ * It reads the whole file once, single-threaded, with a plain newlib fd and a
+ * page-aligned 1 MB buffer -- the most boring read the port can make -- prints
+ * a checkpoint every 64 MB, and finishes with a word sum so the PC-side copy
+ * can be compared against the console's. The log tail (now fsynced once a
+ * second by the #328 flusher) then says which case we are in:
+ *   stops mid-file at a named offset -> the SD copy / card / fs, not the engine
+ *   the whole 636 MB reads fine      -> the engine's read path or the
+ *                                       concurrency around it. */
+static void apk329_verify(const char *path, long long sz) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) { debugPrintf("[apk329] open failed -> %d\n", fd); return; }
+  const size_t chunk = 1u << 20;
+  unsigned char *buf = memalign(0x1000, chunk);
+  if (!buf) { debugPrintf("[apk329] buffer alloc failed\n"); close(fd); return; }
+  unsigned long long total = 0, sum = 0;
+  unsigned long long mark = 64ull << 20;
+  uint64_t t0 = armGetSystemTick();
+  debugPrintf("[apk329] verifying base.apk: %lld bytes, 1 MB chunks, checkpoint every 64 MB\n", sz);
+  for (;;) {
+    long r = read(fd, buf, chunk);
+    if (r < 0) { debugPrintf("[apk329] READ ERROR at %llu -> %ld\n", total, r); break; }
+    if (r == 0) break;
+    {   /* word-wise sum: cheap, and one wrong word is enough to show up */
+      long i = 0;
+      for (; i + 8 <= r; i += 8) {
+        unsigned long long w;
+        memcpy(&w, buf + i, 8);
+        sum += w;
+      }
+      for (; i < r; i++) sum += (unsigned long long)buf[i];
+    }
+    total += (unsigned long long)r;
+    if (total >= mark || (long long)total == sz) {
+      debugPrintf("[apk329] read %llu/%lld MB, %llu ms\n",
+                  total >> 20, sz >> 20,
+                  (unsigned long long)(armTicksToNs(armGetSystemTick() - t0) / 1000000ull));
+      mark += 64ull << 20;
+    }
+  }
+  debugPrintf("[apk329] verify %s: %llu of %lld bytes, sum=%016llx, %llu ms\n",
+              total == (unsigned long long)sz ? "COMPLETE" : "SHORT",
+              total, sz, sum,
+              (unsigned long long)(armTicksToNs(armGetSystemTick() - t0) / 1000000ull));
+  free(buf);
+  close(fd);
+}
+
 static void nx_build_base_apk(void) {
   struct stat st;
   if (stat(game_path("base.apk"), &st) == 0 && st.st_size > 0) {
     debugPrintf("[apk138] base.apk present (%lld bytes)\n",
                 (long long)st.st_size);
+    apk329_verify(game_path("base.apk"), (long long)st.st_size);
     return;
   }
   if (!asset_pack_active()) {

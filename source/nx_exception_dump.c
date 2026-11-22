@@ -50,6 +50,7 @@
 #include <unistd.h>
 #include <elf.h>
 #include "util.h"
+#include "diag.h"
 #include "so_util.h"
 
 #define XD_BUF_SIZE 0x4000
@@ -314,6 +315,19 @@ static void xd_dump_range(const char *tag, uintptr_t base, size_t bytes) {
 
 void __libnx_exception_handler(ThreadExceptionDump *ctx) {
   char b1[96], b2[96], b3[96];
+
+  /* #329: the wedge catcher (diag.c) faults on purpose once the fs is dead and
+   * the game is still in frame 0. Every other dump channel -- xd.log,
+   * debug.log, wd290.log, sentinel.log, alive.log -- writes through the same fs
+   * session that just died, so here we write NOTHING and re-raise at once:
+   * Atmosphere's creport is a separate process and still produces the full
+   * thread report (PC + stack for every thread), which is the only evidence
+   * that survives. The catcher's registers (x0-x5) carry idle ms, flush seq,
+   * frame, queued bytes and dropped lines. */
+  if (g_wedge_break) {
+    svcBreak(BreakReason_Panic, 0, 0);
+    for (;;) svcSleepThread(1000000000ULL);
+  }
 
   /* #305: a fault while dumping would recurse forever; say so once, raw.
    * #319: TWO ways to get here, and #318 could not tell them apart: a fault

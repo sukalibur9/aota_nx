@@ -101,6 +101,7 @@ static char g_ring[LOGRING_SIZE];
 static u32  g_ring_head;          /* bytes ever queued (mod LOGRING_SIZE) */
 static u32  g_ring_tail;          /* bytes ever written out */
 static u32  g_log_dropped;        /* lines lost: ring full or lock stuck */
+static volatile unsigned long g_log_flush_seq;  /* completed SD writes (#329) */
 static Thread g_log_thr;
 static int    g_log_thr_ok;
 
@@ -153,6 +154,7 @@ static void log_drain_once(void) {
       wrote = write(fd, chunk, (size_t)n);
     }
     if (wrote <= 0) return;      /* keep the bytes; try again next tick */
+    g_log_flush_seq++;           /* #329: one completed write == fs is alive */
     mutexTryLock(&g_log_lock);   /* best effort, single consumer */
     g_ring_tail = t + (u32)wrote;
     mutexUnlock(&g_log_lock);
@@ -162,8 +164,19 @@ static void log_drain_once(void) {
 
 static void log_flusher_main(void *arg) {
   (void)arg;
+  int ticks = 0;
   for (;;) {
     log_drain_once();
+    /* #329: a write into the fs devoptab is NOT on the SD card. Test #328's log
+     * tail is therefore ambiguous: lines written a second before the freeze can
+     * still be sitting in the FAT cache, so "last line" may be far behind "last
+     * thing that ran". fsync once a second commits what we have; the flusher is
+     * the only thread that pays for it, and only it can be delayed. */
+    if (++ticks >= 20) {         /* 20 * 50 ms = 1 s */
+      ticks = 0;
+      int fd = log_fd_open();
+      if (fd >= 0) { (void)fsync(fd); g_log_flush_seq++; }
+    }
     /* 50 ms: short enough that a crash loses almost nothing, long enough that
      * the SD sees a handful of writes per second instead of one per line. */
     svcSleepThread(50000000ULL);
@@ -182,6 +195,29 @@ void log_init(void) {
   g_log_thr_ok = 1;
   debugPrintf("[log328] queued logging: ring %u KB, flusher running\n",
               (unsigned)(LOGRING_SIZE / 1024));
+  debugPrintf("[log329] flusher fsyncs every 1s so the log tail is really on the SD\n");
+#endif
+}
+
+unsigned long log_flush_seq(void) {
+#if DEBUG_LOG
+  return g_log_flush_seq;
+#else
+  return 0;
+#endif
+}
+unsigned long log_ring_queued(void) {
+#if DEBUG_LOG
+  return (unsigned long)g_ring_head;
+#else
+  return 0;
+#endif
+}
+unsigned long log_dropped_lines(void) {
+#if DEBUG_LOG
+  return (unsigned long)g_log_dropped;
+#else
+  return 0;
 #endif
 }
 

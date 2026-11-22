@@ -90,6 +90,12 @@ int diag_sample_holder_pc(uintptr_t holder_tp, uint64_t *out_pc, uint64_t *out_l
  * Never returns NULL. */
 const char *diag_self_name(void);
 
+/* Build #329: set by the wedge catcher just before it faults on purpose, so the
+ * exception handler skips its fs-based dump and re-raises straight away. The
+ * resulting Atmosphere creport (written by another process) is the only dump
+ * that survives a dead fs session. */
+extern volatile int g_wedge_break;
+
 #ifdef __cplusplus
 }
 #endif

@@ -78,6 +78,12 @@ static DiagThread       g_threads[DIAG_MAX_THREADS];
 static Mutex            g_reg_lock;     /* zero-init libnx Mutex == unlocked       */
 static __thread DiagThread *self;       /* this thread's slot (host TLS)           */
 
+/* #329: set right before the wedge catcher faults on purpose. The exception
+ * handler checks it and skips its own (fs-based) dump so Atmosphere's creport
+ * writes the report -- the only dump channel that still works once the FS
+ * session is wedged. */
+volatile int g_wedge_break;
+
 static volatile int      g_dump_periodic;   /* #291: header text selector      */
 static volatile int      g_frame = -1;
 static volatile uint64_t g_last_progress;   /* tick of last diag_frame()           */
@@ -708,6 +714,65 @@ static void watchdog_main(void *unused) {
   }
 }
 
+/* #329 wedge catcher: the fs is a single shared resource.
+ * Test #328 wedged it ~0.4 s into nativeRender frame 0: from the first
+ * base.apk read on, debug.log, wd290.log, sentinel.log and (already in #317)
+ * alive.log all stopped at once, while the engine stayed in frame 0. Every one
+ * of those channels writes through the same fs session, so a single request the
+ * FS service never answers hides everything -- including WHY.
+ *
+ * This thread owns no fs state. While the game is still in frame 0 it watches
+ * two counters that only move when the process is doing work:
+ *   log_ring_queued()  the producers' byte counter  (moves even if fs is dead)
+ *   log_flush_seq()    completed SD writes         (frozen == fs is dead)
+ * 30 s with both frozen means the run is over but nothing was written down.
+ * It then FAULTS on purpose with the state in x0-x5 (creport shows the GPRs),
+ * so Atmosphere's crash reporter -- a different process with its own fs session
+ * -- lists every thread's PC and stack. That report says whether the engine is
+ * parked in svcSendSyncRequest (fs) or in its own userspace wait.
+ * Gated to frame <= 0: after the first frame this thread disarms, so it can
+ * never turn a slow loading screen into a crash. */
+__attribute__((noinline)) static void wedge329_fault(unsigned long magic,
+    unsigned long idle_ms, unsigned long flush_seq, unsigned long frame,
+    unsigned long queued, unsigned long dropped) {
+  /* x0 magic "329!" | x1 idle ms | x2 flush seq | x3 frame | x4 queued |
+   * x5 dropped lines. A store to address 0 is a translation fault: the kernel
+   * reports it, our handler re-raises it as a panic, creport writes the file. */
+  __asm__ volatile (
+      "mov x0, %0\n\tmov x1, %1\n\tmov x2, %2\n\tmov x3, %3\n\t"
+      "mov x4, %4\n\tmov x5, %5\n\tmov x6, xzr\n\tstr xzr, [x6]\n\t"
+      :: "r"(magic), "r"(idle_ms), "r"(flush_seq), "r"(frame),
+         "r"(queued), "r"(dropped)
+      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "memory");
+  /* Unreachable unless address 0 happens to be mapped. */
+  svcBreak(BreakReason_Panic, 0, 0);
+  for (;;) svcSleepThread(1000000000ULL);
+}
+
+static void wedge329_main(void *unused) {
+  (void)unused;
+  uint64_t last_change = now_tick();
+  unsigned long last_seq = log_flush_seq();
+  for (;;) {
+    svcSleepThread(250ull * 1000ull * 1000ull);
+    int fr = g_frame;
+    unsigned long seq = log_flush_seq();
+    if (fr > 0 || seq != last_seq) {      /* something moved: still alive */
+      last_change = now_tick();
+      last_seq = seq;
+      continue;
+    }
+    uint64_t idle = now_tick() - last_change;
+    if (tick_to_ns(idle) >= 30000000000ull) {
+      g_wedge_break = 1;                  /* handler: no fs dump, break now */
+      wedge329_fault(0x33323921ul,       /* "!329" magic */
+                     (unsigned long)(tick_to_ns(idle) / 1000000ull),
+                     seq, (unsigned long)fr,
+                     log_ring_queued(), log_dropped_lines());
+    }
+  }
+}
+
 /* #292 sentinel: an independent thread whose only job is to prove process
  * liveness. It never touches the log lock, the futex shims or diag state, so
  * its file going quiet means EVERYTHING stopped -- not just the watchdog. */
@@ -827,6 +892,13 @@ void diag_watchdog_start(void) {
     Result src = threadCreate(&s_thr, sentinel_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[wd292] sentinel threadCreate rc=0x%x\n", src);
     if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr)); }
+  /* #329: wedged-fs catcher -> Atmosphere's creport (fs-independent dump). */
+  { static Thread w_thr;
+    Result wrc = threadCreate(&w_thr, wedge329_main, NULL, NULL, 0x4000, 0x2C, -2);
+    debugPrintf("[wd329] wedge catcher threadCreate rc=0x%x\n", wrc);
+    if (R_SUCCEEDED(wrc))
+      debugPrintf("[wd329] wedge catcher start rc=0x%x (faults at 30s of a frozen \
+frame-0 + frozen fs, so creport lists every thread)\n", threadStart(&w_thr)); }
   /* #318: third, session-independent witness (see alive2_main). */
   { static Thread a_thr;
     Result arc = threadCreate(&a_thr, alive2_main, NULL, NULL, 0x4000, 0x2C, -2);
