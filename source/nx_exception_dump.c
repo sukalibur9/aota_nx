@@ -219,12 +219,30 @@ static void xd_probe(const char *tag, long v) {
    * line always names the real point of death. */
   if (dbg >= 0) fsync(dbg);
   if (xd_fd >= 0 && xd_fd != dbg) fsync(xd_fd);
+  /* #332: also on the raw FsFile. Test #331's xdraw.log was ZERO bytes at the
+   * end of the run, which could not distinguish "the raw channel never worked"
+   * from "no fault happened". Every stage marker now lands there too, so a
+   * non-empty xdraw.log proves the fault channel is live before a fault is. */
+  (void)xd_raw_write(b, k);
 }
 
 /* #307: exported stage marker for main(). Same lock-free channel as the boot
  * probes; with the sync above, the last "stage" line is trustworthy even
  * after a hard power-off. */
 void xd_stage(const char *tag) { xd_probe(tag, 0); }
+
+/* #332: raw-only marker for the watchdog/sentinel/stall-catcher threads. Those
+ * run while the main thread may be frozen, so the marker must not touch newlib
+ * (a wedged fsdev write never returns) and must not take a lock: only the
+ * pre-opened FsFile, flushed by fsFileWrite. */
+void xd_stage_raw(const char *tag) {
+  char b[96];
+  size_t k = 0;
+  b[k++] = '['; b[k++] = 'x'; b[k++] = 'r'; b[k++] = ']'; b[k++] = ' ';
+  while (*tag && k < sizeof b - 2) b[k++] = *tag++;
+  b[k++] = '\n';
+  (void)xd_raw_write(b, k);
+}
 
 /* #305: pre-created at boot (xd_log_init), so the fault path allocates nothing.
  * Writes the buffer to the mirror and to debug.log, then signals completion.

@@ -3637,11 +3637,16 @@ int main(int argc, char *argv[]) {
   debugPrintf("[tls269] main gtid=%u\n", game_tls_tid());
   /* #270: lock-free record -- the debugPrintf above dropped in test #269 */
   gtid270_log("main", 0, game_tls_tid());
+  /* #332: test #331's log stopped exactly here (before diag_watchdog_start's
+   * first line reached the ring), so this window is bracketed with fsync'd
+   * markers: the last one printed names the call that never returned. */
+  xd_stage("stage:gtid-logged");
   /* Watchdog re-enabled (fbstub88) with the snapshot-ordering fix: stacks are
    * now walked while the target thread is PAUSED (the fbstub86 self-crash came
    * from resuming first and walking a live stack). 6s thresholds. Its job now:
    * catch the first-present hang and dump the thread blocked in eglSwapBuffers. */
   diag_watchdog_start();
+  xd_stage("stage:watchdog-returned");
   /* #263: bracket Full RAM's pre-frame-0 park (test #262: the main thread
    * never reached nativeRender frame 0). This line proves the preamble
    * completed up to the loop. */
@@ -3653,21 +3658,27 @@ int main(int argc, char *argv[]) {
    * the loop below. */
   android_native_start_feed_thread((uint8_t (*)(void*,void*,void*))Unity_nativeInjectEvent,
                                    fake_env, fake_unityplayer_thiz);
+  xd_stage("stage:feed-returned");
 
   int frame = 0;
+  xd_stage("stage:loop-enter");
   while (appletMainLoop() && !jni_quit_requested) {
     diag_frame(frame);   // heartbeat: lets the watchdog see progress (or its absence)
+    if (frame == 0) xd_stage("stage:frame-heartbeat");
     /* #300: the game's TLS setup rewrites TLS[0x1e4] on the main thread;
      * keep libnx's real handle in place so mutexLock's arbitration has a
      * valid owner handle. Bounded: the slot settles within a few frames. */
     if (frame < 600) tag299_fix_main();
+    if (frame == 0) xd_stage("stage:tag299-returned");
     nx_time_tick();      // advance our managed-Time clock once per frame
+    if (frame == 0) xd_stage("stage:time-returned");
     /* fbstub42: the engine clock is now fixed at its true source by the
      * TimeManager::Update entry hook (installed at boot, see nx_install_time_fix):
      * Update is re-driven each frame with newTime = GetTimeSinceStartup(), so all
      * deltaTime variants advance and the PreloadManager can integrate. No per-frame
      * field poking needed here. */
     android_native_update_mode();
+    if (frame == 0) xd_stage("stage:updmode-returned");
     /* [inp285] the input feed runs on its own 60 Hz thread now (started
      * before the loop); the per-frame feed_hid call + the #263 frame-0
      * marker are removed -- the main thread no longer runs feed_hid. */

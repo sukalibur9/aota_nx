@@ -18,6 +18,12 @@
 #include "util.h"   /* debugPrintf */
 #include "so_util.h" /* so_find_module_by_addr for backtrace symbolication */
 
+/* #332: fsync'd stage markers (see nx_exception_dump.c). xd_stage writes the
+ * newlib fds as well; xd_stage_raw only the pre-opened FsFile, so it is safe
+ * from a thread that runs while the main thread may be wedged. */
+extern void xd_stage(const char *tag);
+extern void xd_stage_raw(const char *tag);
+
 /* ------------------------------------------------------------------ tunables */
 #define DIAG_MAX_THREADS   96
 #define DIAG_POLL_NS       (1000ull * 1000ull * 1000ull)   /* watchdog tick: 1s */
@@ -688,6 +694,10 @@ static void watchdog_main(void *unused) {
      * came back; n climbing while nothing else logs == the game wedged but the
      * scheduler (and this thread) is alive. */
     loops++;
+    /* #332: the poll sleep returned -> this thread is scheduled. Raw channel:
+     * test #331's wd290.log stopped after its boot line, which could equally
+     * mean "thread never ran again" or "fsdev write was never committed". */
+    if (loops <= 8) xd_stage_raw("stage:wd-awake");
     if (loops <= 8 || (loops % 30) == 0)
       wd290_log("[wd292] awake n=%d frame=%d idle_ms=%llu\n", loops, g_frame,
                 (unsigned long long)(tick_to_ns(now - g_last_progress) / 1000000ull));
@@ -765,6 +775,7 @@ static void wedge330_main(void *unused) {
     }
     uint64_t idle = now_tick() - last_change;
     if (tick_to_ns(idle) >= 45000000000ull) {
+      xd_stage_raw("stage:wedge-fire");   /* #332: did the catcher run at all? */
       g_wedge_break = 1;             /* handler: no fs dump, break now */
       wedge330_fault(0x30333321ul,   /* "!330" magic */
                      (unsigned long)(tick_to_ns(idle) / 1000000ull),
@@ -781,6 +792,7 @@ int diag_frame_now(void) { return g_frame; }
 
 static void sentinel_main(void *unused) {
   (void)unused;
+  xd_stage_raw("stage:sentinel-start");   /* #332: raw, flushed, before any sleep */
   int fd = open("sdmc:/switch/aota/sentinel.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (fd < 0) return;
   ssize_t w0 = write(fd, "[s292] boot\n", 12); (void)w0;
@@ -870,39 +882,59 @@ void diag_watchdog_start(void) {
    * __libnx_aligned_alloc calls, and unlike malloc/memalign it is NOT
    * linker-wrapped by this codebase, so the probe tests the plain newlib
    * heap lock threadCreate's stack alloc takes. */
+  /* #332: test #331 stopped after [tls269] and BEFORE the frame-0 render call
+   * (xdraw.log has no stage:render0-call), i.e. inside this function: thread
+   * creation/stack allocation or one of the new witnesses. The markers below
+   * bracket every step on the fsync'd channel, so the next log names the call
+   * that never returns instead of only "somewhere in diag_watchdog_start". */
   debugPrintf("[wd265] probing heap lock\n");
+  xd_stage("stage:wd-heap-probe");
   void *wd_probe = aligned_alloc(0x1000, 0x4000);
   if (wd_probe) free(wd_probe);
   debugPrintf("[wd265] heap lock free\n");
+  xd_stage("stage:wd-heap-ok");
   debugPrintf("[wd265] probing virtmem lock\n");
   virtmemLock();
   virtmemUnlock();
   debugPrintf("[wd265] virtmem lock free\n");
+  xd_stage("stage:wd-virtmem-ok");
   /* libnx thread: deliberately NOT via the pthread shim under test.
    * 16 KiB stack, priority 0x2C (same band as main), default core. */
   debugPrintf("[wd265] creating watchdog thread\n");
   Result rc = threadCreate(&g_wd_thread, watchdog_main, NULL, NULL, 0x4000, 0x2C, -2);
   debugPrintf("[wd265] threadCreate returned rc=0x%x\n", rc);
-  if (R_SUCCEEDED(rc) && R_SUCCEEDED(threadStart(&g_wd_thread)))
+  xd_stage("stage:wd-created");
+  Result start_rc = R_SUCCEEDED(rc) ? threadStart(&g_wd_thread) : rc;
+  xd_stage("stage:wd-started");
+  if (R_SUCCEEDED(start_rc))
     debugPrintf("[wd] watchdog armed (stall=%llus, poll=1s)\n",
                 (unsigned long long)(DIAG_STALL_NS / 1000000000ull));
   else
-    debugPrintf("[wd] watchdog FAILED to start rc=0x%x\n", rc);
+    debugPrintf("[wd] watchdog FAILED to start rc=0x%x\n", start_rc);
   /* #292: second, independent liveness witness (own file, own thread). */
   { static Thread s_thr;
+    xd_stage("stage:sentinel-create");
     Result src = threadCreate(&s_thr, sentinel_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[wd292] sentinel threadCreate rc=0x%x\n", src);
-    if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr)); }
+    xd_stage("stage:sentinel-created");
+    if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr));
+    xd_stage("stage:sentinel-started"); }
   /* #330: frame-0 stall catcher -> Atmosphere's creport (fs-independent dump). */
   { static Thread w_thr;
+    xd_stage("stage:wedge-create");
     Result wrc = threadCreate(&w_thr, wedge330_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[wd330] stall catcher threadCreate rc=0x%x\n", wrc);
+    xd_stage("stage:wedge-created");
     if (R_SUCCEEDED(wrc))
       debugPrintf("[wd330] stall catcher start rc=0x%x (faults after 45s at \
-frame 0 with no thread logging, so creport lists every thread)\n", threadStart(&w_thr)); }
+frame 0 with no thread logging, so creport lists every thread)\n", threadStart(&w_thr));
+    xd_stage("stage:wedge-started"); }
   /* #318: third, session-independent witness (see alive2_main). */
   { static Thread a_thr;
+    xd_stage("stage:alive2-create");
     Result arc = threadCreate(&a_thr, alive2_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[a318] alive2 threadCreate rc=0x%x\n", arc);
-    if (R_SUCCEEDED(arc)) debugPrintf("[a318] alive2 start rc=0x%x\n", threadStart(&a_thr)); }
+    if (R_SUCCEEDED(arc)) debugPrintf("[a318] alive2 start rc=0x%x\n", threadStart(&a_thr));
+    xd_stage("stage:alive2-started"); }
+  xd_stage("stage:watchdog-returned");
 }
