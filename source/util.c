@@ -64,84 +64,146 @@ static int log_fd_open(void) {
 
 int debugLogFd(void) { return log_fd_open(); }
 
+/* ---- build #328: producers never touch SD ----------------------------------
+ * Test #327 finally sampled the main thread at the stall (#327 works):
+ *
+ *   [wd327] snap Unity Main Thread: paused for a context read (not in fs), resumed
+ *   PC=NRO+0x90eb90  LR=NRO+0x8ffc84
+ *   bt[0] NRO+0x90d7c8 (fsdev_write+0x48)   bt[4] libunity.so+0x10e81a0
+ *
+ * NRO+0x90eb90 is libnx's svcSendSyncRequest, so the main thread was parked
+ * inside an SD write -- a debugPrintf line -- and it never came back: the
+ * last debug.log line is an apk314 lseek, and the very next debugPrintf (the
+ * matching "#N read" line) never appears. The game was making progress on
+ * the APK reads; it was OUR log write that froze it. That run then died with
+ * Atmosphere's User Break at aota_nx+0x90ebac (svcBreak), LR into
+ * __libnx_exception_handler: an exception was raised, our own handler tried
+ * to write its dump through write() -> _write_r -> fsdev_write, that faulted
+ * too, and the handler recursed (the crash report's 4-frame cycle repeats 8x)
+ * until svcBreak. Both halves of the report are the same fault line: a
+ * synchronous newlib/fsdev write on a thread that must not block.
+ *
+ * So a producer now only memcpys the formatted line into a RAM ring and
+ * returns; the single flusher thread below owns the fd and is the only code
+ * that calls write() on it. If the FS service wedges (it did in #326 and in
+ * #327, pause or no pause), the flusher is the only casualty: the ring fills,
+ * lines are dropped and counted, and the game keeps running.
+ *
+ * The old #326 drop.log channel is gone with it: it existed because the log
+ * lock could be held forever by a descheduled thread, and its fallback was
+ * itself an SD write on the caller. #328 holds this lock only across a
+ * memcpy (a few microseconds, no fs request inside), and never blocks on it:
+ * a lock that cannot be taken within 100 yields just counts a dropped line. */
+#if DEBUG_LOG
+#define LOGRING_SIZE (1u << 17)   /* 128 KB of queued lines */
+
+static char g_ring[LOGRING_SIZE];
+static u32  g_ring_head;          /* bytes ever queued (mod LOGRING_SIZE) */
+static u32  g_ring_tail;          /* bytes ever written out */
+static u32  g_log_dropped;        /* lines lost: ring full or lock stuck */
+static Thread g_log_thr;
+static int    g_log_thr_ok;
+
+/* Queue one already-formatted line. Never blocks, never touches SD. */
+static int log_ring_push(const char *p, size_t n) {
+  int got = 0;
+  u32 h, t, off, first;
+  if (n > LOGRING_SIZE) n = LOGRING_SIZE;
+  for (int i = 0; i < 100; i++) {
+    if (mutexTryLock(&g_log_lock)) { got = 1; break; }
+    svcSleepThread(0);            /* yield: let the holder run */
+  }
+  if (!got) return 0;
+  h = g_ring_head; t = g_ring_tail;
+  if ((u32)(h - t) + (u32)n > LOGRING_SIZE) { mutexUnlock(&g_log_lock); return 0; }
+  off = h % LOGRING_SIZE;
+  first = LOGRING_SIZE - off;
+  if (first > n) first = (u32)n;
+  memcpy(g_ring + off, p, first);
+  if (n > first) memcpy(g_ring, p + first, n - first);
+  g_ring_head = h + (u32)n;
+  mutexUnlock(&g_log_lock);
+  return 1;
+}
+
+/* Move queued bytes to the fd. Tail advances only by what write() accepted,
+ * so a failing/wedged FS keeps the data instead of losing it. */
+static void log_drain_once(void) {
+  static char chunk[4096];
+  for (;;) {
+    int got = 0;
+    u32 n = 0, t = 0, off, first;
+    ssize_t wrote;
+    if (!mutexTryLock(&g_log_lock)) return;
+    got = 1;
+    t = g_ring_tail; n = g_ring_head - t;
+    if (n > sizeof chunk) n = sizeof chunk;
+    if (n) {
+      off = t % LOGRING_SIZE;
+      first = LOGRING_SIZE - off;
+      if (first > n) first = n;
+      memcpy(chunk, g_ring + off, first);
+      if (n > first) memcpy(chunk + first, g_ring, n - first);
+    }
+    mutexUnlock(&g_log_lock);
+    if (!got || !n) return;
+    {
+      int fd = log_fd_open();
+      if (fd < 0) return;
+      wrote = write(fd, chunk, (size_t)n);
+    }
+    if (wrote <= 0) return;      /* keep the bytes; try again next tick */
+    mutexTryLock(&g_log_lock);   /* best effort, single consumer */
+    g_ring_tail = t + (u32)wrote;
+    mutexUnlock(&g_log_lock);
+    if ((u32)wrote < n) return;
+  }
+}
+
+static void log_flusher_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    log_drain_once();
+    /* 50 ms: short enough that a crash loses almost nothing, long enough that
+     * the SD sees a handful of writes per second instead of one per line. */
+    svcSleepThread(50000000ULL);
+  }
+}
+#endif
+
+void log_init(void) {
+#if DEBUG_LOG
+  if (g_log_thr_ok) return;
+  (void)log_fd_open();          /* open on a healthy process, not in a producer */
+  if (R_FAILED(threadCreate(&g_log_thr, log_flusher_main, NULL, NULL,
+                            0x4000, 0x2C, -2)))
+    return;
+  if (R_FAILED(threadStart(&g_log_thr))) return;
+  g_log_thr_ok = 1;
+  debugPrintf("[log328] queued logging: ring %u KB, flusher running\n",
+              (unsigned)(LOGRING_SIZE / 1024));
+#endif
+}
+
 int debugPrintf(char *text, ...) {
 #if DEBUG_LOG
-  int fd;
   va_list list;
-  /* Build #267: NON-BLOCKING log lock. Test #266 proved the waiter
-   * completes its futex wait (wake.log) but then blocks forever inside
-   * the FAKEWAKE debugPrintf: g_log_lock was wedged by a thread that
-   * descheduled mid-print while holding it, and every later print
-   * blocks on mutexLock. Logging must never stop the game: try the
-   * lock with a bounded yield-spin (100 tries -- under normal
-   * contention a few yields suffice), and DROP the line if the lock
-   * never frees. A dropped line costs far less than a parked game;
-   * the lock-free channels (wake.log, snoop.log) keep reporting. */
+  /* #328: the caller only formats and queues. log_ring_push() takes
+   * g_log_lock with the #267 bounded yield-spin and gives up (counting the
+   * line as dropped) if it cannot have it, so no thread can ever park here on
+   * another thread's lock -- and, unlike every build up to #327, nothing on
+   * this path issues an fs request: the SD write belongs to the flusher
+   * thread alone. */
   {
-    int got = 0;
-    for (int i = 0; i < 100; i++) {
-      if (mutexTryLock(&g_log_lock)) { got = 1; break; }
-      svcSleepThread(0);  /* yield: let the holder run */
-    }
-    if (!got) {
-      /* Build #326: never go blind again. Test #325's debug.log stopped in the
-       * middle of asset loading (1647 lines, last one an apk314 read that has no
-       * completion) while the lock-free xd.log kept recording stage markers all
-       * the way to stage:render0-call -- and sentinel.log, which prints through
-       * this function, stopped at n=5. So g_log_lock had been wedged (the GC
-       * suspends threads with pthread_kill; a thread frozen between try-lock and
-       * unlock keeps it forever) and every later line of that run was dropped
-       * silently. Keep the drop decision, but park the line in a separate fd so
-       * the run still has a log. No lock here on purpose: this is the path taken
-       * *when* the lock is unusable. */
-      static int alt_fd = -1;
-      if (alt_fd < 0) {
-        alt_fd = open(game_path("drop.log"),
-                      O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (alt_fd >= 0) {
-          const char *hdr =
-            "[drop326] debug.log lock wedged: the lines below could not go there\n";
-          ssize_t hw = write(alt_fd, hdr, strlen(hdr));
-          (void)hw;
-        }
-      }
-      if (alt_fd >= 0) {
-        char alt[1024];
-        va_list list2;
-        va_start(list2, text);
-        int n2 = vsnprintf(alt, sizeof alt, text, list2);
-        va_end(list2);
-        if (n2 > 0) {
-          if (n2 > (int)sizeof alt - 1) n2 = (int)sizeof alt - 1;
-          ssize_t w2 = write(alt_fd, alt, (size_t)n2);
-          (void)w2;
-        }
-      }
-      return 0;
-    }
-  }
-  /* #303: raw fd + one write() per line, NOT stdio. b302's watchdog caught the
-   * main thread blocked in
-   *     debugPrintf -> _fflush_r -> fsdev_write -> svcSendSyncRequest
-   * i.e. every line went through newlib's FILE layer, which holds the
-   * process-wide stdio lock while the SD round-trip is in flight, and through
-   * libnx's fs mutex. Any thread paused in that window froze every other
-   * logger (and the watchdog itself) behind it. A plain write() keeps the
-   * crash-surviving "one line, already out the door" property with a much
-   * shorter, lock-only-on-our-side path. */
-  fd = log_fd_open();
-  if (fd >= 0) {
     char buf[1024];
     va_start(list, text);
     int n = vsnprintf(buf, sizeof buf, text, list);
     va_end(list);
     if (n > 0) {
       if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;  /* truncated line */
-      ssize_t w = write(fd, buf, (size_t)n);
-      (void)w;
+      if (!log_ring_push(buf, (size_t)n)) g_log_dropped++;
     }
   }
-  mutexUnlock(&g_log_lock);
 #else
   (void)text;
 #endif

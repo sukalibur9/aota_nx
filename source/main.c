@@ -3619,6 +3619,11 @@ int main(int argc, char *argv[]) {
    * rmutex -> libnx deadlock svcBreak, reported as result 0xCA8). */
   { extern void xd_log_init(void); xd_log_init(); }
   xd_stage("stage:xd-init-returned");
+  /* #328: hand debug.log's fd to its own thread. Test #327's watchdog sampled
+   * the main thread parked in fsdev_write -> svcSendSyncRequest (a log line to
+   * SD) and the run never printed another line; from here on a producer only
+   * memcpys into a RAM ring and returns. */
+  { extern void log_init(void); log_init(); }
   /* #308: record this thread's id before any game thread exists. The vsync
    * counter bind accepts only waits made by this thread (test #307 bound the
    * il2cpp GC helper's idle futex and pulsed it 60x/s). */

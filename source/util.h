@@ -18,6 +18,13 @@ int debugPrintf(char *text, ...);
  * could not be opened. */
 int debugLogFd(void);
 
+/* #328: start the single thread that owns debug.log's fd. debugPrintf only
+ * queues into a RAM ring; this thread drains it, so no game thread ever blocks
+ * on an SD write (test #327 caught the main thread parked in
+ * fsdev_write -> svcSendSyncRequest with the log frozen behind it). Call once
+ * from main() on a healthy process, after the game root is resolved. */
+void log_init(void);
+
 /* #270: lock-free gtid record (see util.c). Writes one line per call
  * to sdmc:/switch/aota/gtid.log; raw open/write, no g_log_lock.
  * #272: each line also carries the caller's tpidrro_el0 (tp=), the true
