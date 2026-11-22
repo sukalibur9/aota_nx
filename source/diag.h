@@ -68,6 +68,14 @@ void diag_watchdog_start(void);
  * thread every 5s; the list goes on the snoop line (snoop.log). */
 void diag_sample_all_pcs(char *buf, size_t n);
 
+/* Build #327: mark the current thread as sitting inside an fs request (the
+ * read cache's read/lseek, or a write). The watchdog must never PAUSE such a
+ * thread: interrupting an in-flight fs IPC request leaves the FS service
+ * waiting forever and jams every later write in the process (#304). With this
+ * flag the watchdog can tell "running userspace code" (safe to sample) from
+ * "running inside fsdev" (never touch). Cheap: one TLS store. */
+void diag_in_fs(int on);
+
 /* Build #298: sample the HOLDER thread's PC for a mutex the caller has been
  * waiting on. Finds the holder in the thread registry by its tpidrro_el0
  * (recorded at registration), pauses it briefly, reads its context, resumes

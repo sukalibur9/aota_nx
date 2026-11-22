@@ -1307,7 +1307,9 @@ void apk314_done(int loud, const char *op, int fd, long long r) {
  * header from archive file"), since it lseek64(SEEK_END)s to size the file. */
 long z_lseek(int fd, long off, int whence) {
   if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
+  diag_in_fs(1);   /* #327: lseek is an fs request too */
   long r = lseek(fd, off, whence);
+  diag_in_fs(0);
   if (fd == g_watch_fd) debugPrintf("[io] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
   if (apk314_is(fd)) debugPrintf("[apk314] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
   return r;
@@ -3269,6 +3271,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
   if (rc_state != 1 || !rc_cacheable[fd] || count == 0) return -1;
   size_t done = 0;
   mutexLock(&rc_lock);
+  diag_in_fs(1);   /* #327: the watchdog must not pause us inside these reads */
   while (done < count) {
     uint64_t abs = off + done;
     uint64_t blk = abs / RC_BLOCK;
@@ -3296,6 +3299,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
   }
   if (0)
     debugPrintf("[rc] hits=%lu fills=%lu\n", rc_hits, rc_fills);
+  diag_in_fs(0);
   mutexUnlock(&rc_lock);
   return (long)done;
 }
@@ -3342,7 +3346,9 @@ long write_fake(int fd, const void *buf, size_t count) {
    * Log BEFORE and AFTER: if a write blocks, the last [wr] line has no
    * matching result line and names the exact fd+count. */
   debugPrintf("[wr] fd=%d count=%zu ...\n", fd, count);
+  diag_in_fs(1);   /* #327: never pause a thread mid fs write (#304) */
   long r = write(fd, buf, count);
+  diag_in_fs(0);
   debugPrintf("[wr] fd=%d -> %ld\n", fd, r);
   return r;
 }

@@ -71,6 +71,7 @@ typedef struct {
   volatile uint64_t     wakes_total;
   volatile uint64_t     futex_spins;
   volatile uint64_t     last_active;    /* tick of last beacon activity           */
+  volatile int          in_fs;          /* #327: inside an fs request right now   */
 } DiagThread;
 
 static DiagThread       g_threads[DIAG_MAX_THREADS];
@@ -290,6 +291,14 @@ void diag_wait_exit(void) {
   t->last_active = now_tick();
 }
 
+/* Build #327: see diag.h. Deliberately lock-free and NULL-safe: this runs
+ * inside the fs call path, so it must never take the registry lock (that would
+ * deadlock the very writes the watchdog is trying to protect). */
+void diag_in_fs(int on) {
+  DiagThread *t = self;
+  if (t) t->in_fs = on ? 1 : 0;
+}
+
 void diag_futex_spin(const void *obj) {
   DiagThread *t = diag_self();
   if (!t) return;
@@ -507,29 +516,44 @@ static void snapshot_thread(DiagThread *t) {
   /* #304: NEVER pause a thread that is running arbitrary code. b303 paused
    * Unity Main Thread exactly once -- inside fsdev_write (PC=NRO+0x907ec0
    * svcSendSyncRequest, LR into serviceDispatchImpl) -- and from that moment on
-   * no SD write in the process ever completed again: debug.log, sentinel.log and
-   * wd290.log all stop while the game kept running. Interrupting an fs IPC
+   * no SD write in the process ever completed again. Interrupting an fs IPC
    * request leaves the FS service holding that session, so every later write
-   * blocks forever. Only sample threads that are parked inside one of our own
-   * sync shims, where a pause cannot land in the middle of an fs request. */
-  if (t->wait_kind == DIAG_W_NONE) return;
+   * blocks forever. Keep that rule for every thread; #327 adds the one bit of
+   * state it needs (in_fs) so the MAIN thread can finally be sampled. */
 
-  /* #323: never pause the MAIN thread. #304 lost a whole boot to one pause that
-   * landed inside an fs IPC request; and the main thread's location is exactly
-   * what is unknown at a frame-0 stall (b322: xd.log has stage:render0-call but
-   * not render0-returned). Read its context WITHOUT pausing: a thread parked in
-   * a syscall (futex/condvar) is not running, and svcGetThreadContext3 answers
-   * for it; a failed read means it is executing userspace code, which is itself
-   * the answer we need (engine code, not one of our shims). The raw mirror is
-   * written BEFORE debugPrintf, so a wedged stdio lock cannot eat the record. */
+  /* #323/#327: the main thread is the one whose location a frame-0 stall never
+   * showed. Read its context WITHOUT pausing first: a thread parked in a
+   * syscall (futex/condvar) is not running and svcGetThreadContext3 answers for
+   * it. A failed read means it is executing userspace code -- and that is
+   * exactly the case worth sampling. #327 makes that pause safe: it is taken
+   * ONLY when the thread is not inside an fs request (diag_in_fs), the ctx is
+   * read in the paused window, the thread is RESUMED before anything is
+   * written, and the whole thing happens at most once per dump. Without the
+   * pause the run stays blind (b326: frame 0, xd.log stops at render0-call, and
+   * no channel can say where the main thread went). The raw mirror is written
+   * BEFORE debugPrintf, so a wedged stdio lock cannot eat the record. */
   if (strstr(t->name, "Main")) {
     ThreadContext mctx;
     Result mgr = svcGetThreadContext3(&mctx, t->handle);
     g_dump_len = 0; g_dump_buf[0] = 0;
-    if (R_FAILED(mgr))
-      dump_emit("[wd] snap %s: no context rc=0x%x -- RUNNING userspace code "
-                "(not parked in a syscall)\n", t->name[0] ? t->name : "?", mgr);
-    else {
+    if (R_FAILED(mgr) && t->in_fs) {
+      dump_emit("[wd327] snap %s: RUNNING inside an fs request -- NOT paused "
+                "(a pause there wedges fsdev, #304)\n", t->name[0] ? t->name : "?");
+    } else if (R_FAILED(mgr)) {
+      Result pr = svcSetThreadActivity(t->handle, ThreadActivity_Paused);
+      Result gr = R_SUCCEEDED(pr) ? svcGetThreadContext3(&mctx, t->handle) : pr;
+      if (R_SUCCEEDED(pr)) svcSetThreadActivity(t->handle, ThreadActivity_Runnable);
+      if (R_SUCCEEDED(gr)) {
+        dump_emit("[wd327] snap %s: paused for a context read (not in fs), "
+                  "resumed\n", t->name[0] ? t->name : "?");
+        g_scan_stack = 1;
+        dump_thread_context(t->name[0] ? t->name : "?", &mctx);
+        g_scan_stack = 0;
+      } else {
+        dump_emit("[wd327] snap %s: pause/read failed pause=0x%x read=0x%x\n",
+                  t->name[0] ? t->name : "?", pr, gr);
+      }
+    } else {
       dump_emit("[wd] snap %s: context read WITHOUT pausing (parked in a syscall)\n",
                 t->name[0] ? t->name : "?");
       g_scan_stack = 1;
@@ -540,6 +564,9 @@ static void snapshot_thread(DiagThread *t) {
     debugPrintf("%s", g_dump_buf);
     return;
   }
+
+  /* Non-main threads: only one parked in our own sync shim may be paused. */
+  if (t->wait_kind == DIAG_W_NONE) return;
 
   ThreadContext ctx;
   /* #292: if the dump hangs, the last marker names the thread it hung on. */
