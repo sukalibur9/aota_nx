@@ -714,25 +714,23 @@ static void watchdog_main(void *unused) {
   }
 }
 
-/* #329 wedge catcher: the fs is a single shared resource.
- * Test #328 wedged it ~0.4 s into nativeRender frame 0: from the first
- * base.apk read on, debug.log, wd290.log, sentinel.log and (already in #317)
- * alive.log all stopped at once, while the engine stayed in frame 0. Every one
- * of those channels writes through the same fs session, so a single request the
- * FS service never answers hides everything -- including WHY.
- *
- * This thread owns no fs state. While the game is still in frame 0 it watches
- * two counters that only move when the process is doing work:
- *   log_ring_queued()  the producers' byte counter  (moves even if fs is dead)
- *   log_flush_seq()    completed SD writes         (frozen == fs is dead)
- * 30 s with both frozen means the run is over but nothing was written down.
- * It then FAULTS on purpose with the state in x0-x5 (creport shows the GPRs),
- * so Atmosphere's crash reporter -- a different process with its own fs session
- * -- lists every thread's PC and stack. That report says whether the engine is
- * parked in svcSendSyncRequest (fs) or in its own userspace wait.
- * Gated to frame <= 0: after the first frame this thread disarms, so it can
- * never turn a slow loading screen into a crash. */
-__attribute__((noinline)) static void wedge329_fault(unsigned long magic,
+/* #330 stall catcher (corrects #329).
+ * #329 watched log_flush_seq() to decide whether the process had stopped. That
+ * was wrong: the flusher bumps log_flush_seq() on every 1 s fsync tick whether
+ * or not there is new data, so the "frozen" test could never be true and the
+ * catcher never fired -- which is why test #329 produced no crash report even
+ * though its log tail ends at a 319 MB allocation inside Unity's memory
+ * manager (frame 0, ~1 s before the end of the run) and no channel said
+ * anything afterwards.
+ * The honest liveness counter is the PRODUCERS': log_ring_queued() only moves
+ * when a thread actually logs something. A frozen producer counter plus
+ * frame <= 0 means no thread in the process is doing observable work, no
+ * matter whether the cause is an unanswered fs request or a userspace hang.
+ * 45 s of that FAULTS on purpose with the state in x0-x5, so Atmosphere's
+ * crash reporter -- a separate process with its own fs session -- lists every
+ * thread's PC and stack. Gated to frame <= 0 and disarmed for good once the
+ * first frame renders, so a slow loading screen is never turned into a crash. */
+__attribute__((noinline)) static void wedge330_fault(unsigned long magic,
     unsigned long idle_ms, unsigned long flush_seq, unsigned long frame,
     unsigned long queued, unsigned long dropped) {
   /* x0 magic "329!" | x1 idle ms | x2 flush seq | x3 frame | x4 queued |
@@ -749,26 +747,29 @@ __attribute__((noinline)) static void wedge329_fault(unsigned long magic,
   for (;;) svcSleepThread(1000000000ULL);
 }
 
-static void wedge329_main(void *unused) {
+static void wedge330_main(void *unused) {
   (void)unused;
   uint64_t last_change = now_tick();
-  unsigned long last_seq = log_flush_seq();
+  unsigned long last_queued = log_ring_queued();
   for (;;) {
     svcSleepThread(250ull * 1000ull * 1000ull);
     int fr = g_frame;
-    unsigned long seq = log_flush_seq();
-    if (fr > 0 || seq != last_seq) {      /* something moved: still alive */
+    if (fr > 0) {                    /* a frame rendered: disarmed for good */
+      for (;;) svcSleepThread(1000000000ULL);
+    }
+    unsigned long q = log_ring_queued();
+    if (q != last_queued) {          /* a thread logged: still alive */
       last_change = now_tick();
-      last_seq = seq;
+      last_queued = q;
       continue;
     }
     uint64_t idle = now_tick() - last_change;
-    if (tick_to_ns(idle) >= 30000000000ull) {
-      g_wedge_break = 1;                  /* handler: no fs dump, break now */
-      wedge329_fault(0x33323921ul,       /* "!329" magic */
+    if (tick_to_ns(idle) >= 45000000000ull) {
+      g_wedge_break = 1;             /* handler: no fs dump, break now */
+      wedge330_fault(0x30333321ul,   /* "!330" magic */
                      (unsigned long)(tick_to_ns(idle) / 1000000ull),
-                     seq, (unsigned long)fr,
-                     log_ring_queued(), log_dropped_lines());
+                     log_flush_seq(), (unsigned long)fr,
+                     q, log_dropped_lines());
     }
   }
 }
@@ -892,13 +893,13 @@ void diag_watchdog_start(void) {
     Result src = threadCreate(&s_thr, sentinel_main, NULL, NULL, 0x4000, 0x2C, -2);
     debugPrintf("[wd292] sentinel threadCreate rc=0x%x\n", src);
     if (R_SUCCEEDED(src)) debugPrintf("[wd292] sentinel start rc=0x%x\n", threadStart(&s_thr)); }
-  /* #329: wedged-fs catcher -> Atmosphere's creport (fs-independent dump). */
+  /* #330: frame-0 stall catcher -> Atmosphere's creport (fs-independent dump). */
   { static Thread w_thr;
-    Result wrc = threadCreate(&w_thr, wedge329_main, NULL, NULL, 0x4000, 0x2C, -2);
-    debugPrintf("[wd329] wedge catcher threadCreate rc=0x%x\n", wrc);
+    Result wrc = threadCreate(&w_thr, wedge330_main, NULL, NULL, 0x4000, 0x2C, -2);
+    debugPrintf("[wd330] stall catcher threadCreate rc=0x%x\n", wrc);
     if (R_SUCCEEDED(wrc))
-      debugPrintf("[wd329] wedge catcher start rc=0x%x (faults at 30s of a frozen \
-frame-0 + frozen fs, so creport lists every thread)\n", threadStart(&w_thr)); }
+      debugPrintf("[wd330] stall catcher start rc=0x%x (faults after 45s at \
+frame 0 with no thread logging, so creport lists every thread)\n", threadStart(&w_thr)); }
   /* #318: third, session-independent witness (see alive2_main). */
   { static Thread a_thr;
     Result arc = threadCreate(&a_thr, alive2_main, NULL, NULL, 0x4000, 0x2C, -2);
