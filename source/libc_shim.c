@@ -2687,6 +2687,13 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   (void)addr; (void)prot;
   if (length == 0) length = 1;
 
+  /* #331: name a large file map BEFORE any arena work or the file read, so the
+   * last line of a run that dies inside the map (global-metadata.dat is 15 MB
+   * and is mapped right after its open+dup) says whether it was attempted. */
+  if (!(flags & BIONIC_MAP_ANONYMOUS) && fd >= 0 && length >= (size_t)(1u << 20))
+    debugPrintf("[mmap] file req %u KB fd=%d off=0x%lx prot=0x%x\n",
+                (unsigned)(length >> 10), fd, offset, prot);
+
   if ((flags & BIONIC_MAP_FIXED) && addr && (flags & BIONIC_MAP_ANONYMOUS)) {
     static unsigned fixed_n = 0;
     /* Build #126: MAP_FIXED inside a phantom tail: nothing is reserved

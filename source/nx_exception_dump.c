@@ -66,8 +66,43 @@ static size_t xd_len;
  * prefix has been flushed is therefore never written twice. */
 static size_t xd_flushed;
 static volatile int xd_busy;   /* handler already running (reentrancy guard) */
+static int xd_nested_breaks;   /* #331: breaks taken from the nested path */
 
 static int xd_fd = -1;         /* sdmc:/switch/aota/xd.log, opened at boot */
+
+/* #331: the fault path must not touch newlib AT ALL -- not just open(), also
+ * write(). Test #330's creport shows exactly that failure mode: the handler ran
+ * three times over, each pass entered xd_flush_pending -> xd_write_all ->
+ * _write_r and died again, so the fault record never reached disk and the
+ * report only contains the handler's own recursion:
+ *
+ *   svcBreak <- __libnx_exception_handler <- xd_flush_pending <- xd_write_all
+ *            <- _write_r <- __libnx_exception_returnentry <- handler <- ... (x8)
+ *
+ * That is the #305 pattern (the fault is inside the allocator, so the faulting
+ * thread still holds newlib's heap lock; every newlib call from the handler
+ * re-deadlocks and libnx breaks again). The one channel that needs no newlib
+ * and no fsdev lock is a raw FsFile opened at boot and written by offset: the
+ * file handle is pre-created, fsFileWrite is plain IPC, and FsWriteOption_Flush
+ * commits it. xdraw.log is a SEPARATE file from xd.log so the two channels
+ * (newlib fd + raw handle) never fight over one file's offset. */
+static FsFile xd_rf;
+static int    xd_rf_ok;
+static int    xd_rf_dead;
+static s64    xd_rf_off;
+
+static int xd_raw_ok(void) { return xd_rf_ok && !xd_rf_dead; }
+
+/* 0 = delivered and flushed, -1 = unusable for the rest of the run */
+static int xd_raw_write(const char *p, size_t n) {
+  if (!xd_raw_ok() || !n) return xd_raw_ok() ? 0 : -1;
+  if (R_FAILED(fsFileWrite(&xd_rf, xd_rf_off, p, n, FsWriteOption_Flush))) {
+    xd_rf_dead = 1;
+    return -1;
+  }
+  xd_rf_off += (s64)n;
+  return 0;
+}
 
 static Thread xd_thr;
 static Event  xd_evt;          /* "buffer ready" */
@@ -143,8 +178,12 @@ static void xd_flush_pending(void) {
   if (xd_len <= xd_flushed) return;
   size_t n = xd_len - xd_flushed;
   const char *p = xd_buf + xd_flushed;
-  int dbg = debugLogFd();
   xd_flushed = xd_len;
+  /* #331: prefer the raw handle -- it needs no newlib lock, so it still works
+   * when the fault happened inside the allocator (the #330 case). Only when
+   * that channel is genuinely unavailable do we fall back to the newlib fds. */
+  if (xd_raw_write(p, n) == 0) return;
+  int dbg = debugLogFd();
   if (xd_fd >= 0) xd_write_all(xd_fd, p, n);
   if (dbg >= 0 && dbg != xd_fd) xd_write_all(dbg, p, n);
   xd_sync();   /* #324: queue is not delivery -- commit before we break */
@@ -215,6 +254,22 @@ void xd_log_init(void) {
   xd_probe("xdfd", xd_fd);
   (void)debugLogFd();          /* open debug.log now, not on the fault path */
   xd_probe("dbgfd", debugLogFd());
+  /* #331: this build's dump channel -- opened here, on the healthy main
+   * thread, so the fault path only ever calls fsFileWrite. */
+  if (!xd_rf_ok) {
+    FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
+    if (fs) {
+      (void)fsFsCreateFile(fs, "/switch/aota/xdraw.log", 0, 0);   /* EEXIST is fine */
+      if (R_SUCCEEDED(fsFsOpenFile(fs, "/switch/aota/xdraw.log",
+                                   (FsOpenMode)(FsOpenMode_Write | FsOpenMode_Append),
+                                   &xd_rf))) {
+        s64 sz = 0;
+        if (R_SUCCEEDED(fsFileGetSize(&xd_rf, &sz)) && sz >= 0) xd_rf_off = sz;
+        xd_rf_ok = 1;
+      }
+    }
+    xd_probe("rawxd", xd_rf_ok);
+  }
   if (xd_thr_ok) return;
   Result   rc = eventCreate(&xd_evt, true);        /* auto-clear: one fire, one write */
   xd_probe("evt", rc);
@@ -337,6 +392,14 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
    * on the fault path -- then name this pass's own context, so one run says
    * which of the two it was and where the handler stopped. */
   if (xd_busy) {
+    /* #331: break ONCE, then park. Test #330 repeated the break, and every
+     * break re-enters this handler, so the report showed eight copies of the
+     * recursion instead of the fault. The record itself is on xdraw.log by
+     * now (raw channel); one break is enough to make creport write the file. */
+    if (xd_nested_breaks >= 1) {
+      for (;;) svcSleepThread(1000000000ULL);
+    }
+    xd_nested_breaks++;
     if (xd_len > XD_BUF_SIZE - 192) xd_len = XD_BUF_SIZE - 192;
     if (xd_flushed > xd_len) xd_flushed = xd_len;
     size_t had = xd_len;
@@ -349,9 +412,12 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx) {
     bs(" sp="); bhex(ctx->sp.x, 16);
     bs(" x0="); bhex(ctx->cpu_gprs[0].x, 16);
     bs(" dumped="); bdec((long long)had, 0, '0', 0, 0);
+    bs(" raw="); bdec(xd_raw_ok() ? 1 : 0, 0, '0', 0, 0);
     bs("\n");
     xd_flush_pending();
-    svcBreak(BreakReason_Panic, 0, 0);
+    if (xd_raw_ok()) {         /* #331: only break when the record is on disk */
+      svcBreak(BreakReason_Panic, 0, 0);
+    }
     for (;;) svcSleepThread(1000000000ULL);
   }
   xd_busy = 1;
