@@ -4649,11 +4649,21 @@ __attribute__((used)) static uintptr_t waiter221_start_fn = 0;
  * If the worker runs and signals before the waiter reaches FLAG,
  * the waiter sees flag=1 and skips the wait entirely. */
 __attribute__((used)) unsigned waiter221_log(void *arg) {
+  /* #333: test #332 ends at the START line below, and the creator never comes
+   * back from pthread_create, so these three markers (fsync'd, lock-free) name
+   * the call that never returns: the game's StartThread helper, the extra
+   * svcStartThread kick, or nothing here at all (the stall is before it). */
+  extern void xd_stage_raw(const char *tag);
   unsigned handle = *(volatile unsigned *)arg;
-  if (waiter221_n < WAITER221_LOG_CAP)
+  const int w_log = (waiter221_n < WAITER221_LOG_CAP);
+  if (w_log) {
     debugPrintf("[waiter221] START handle=%x (n=%u)\n", handle, waiter221_n++);
+    xd_stage_raw("stage:waiter-start");
+  }
   int ret = ((int (*)(void *))waiter221_start_fn)(arg);
+  if (w_log) xd_stage_raw("stage:waiter-helper-ret");
   (void)svcStartThread((Handle)handle);
+  if (w_log) xd_stage_raw("stage:waiter-kicked");
   return (unsigned)ret;
 }
 

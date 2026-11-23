@@ -686,6 +686,11 @@ static void watchdog_main(void *unused) {
   /* #291: prove the thread itself got scheduled, before it ever sleeps. */
   wd290_log("[wd291] watchdog thread running (state snapshots every %llus, max %d)\n",
             (unsigned long long)(DIAG_STATE_NS / 1000000000ull), DIAG_STATE_DUMPS);
+  /* #333: test #332's xdraw.log has stage:sentinel-start (a raw write from the
+   * sentinel) but no stage:wd-awake, so the sentinel was alive up to its 500 ms
+   * line while the watchdog produced nothing after its boot line. Bracket the
+   * ONLY thing between them -- the first poll sleep -- on the raw channel. */
+  xd_stage_raw("stage:wd-loop-enter");
   int loops = 0;
   for (;;) {
     svcSleepThread(DIAG_POLL_NS);
@@ -774,7 +779,13 @@ static void wedge330_main(void *unused) {
       continue;
     }
     uint64_t idle = now_tick() - last_change;
-    if (tick_to_ns(idle) >= 45000000000ull) {
+    /* #333: 45 s -> 15 s. Tests #329-#332 all produced NO crash report even
+     * though this catcher fires after 45 s of complete silence: the frames
+     * that would have told us where every thread sits never existed because
+     * the run was over (or reset) first. 15 s is still far longer than any
+     * legitimate frame-0 stall and short enough to be reached while the user
+     * is still looking at the black screen. */
+    if (tick_to_ns(idle) >= 15000000000ull) {
       xd_stage_raw("stage:wedge-fire");   /* #332: did the catcher run at all? */
       g_wedge_break = 1;             /* handler: no fs dump, break now */
       wedge330_fault(0x30333321ul,   /* "!330" magic */

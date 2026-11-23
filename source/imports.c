@@ -390,10 +390,29 @@ __attribute__((naked, used, noinline)) static unsigned game_tls_tid(void) {
   );
 }
 
+/* #333: test #332 finally got the main thread INTO frame-0 nativeRender
+ * (xdraw.log has stage:render0-call) but never out of it (no
+ * stage:render0-returned), and the last debug.log line is the game's
+ * StartThread hook printing "[waiter221] START handle=3e01d2" -- i.e. the
+ * hang is inside one pthread_create: the new thread starts, the creator
+ * never comes back. The whole process then goes silent (alive.log, which has
+ * its OWN FsFile session and fsyncs, is 0 bytes), so the marker has to be on
+ * the fsync'd raw channel and must not touch newlib or a lock. These two
+ * markers split the only two candidates: the creator blocked in
+ * pthread_create's child handshake (create-enter without create-returned)
+ * or the child blocked before it runs engine code (child-tramp absent, or it
+ * stops between the TLS install and the registry). */
+extern void xd_stage_raw(const char *tag);
+
 static void *thread_trampoline(void *p) {
   ThreadStart *ts = (ThreadStart *)p;   /* leaked on purpose: tpidr points into ts->tls */
+  static unsigned tr_n;
+  const int tr_log = (__atomic_add_fetch(&tr_n, 1, __ATOMIC_RELAXED) <= 8);
+  if (tr_log) xd_stage_raw("stage:child-tramp");
   install_bionic_tls(ts->tls);          // this thread's OWN stack-guard block (tpidr_el0+0x28)
+  if (tr_log) xd_stage_raw("stage:child-tls");
   diag_thread_register(ts->entry, ts->is_main);
+  if (tr_log) xd_stage_raw("stage:child-registered");
   debugPrintf("[pthread] thread started entry=%p tid=%lu gtid=%u\n", ts->entry, (unsigned long)pthread_self(), game_tls_tid());
   /* #270: lock-free record -- the debugPrintf above can drop under contention */
   gtid270_log("pthread", (uintptr_t)ts->entry, game_tls_tid());
@@ -406,6 +425,9 @@ static void *thread_trampoline(void *p) {
   return r;
 }
 int pthread_create_fake(pthread_t *thread, const void *bionic_attr, void *entry, void *arg) {
+  static unsigned pc_n;
+  const int pc_log = (__atomic_add_fetch(&pc_n, 1, __ATOMIC_RELAXED) <= 8);
+  if (pc_log) xd_stage_raw("stage:pcreate-enter");
   debugPrintf("[pthread] create entry=%p arg=%p\n", entry, arg);
   ThreadStart *ts = malloc(sizeof(*ts));
   if (!ts) return -1;
@@ -423,6 +445,7 @@ int pthread_create_fake(pthread_t *thread, const void *bionic_attr, void *entry,
   const int r = pthread_create(thread, &attr, thread_trampoline, ts);
   pthread_attr_destroy(&attr);
   debugPrintf("[pthread] create entry=%p -> r=%d\n", entry, r);
+  if (pc_log) xd_stage_raw(r == 0 ? "stage:pcreate-returned" : "stage:pcreate-failed");
   if (r != 0) { free(ts); return r; }
   return 0;
 }
