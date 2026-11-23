@@ -3561,9 +3561,37 @@ int main(int argc, char *argv[]) {
    * stores. Addresses derived in nx_patch_os.h. */
   {
     uintptr_t b = (uintptr_t)il2cpp_mod.load_virtbase;
-    *(void **)(b + OS_IL2CPP_VM_GLOBAL)   = fake_vm;
-    *(void **)(b + OS_IL2CPP_HANDLER_PTR) = (void *)(b + OS_IL2CPP_HANDLER_FN);
-    debugPrintf("[boot] il2cpp JavaVM global set (vm=%p)\n", fake_vm);
+    /* #337: the two stores below are now OPT-IN.
+     *
+     * Test #336 set them at the correct addresses for THIS libil2cpp for the
+     * first time, and the engine crashed before the title screen:
+     *     [xd] faulting thread tid=1738 (Loading.PreloadManager)
+     *     [xd] desc=0x100 pc=0x0 far=0 esr=82000005   (instruction abort, a
+     *          jump to NULL) at libunity+0xf3fb7c, LR libunity+0xf3fb80 --
+     *          a `blr` of a callback slot that read back as zero.
+     * Everything else #336 added (audio rate, resampler, InputDevice bridge)
+     * is dormant at that point in boot -- FMOD's AudioDevice.init never ran
+     * (no [aud143] line, no audout sink), while the JavaVM was already armed
+     * 3000 log lines earlier, and "Java VM not initialized" is gone from the
+     * log for the first time. #335, with the same engine but a VM the runtime
+     * could not see, loaded to the title screen. So the VM hand-off is the
+     * only #336 change that can own this crash, and it stays behind a flag
+     * until we know which JNI hand-off it unlocks:
+     *     create sdmc:/switch/aota/vm_on   -> registration ON  (test path)
+     *     no file (default)               -> registration OFF (#335 boot)
+     * The toggle keeps one NRO able to answer both questions in one boot. */
+    int vm_on = 0;
+    { struct stat st;
+      if (stat("sdmc:/switch/aota/vm_on", &st) == 0 || stat("vm_on", &st) == 0) vm_on = 1; }
+    if (vm_on) {
+      *(void **)(b + OS_IL2CPP_VM_GLOBAL)   = fake_vm;
+      *(void **)(b + OS_IL2CPP_HANDLER_PTR) = (void *)(b + OS_IL2CPP_HANDLER_FN);
+      debugPrintf("[boot] #337 il2cpp JavaVM ENABLED (vm_on present): vm=%p handler=%p\n",
+                  fake_vm, (void *)(b + OS_IL2CPP_HANDLER_FN));
+    } else {
+      debugPrintf("[boot] #337 il2cpp JavaVM DISABLED (no vm_on): Rewired/Unity input will still report "
+                  "\"Java VM not initialized\"; create sdmc:/switch/aota/vm_on to re-arm it\n");
+    }
     nx_boot_il2cpp_hacks();   /* install Time.get_* hooks; GC handled by bridge */
     /* Must be armed here, not from the render loop: this title's first
      * Resources.Load calls happen during boot-scene script init, well before

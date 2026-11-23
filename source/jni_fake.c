@@ -1933,6 +1933,21 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
     debugPrintf("[inp336] InputDevice.getDeviceIds -> [0,1]\n");
     return make_pri_array_adopt(v, 2, 4);
   }
+  /* #337: close the one NULL this bridge provably handed the engine.
+   * indev_object answers getMotionRanges() with an EMPTY array; Unity's native
+   * input code then calls List.iterator() on it and #[336] logged
+   *     [jni] UNMATCHED -> null: UnityPlayer.iterator()Ljava/util/Iterator;
+   * -- a null container in code that walks it ([inp336] getSources/getDevice
+   * run right before it). Answer every iterator() on one of OUR containers
+   * with a live, empty iterator instead: hasNext() on it falls through to the
+   * generic 0, so the walk ends immediately, exactly as the empty array says. */
+  if (!strcmp(id->name, "iterator") &&
+      !strncmp(id->sig, "()Ljava/util/Iterator;", 22) && recv &&
+      (*(uint32_t *)recv == TAG_OBJARR || *(uint32_t *)recv == TAG_PRIARR)) {
+    void *it = jni_make_object("java/util/Iterator");
+    debugPrintf("[inp337] iterator() on our container -> %p (empty; was UNMATCHED null)\n", it);
+    return it;
+  }
   log_app_upcall(id);
   { void *dlg; if (dlg325_object(recv, id, va, &dlg)) return dlg; }   /* #325 */
 
