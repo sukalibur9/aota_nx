@@ -2010,6 +2010,91 @@ static void nx_errs322_install(uintptr_t ub) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Build #341: the #340 crash is the same missing-shader story one step further.
+ *
+ * Test #340 (log b340) is the first run that gets past the #339 OOM: newlib
+ * reports 2800 MB, no [fb316] memalign FAILED, and the JavaVM hand-off is the
+ * default. The engine then loads the courtroom scene (four header lines of the
+ * render loop, sentinel frame=1 for ~3 minutes) and dies in the Unity Main
+ * Thread's renderer with our own dump (xdraw.log):
+ *
+ *   faulting thread tid=2661
+ *   desc=0x101 pc=libunity.so+0xe90520 far=0000000000000048 esr=92000005
+ *   x8 0000000000000000   x0 00000051a007d090   lr=libunity+0xdee528
+ *   ins+0  libunity.so+0xe90520: f9402508   ldr x8, [x8, #72]
+ *
+ * i.e. `ldr x8,[x0,#64]` (0xe90518) returned NULL and the very next live use
+ * dereferences it at +0x48. The getter is a leaf:
+ *
+ *   e90508  ldr x8,[x0,#56] ; cbz x8,e90518 ; ldr x0,[x8,#8]! ; ret
+ *   e90518  ldr x8,[x0,#64]              <-- NULL for this object
+ *   e9051c  ldrsw x9,[x0,#80]
+ *   e90520  ldr x8,[x8,#72]              <-- far=0x48
+ *   e90524  add x8,x8,x9,lsl #3
+ *   e90528  ldr x0,[x8]
+ *   e9052c  ret
+ *   e9054c  mov x0,xzr ; ret             <-- the NULL return the neighbours use
+ *
+ * The object being walked is a ShaderLab pass list: this run's dump shows
+ * "<Unnamed Pass 0>" twice in x20's block, and the same boot prints
+ *
+ *   Unity: The resource Internal-ErrorShader.shader could not be loaded
+ *          from the resource file!   (x3)
+ *
+ * before 606 "referenced script (Unknown)" behaviours and the fault -- the
+ * exact resource failure #322 already guards at the material-shader site. Here
+ * a shader whose pass list is NULL is walked instead.
+ *
+ * The stock sequence is replaced by the same 4-word ldr/br trampoline shape as
+ * #120/#311/#315/#317. The trampoline re-executes the stock instructions and
+ * returns 0 when the pass list is NULL, which is what 0xe9054c (the sibling
+ * branch's own NULL return) hands back. Non-NULL behaviour is bit-identical.
+ * Verify-first: the four stock words are compared before anything is written.
+ * ------------------------------------------------------------------------- */
+#define NX_PASS341_VA 0xe90518u
+
+__attribute__((naked)) static void nx_tramp_pass341(void) {
+  __asm__ volatile(
+    "ldr x8, [x0, #64]\n"
+    "cbz x8, .Lpass341_null\n"
+    "ldrsw x9, [x0, #80]\n"
+    "ldr x8, [x8, #72]\n"
+    "add x8, x8, x9, lsl #3\n"
+    "ldr x0, [x8]\n"
+    "ret\n"
+    ".Lpass341_null:\n"
+    "mov x0, xzr\n"
+    "ret\n"
+  );
+}
+
+static void nx_pass341_install(uintptr_t ub) {
+  static const uint32_t exp[4] = { 0xf9402008u, 0xb9805009u, 0xf9402508u, 0x8b090d08u };
+  uint32_t cur[4];
+  for (int i = 0; i < 4; i++)
+    cur[i] = *(volatile uint32_t *)(ub + NX_PASS341_VA + 4u * (uint32_t)i);
+  if (cur[0] == 0x58000050u && cur[1] == 0xd61f0200u) {
+    debugPrintf("[pass341] guard @%p already applied -- ok\n",
+                (void *)(ub + NX_PASS341_VA));
+    return;
+  }
+  if (memcmp(cur, exp, sizeof cur) != 0) {
+    debugPrintf("[pass341] SKIP: pass getter mismatch (have 0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                cur[0], cur[1], cur[2], cur[3]);
+    return;
+  }
+  uint32_t patch[4] = {
+    0x58000050u,  /* ldr x16, [pc, #8] */
+    0xd61f0200u,  /* br x16 */
+    (uint32_t)(uintptr_t)nx_tramp_pass341,
+    (uint32_t)((uintptr_t)nx_tramp_pass341 >> 32),
+  };
+  so_patch_code((void *)(ub + NX_PASS341_VA), patch, sizeof patch);
+  debugPrintf("[pass341] guard @%p -> tramp %p (NULL pass list returns 0, was far=0x48)\n",
+              (void *)(ub + NX_PASS341_VA), (void *)nx_tramp_pass341);
+}
+
+/* ---------------------------------------------------------------------------
  * Build #326: silence PlayerInitEngineGraphics' advisory "hardware" dialog.
  *
  * Test #324 finally showed what the black screen was waiting on: a JNI dialog
@@ -2179,6 +2264,7 @@ static int nx_patch_libunity(uintptr_t ub) {
   nx_msg315_install(ub);     /* Build #315: compact the array right before the sort */
   nx_msg317_install(ub);     /* Build #317: skip set() with idx<0 / no array */
   nx_errs322_install(ub);    /* Build #322: take the null branch for a missing error shader */
+  nx_pass341_install(ub);    /* Build #341: NULL shader pass list -> NULL, not far=0x48 */
   nx_gpu326_install(ub);     /* Build #326: skip the advisory hardware-check dialog */
   nx_jobsnoop_start();   /* Build #119: libunity is loaded; start the snoop */
   return 1;
