@@ -1875,16 +1875,24 @@ static FakeInputDevice g_idev[4];
  * null-handler queue node appears later on another thread. Until the exact
  * hand-off in that init is pinned down with a log, the bridge stays behind a
  * flag so one NRO can answer both questions in one boot:
- *     create sdmc:/switch/aota/inp_on  -> bridge ON  (test path)
- *     no file (default)                -> bridge OFF (#335 input behaviour) */
+ * #338 gated that bridge on sdmc:/switch/aota/inp_on and the A/B was decisive:
+ *     no file (bridge OFF) -> crash at frame 0: libunity+0xf88a14, ldr x10,[x9]
+ *                             with x9=0, stack libunity+0xf3fb80.. -- the same
+ *                             null-handler queue family, on the first frame
+ *     inp_on (bridge ON)   -> 205 rendered frames, FMOD up, [aud143] writes
+ *                             flowing at 24 kHz into a 48 kHz sink; the only
+ *                             fault was ENOMEM during the asset load
+ * So the bridge is not what breaks the boot -- removing it is. It is the
+ * default now; create sdmc:/switch/aota/inp_off to get the #335 path back. */
 static int nx_inp_bridge_on(void) {
   static int cached = -1;
   if (cached < 0) {
     struct stat st;
-    cached = (stat("sdmc:/switch/aota/inp_on", &st) == 0 || stat("inp_on", &st) == 0) ? 1 : 0;
-    debugPrintf("[boot] #338 InputDevice bridge %s\n",
-                cached ? "ENABLED (inp_on present)"
-                       : "DISABLED (no inp_on) -- #335 input behaviour, was the last known-good boot");
+    int off = (stat("sdmc:/switch/aota/inp_off", &st) == 0 || stat("inp_off", &st) == 0);
+    cached = off ? 0 : 1;
+    debugPrintf("[boot] #339 InputDevice bridge %s\n",
+                cached ? "ENABLED (default; no inp_off)"
+                       : "DISABLED (inp_off present) -- #335 input behaviour");
   }
   return cached;
 }

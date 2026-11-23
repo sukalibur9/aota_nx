@@ -1633,6 +1633,7 @@ static size_t mmap_overmap_kept_pages(size_t need_pages, size_t len) {
 }
 #define MMAP_BIG_THRESH ((size_t)64 * 1024 * 1024)
 #define BIONIC_PROT_NONE 0x0
+#define BIONIC_PROT_READ  0x1
 #define BIONIC_PROT_WRITE 0x2
 #define BIONIC_MADV_DONTNEED 4
 
@@ -2408,6 +2409,44 @@ static size_t  g_fb_bytes = 0;
 static size_t  g_fb_peak = 0;
 static Mutex   g_fb_lock;
 
+/* Build #339: identical read-only file maps share their pages.
+ * Test #338 (InputDevice bridge on) reached frame 205 and then died in ENOMEM on
+ * two 52 MB maps. Its fallback ledger never shrank (blocks 34..42, 1241 -> 1505
+ * MB) while showing sdmc:/switch/aota/libunity.so mapped SIX times (23556 KB
+ * each) and sdmc:/switch/aota/libil2cpp.so TWICE (105115 KB each) -- always
+ * PROT_READ, offset 0, length == file size. That is 360 MB of the same file
+ * bytes held in RAM at once. Hand out the same pages for an identical
+ * (dev, ino, offset, length) read-only file map and free them when the last
+ * owner munmaps. */
+#define FB_SHARE_MAX 24
+#define FB_SHARE_MIN ((size_t)4 * 1024 * 1024)
+typedef struct { uint8_t *ptr; uint64_t dev, ino; long off; size_t len; int refs; } FbShare;
+static FbShare g_share[FB_SHARE_MAX];
+static int     g_share_off;   /* set after a partial munmap on a shared block */
+
+/* caller holds g_fb_lock (or is single-threaded boot code). */
+static FbShare *share_find(uint64_t dev, uint64_t ino, long off, size_t len) {
+  for (int i = 0; i < FB_SHARE_MAX; i++)
+    if (g_share[i].ptr && g_share[i].refs > 0 && g_share[i].dev == dev &&
+        g_share[i].ino == ino && g_share[i].off == off && g_share[i].len == len)
+      return &g_share[i];
+  return NULL;
+}
+static FbShare *share_find_ptr(const void *p) {
+  for (int i = 0; i < FB_SHARE_MAX; i++)
+    if (g_share[i].ptr == p && g_share[i].refs > 0) return &g_share[i];
+  return NULL;
+}
+static void share_add_locked(uint8_t *p, uint64_t dev, uint64_t ino, long off, size_t len) {
+  for (int i = 0; i < FB_SHARE_MAX; i++)
+    if (!g_share[i].ptr) {
+      g_share[i].ptr = p; g_share[i].dev = dev; g_share[i].ino = ino;
+      g_share[i].off = off; g_share[i].len = len; g_share[i].refs = 1;
+      return;
+    }
+  debugPrintf("[mmap] share table full (%d): %p not shareable\n", FB_SHARE_MAX, p);
+}
+
 static inline int fb_dead_get(const FbBlock *b, size_t pg) {
   return b->dead && ((b->dead[pg >> 5] >> (pg & 31)) & 1u);
 }
@@ -2457,8 +2496,22 @@ static int fb_munmap(void *addr, size_t length) {
     size_t p1 = (e - bs + MMAP_PAGE - 1) / MMAP_PAGE;
     if (p1 > total) p1 = total;
     if (p0 == 0 && p1 >= total) {                    /* the whole block is gone */
+      /* #339: a shared mapping stays in RAM until its last owner lets go. */
+      FbShare *sh = share_find_ptr(b->ptr);
+      if (sh && sh->refs > 1) {
+        sh->refs--;
+        debugPrintf("[mmap] share keep %p (%d owners left)\n", (void *)b->ptr, sh->refs);
+        i++;
+        continue;
+      }
+      if (sh) { sh->ptr = NULL; sh->refs = 0; }
       fb_release_locked(i);
       continue;                                      /* slot i now holds another block */
+    }
+    if (share_find_ptr(b->ptr)) {
+      g_share_off = 1;
+      debugPrintf("[mmap] share: PARTIAL munmap %p +%u KB -- sharing disabled\n",
+                  (void *)b->ptr, (unsigned)(length >> 10));
     }
     if (!b->dead) {
       b->dead = (uint32_t *)calloc((total + 31) / 32, sizeof(uint32_t));
@@ -2559,6 +2612,30 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
     size_t keptp = mmap_overmap_kept_pages(needp, length);
     if (keptp < needp) alloc = keptp * MMAP_PAGE;
   }
+  /* #339: an identical read-only file map gets the same pages (see g_share). */
+  uint64_t sdev = 0, sino = 0;
+  int shareable = 0;
+  if (fd >= 0 && !(flags & BIONIC_MAP_ANONYMOUS) && prot == BIONIC_PROT_READ &&
+      length >= FB_SHARE_MIN) {
+    struct stat sst;
+    if (fstat(fd, &sst) == 0) { sdev = sst.st_dev; sino = sst.st_ino; shareable = 1; }
+  }
+  if (shareable && !g_share_off) {
+    mutexLock(&g_fb_lock);
+    FbShare *sh = share_find(sdev, sino, offset, len);
+    if (sh) {
+      sh->refs++;
+      void *hp = sh->ptr;
+      int refs = sh->refs;
+      mutexUnlock(&g_fb_lock);
+      debugPrintf("[mmap] share hit %u KB dev=%llu ino=%llu off=%ld -> %p (owners %d)\n",
+                  (unsigned)(length >> 10), (unsigned long long)sdev,
+                  (unsigned long long)sino, offset, hp, refs);
+      return hp;
+    }
+    mutexUnlock(&g_fb_lock);
+  }
+
   void *q = NULL;
   int aligned = 0;
   if (alloc >= MMAP_BIG_THRESH) {       /* Baselib aligns these -> hand out an aligned base */
@@ -2613,6 +2690,7 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
     g_fb_bytes += alloc;
     if (g_fb_bytes > g_fb_peak) g_fb_peak = g_fb_bytes;
     tracked = 1;
+    if (shareable) share_add_locked((uint8_t *)q, sdev, sino, offset, len);
   }
   const size_t total = g_fb_bytes;
   const int nblk = g_fb_n;
