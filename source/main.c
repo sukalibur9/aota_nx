@@ -659,7 +659,18 @@ void __libnx_initheap(void) {
   if (size > so_zone + big_align + newlib_floor + 256 * MB) {
     size_t avail = size - so_zone - big_align - newlib_floor;
     if (arena_sz > avail) arena_sz = avail & ~(big_align - 1);   /* clamp to RAM */
-    fake_heap_size = size - so_zone - arena_sz - big_align;       /* newlib gets the rest */
+    /* #340: the 64 MB alignment pad exists only to align the arena base. The
+     * arena is disabled (MMAP_ARENA_RESERVE 0 -> arena_sz 0, #291), so nothing
+     * is placed after the heap but the .so zone and the pad was never handed to
+     * newlib at all: "[boot] mem layout: newlib=2736 MB" under a 2960 MB heap
+     * (+160 MB .so zone +64 MB pad). Test #339 then died on exactly the memory
+     * this costs:
+     *     [fb316] memalign FAILED: 53772 KB (heap 2648/84 MB)
+     *     [xd] desc=0x101 pc=libil2cpp.so+0x2c3e0b8 far=0 esr=92000045
+     *     ins+0 a9007c13 stp x19,xzr,[x0]        <- x0 = NULL from the alloc
+     * while #335, with 106 MB free, served the same 52 MB request. Give the pad
+     * back whenever no arena needs it. */
+    fake_heap_size = size - so_zone - arena_sz - (arena_sz ? big_align : 0); /* newlib gets the rest */
   } else {
     /* heap too small for a dedicated arena (e.g. applet mode): skip it; the mmap
      * allocator falls back to a memalign-backed bitmap arena. */
@@ -3580,17 +3591,23 @@ int main(int argc, char *argv[]) {
      *     create sdmc:/switch/aota/vm_on   -> registration ON  (test path)
      *     no file (default)               -> registration OFF (#335 boot)
      * The toggle keeps one NRO able to answer both questions in one boot. */
-    int vm_on = 0;
+    /* #340: registration is ON by default. Test #339 ran with the flag file
+     * present and logged "#339 InputDevice bridge ENABLED" +
+     * "#337 il2cpp JavaVM ENABLED (vm_on present)", so the default build now
+     * matches that configuration -- no file needed on the SD card. The file
+     * sdmc:/switch/aota/vm_off takes it back to the #335 hand-off (VM not
+     * visible to the runtime) for an A/B boot from the same .nro. */
+    int vm_off = 0;
     { struct stat st;
-      if (stat("sdmc:/switch/aota/vm_on", &st) == 0 || stat("vm_on", &st) == 0) vm_on = 1; }
-    if (vm_on) {
+      if (stat("sdmc:/switch/aota/vm_off", &st) == 0 || stat("vm_off", &st) == 0) vm_off = 1; }
+    if (!vm_off) {
       *(void **)(b + OS_IL2CPP_VM_GLOBAL)   = fake_vm;
       *(void **)(b + OS_IL2CPP_HANDLER_PTR) = (void *)(b + OS_IL2CPP_HANDLER_FN);
-      debugPrintf("[boot] #337 il2cpp JavaVM ENABLED (vm_on present): vm=%p handler=%p\n",
+      debugPrintf("[boot] #340 il2cpp JavaVM ENABLED (default; no vm_off): vm=%p handler=%p\n",
                   fake_vm, (void *)(b + OS_IL2CPP_HANDLER_FN));
     } else {
-      debugPrintf("[boot] #337 il2cpp JavaVM DISABLED (no vm_on): Rewired/Unity input will still report "
-                  "\"Java VM not initialized\"; create sdmc:/switch/aota/vm_on to re-arm it\n");
+      debugPrintf("[boot] #340 il2cpp JavaVM DISABLED (vm_off present): Rewired/Unity input will "
+                  "still report \"Java VM not initialized\"; delete sdmc:/switch/aota/vm_off to re-arm it\n");
     }
     nx_boot_il2cpp_hacks();   /* install Time.get_* hooks; GC handled by bridge */
     /* Must be armed here, not from the render loop: this title's first

@@ -854,6 +854,22 @@ void mem287_heap_mb(unsigned *used_mb, unsigned *free_mb) {
   if (free_mb) *free_mb = (unsigned)((unsigned)mi.fordblks >> 20);
 }
 
+/* Build #340: fragmentation detail for a failed allocation.
+ *
+ * #339 failed a 53 MB page-aligned request with 84 MB of fordblks free
+ * ("[fb316] memalign FAILED: 53772 KB ... heap 2648/84 MB"), i.e. the bytes
+ * existed but not as one chunk. fordblks alone cannot tell that apart from a
+ * genuinely full heap, so print the two numbers that can:
+ *   ordblks  number of separate free chunks (large + small free => fragmented)
+ *   keepcost size of the top-most chunk dlmalloc could hand back to the OS
+ *            (== the contiguous tail newlib can use for a fresh big request)
+ * Both come from the same mallinfo() call mem287_heap_mb uses. */
+void mem340_heap_detail(unsigned *ordblks, unsigned *keepcost_kb) {
+  struct mallinfo mi = mallinfo();
+  if (ordblks) *ordblks = (unsigned)mi.ordblks;
+  if (keepcost_kb) *keepcost_kb = (unsigned)((unsigned)mi.keepcost >> 10);
+}
+
 /* Build #288: top m145 caller for the [census288] line (libc_shim.c). Returns
  * the caller address holding the most live bytes among >=4MB allocations, or
  * 0 if the table is empty. Mirrors mem150_gather's top-caller loop. */

@@ -1915,6 +1915,7 @@ static int c288_qual(size_t length, int prot, int flags) {
 
 /* gpu_arena.c: heap headroom (287) + top m145 caller (288) for the census line. */
 extern void mem287_heap_mb(unsigned *used_mb, unsigned *free_mb);
+extern void mem340_heap_detail(unsigned *ordblks, unsigned *keepcost_kb);   /* #340 */
 extern uintptr_t mem288_top_caller(unsigned *n, unsigned *live_mb, unsigned *max1_mb);
 
 // Reserve address space in the OC window. Mirrors mmap_arena_alloc_locked's
@@ -2647,10 +2648,12 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
     /* #316: never fail silently -- an unserved big reserve is what the engine
      * NULL-derefs a few instructions later, so name the size and the heap
      * state in one line. */
-    unsigned hu = 0, hf = 0;
+    unsigned hu = 0, hf = 0, hob = 0, hkc = 0;
     mem287_heap_mb(&hu, &hf);
-    debugPrintf("[fb316] memalign FAILED: %u KB (alloc %u KB) heap %u/%u MB, blocks %d/%u MB\n",
-                (unsigned)(length >> 10), (unsigned)(alloc >> 10), hu, hf,
+    mem340_heap_detail(&hob, &hkc);
+    debugPrintf("[fb316] memalign FAILED: %u KB (alloc %u KB) heap %u/%u MB, free-chunks %u "
+                "top-chunk %u KB, blocks %d/%u MB\n",
+                (unsigned)(length >> 10), (unsigned)(alloc >> 10), hu, hf, hob, hkc,
                 g_fb_n, (unsigned)(g_fb_bytes >> 20));
     return NULL;
   }
