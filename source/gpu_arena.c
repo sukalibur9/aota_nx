@@ -1983,6 +1983,33 @@ static int waiter218_loop_done = 0;
  * Forward-declared here because mutex179_log_wait calls it. */
 static uintptr_t lock272_lookup(uintptr_t mutex);
 
+/* #334: NO I/O ON THE LOCK PATH (this is the #333 crash).
+ *
+ * The #333 crash report's return-address chain repeats
+ *   fsdev_write -> _fsObjectDispatchImpl -> sessionmgrAttachClient ->
+ *   lock292_tramp_log -> lock292_log -> lock272_log_wait ->
+ *   _write_r -> fsdev_write ...
+ * i.e. the hook's own log write dispatched through the FS service, whose
+ * session mutex is a libnx mutex -- the very fn the hook is patched into
+ * (lock+0x4C). Every contended fs mutex re-entered the hook and wrote again.
+ * The nested-exception dump shows the end of it: a write to 0x563f5f3f20 with
+ * sp=0x563f5f4010, i.e. the 4 MB stack libnx gave the frame-0 worker
+ * (buffer 0x563f5f5000) was walked off its bottom into the guard page. And
+ * because the fs session mutex was held by the recursing thread the whole
+ * time, every other thread's write() blocked: alive.log 0 bytes, the whole
+ * process silent at frame 0.
+ *
+ * So the hooks now only store into bss: no write, no debugPrintf, no malloc,
+ * no lock. The snoop thread prints the records on its own FILE* (dump fn
+ * below); that thread's channel has survived every run. */
+#define MUTEX179_RING 16
+typedef struct {
+  uintptr_t obj, holder, caller, wtp, htp;
+  unsigned kind;            /* 1 = lock path wait, 2 = syncwait wrapper */
+} mutex179_rec;
+static mutex179_rec mutex179_ring[MUTEX179_RING];
+static unsigned mutex179_ring_n = 0;
+
 __attribute__((used)) static void mutex179_log_wait(uintptr_t lock, uintptr_t holder, uintptr_t caller) {
   /* #272: waiter identity is tpidrro_el0 itself (the TLS base pointer),
    * unique per thread -- TLS[0x1e4] (holder) is a process-global 33279
@@ -1991,21 +2018,51 @@ __attribute__((used)) static void mutex179_log_wait(uintptr_t lock, uintptr_t ho
   uintptr_t waiter_tp;
   __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (waiter_tp));
   uintptr_t holder_tp = lock272_lookup(lock);
-  if (mutex179_n < MUTEX179_LOG_CAP) {
-    debugPrintf("[mutex179] wait lock=%p holder=%llu caller=%p waiter_tp=%p holder_tp=%p (n=%u)\n",
-                (void *)lock, (unsigned long long)holder, (void *)caller,
-                (void *)waiter_tp, (void *)holder_tp, mutex179_n);
-    lock272_log_wait(lock, (unsigned)holder, waiter_tp, holder_tp);
+  if (mutex179_ring_n < MUTEX179_RING) {
+    unsigned i = mutex179_ring_n++;
+    mutex179_ring[i].obj = lock;
+    mutex179_ring[i].holder = holder;
+    mutex179_ring[i].caller = caller;
+    mutex179_ring[i].wtp = waiter_tp;
+    mutex179_ring[i].htp = holder_tp;
+    mutex179_ring[i].kind = 1;
   }
   mutex179_n++;
 }
 
 __attribute__((used)) static void mutex179_log_sync(uintptr_t obj, uintptr_t val, uintptr_t caller) {
-  if (mutex179_n < MUTEX179_LOG_CAP)
-    debugPrintf("[mutex179] syncwait obj=%p val=%llu caller=%p (n=%u) [live218] loop=%u restart=0x%x poll=0x%x sig=%u\n",
-                (void *)obj, (unsigned long long)val, (void *)caller, mutex179_n,
-                waiter218_loop_n, waiter218_loop_r, waiter218_loop_w, waiter218_loop_sig);
+  uintptr_t tp;
+  __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tp));
+  if (mutex179_ring_n < MUTEX179_RING) {
+    unsigned i = mutex179_ring_n++;
+    mutex179_ring[i].obj = obj;
+    mutex179_ring[i].holder = val;
+    mutex179_ring[i].caller = caller;
+    mutex179_ring[i].wtp = tp;
+    mutex179_ring[i].htp = ((uintptr_t)waiter218_loop_n << 32) | (uintptr_t)waiter218_loop_r;
+    mutex179_ring[i].kind = 2;
+  }
   mutex179_n++;
+}
+
+/* snoop thread only: print the bss records the lock path could not write. */
+__attribute__((used)) void mutex179_dump(FILE *f) {
+  if (!f) return;
+  for (unsigned i = 0; i < mutex179_ring_n && i < MUTEX179_RING; i++) {
+    mutex179_rec *r = &mutex179_ring[i];
+    if (r->kind == 1)
+      fprintf(f, "[mutex179] wait lock=0x%llx holder=%llu caller=0x%llx wtp=0x%llx htp=0x%llx i=%u\n",
+              (unsigned long long)r->obj, (unsigned long long)r->holder,
+              (unsigned long long)r->caller, (unsigned long long)r->wtp,
+              (unsigned long long)r->htp, i);
+    else
+      fprintf(f, "[mutex179] syncwait obj=0x%llx val=%llu caller=0x%llx wtp=0x%llx live=%llu i=%u\n",
+              (unsigned long long)r->obj, (unsigned long long)r->holder,
+              (unsigned long long)r->caller, (unsigned long long)r->wtp,
+              (unsigned long long)r->htp, i);
+  }
+  fprintf(f, "[mutex179] total=%u\n", mutex179_n);
+  fflush(f);
 }
 
 __attribute__((naked, used)) static void mutex179_tramp_wait(void) {
@@ -5977,6 +6034,22 @@ __attribute__((used)) static uintptr_t lock292_ok_ret = 0;
 #define LOCK292_LOG_CAP 64
 static unsigned lock292_n = 0;
 
+/* #334: the lock path records here instead of writing (see the #334 note at
+ * mutex179_log_wait: the hook's write() recursed through fsdev back into the
+ * same hook and overflowed a game thread's stack). Snoop prints these. */
+#define LOCK292_RING 24
+typedef struct {
+  uintptr_t lock, holder, wtp, htp, caller;
+} lock292_rec;
+static lock292_rec lock292_ring[LOCK292_RING];
+static unsigned lock292_ring_n = 0;
+/* #298 holder-PC sample, also bss only now. got: 0 none, 1 sampled, 2 failed. */
+static uintptr_t lock298_mutex = 0, lock298_pc = 0, lock298_lr = 0;
+static unsigned lock298_got = 0;
+/* guard fires (defined with the guard logger below; declared here for the dump) */
+static unsigned lock292_guard_n = 0;
+static uintptr_t lock292_guard_svc = 0;
+
 /* #298: per-mutex wait counts for holder-PC sampling (see lock292_log). */
 #define LOCK298_MAX_MUTEXES 16
 #define LOCK298_SAMPLE_AFTER 32
@@ -5989,12 +6062,17 @@ static struct { uintptr_t mutex; unsigned count; int sampled; } lock298_table[LO
  * Non-static per the #272 lesson: a log fn called only by `bl` from a
  * naked tramp must not be static. */
 __attribute__((used)) void lock292_log(uintptr_t lock, uintptr_t holder, uintptr_t caller) {
-  (void)caller;
   uintptr_t waiter_tp;
   __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (waiter_tp));
   uintptr_t holder_tp = lock272_lookup(lock);
-  if (lock292_n < LOCK292_LOG_CAP)
-    lock272_log_wait(lock, (unsigned)holder, waiter_tp, holder_tp);
+  if (lock292_ring_n < LOCK292_RING) {
+    unsigned i = lock292_ring_n++;
+    lock292_ring[i].lock = lock;
+    lock292_ring[i].holder = holder;
+    lock292_ring[i].wtp = waiter_tp;
+    lock292_ring[i].htp = holder_tp;
+    lock292_ring[i].caller = caller;
+  }
   lock292_n++;
   /* #298: holder-PC sampling. The #297 test showed a cross-thread stall
    * where the holder never releases the mutex, but the logs cannot say
@@ -6027,13 +6105,35 @@ __attribute__((used)) void lock292_log(uintptr_t lock, uintptr_t holder, uintptr
   if (n == LOCK298_SAMPLE_AFTER + 1 && !lock298_table[slot].sampled) {
     lock298_table[slot].sampled = 1;
     uint64_t pc = 0, lr = 0;
+    lock298_mutex = lock;
     if (diag_sample_holder_pc(holder_tp, &pc, &lr)) {
-      gtid270_log("lock298pc", (uintptr_t)pc, (unsigned)lock);
-      gtid270_log("lock298lr", (uintptr_t)lr, (unsigned)lock);
+      lock298_pc = (uintptr_t)pc;
+      lock298_lr = (uintptr_t)lr;
+      lock298_got = 1;
     } else {
-      gtid270_log("lock298pc", 0, (unsigned)lock);  /* sample failed */
+      lock298_got = 2;
     }
   }
+}
+
+/* snoop thread only: the #292 lock records and the #298 sample, printed on a
+ * thread that never takes part in the lock it describes. */
+__attribute__((used)) void lock292_dump(FILE *f) {
+  if (!f) return;
+  for (unsigned i = 0; i < lock292_ring_n && i < LOCK292_RING; i++) {
+    lock292_rec *r = &lock292_ring[i];
+    fprintf(f, "[lock292] wait mutex=0x%llx holder=%llu wtp=0x%llx htp=0x%llx caller=0x%llx i=%u\n",
+            (unsigned long long)r->lock, (unsigned long long)r->holder,
+            (unsigned long long)r->wtp, (unsigned long long)r->htp,
+            (unsigned long long)r->caller, i);
+  }
+  fprintf(f, "[lock292] total=%u guard=%u guardsvc=0x%llx\n",
+          lock292_n, lock292_guard_n, (unsigned long long)lock292_guard_svc);
+  if (lock298_got)
+    fprintf(f, "[lock298] mutex=0x%llx pc=0x%llx lr=0x%llx got=%u\n",
+            (unsigned long long)lock298_mutex, (unsigned long long)lock298_pc,
+            (unsigned long long)lock298_lr, lock298_got);
+  fflush(f);
 }
 
 /* #295: the tramp's guard rejected lock292_svc (out of the +/-4MB
@@ -6041,10 +6141,9 @@ __attribute__((used)) void lock292_log(uintptr_t lock, uintptr_t holder, uintptr
  * target to gtid.log via the lock-free channel so the test shows
  * whether the guard ever fires, and what the bad value was. Non-static
  * per the #272 lesson (called by `bl` from a naked tramp). */
-static unsigned lock292_guard_n = 0;
 __attribute__((used)) void lock292_guard_log(void) {
   lock292_guard_n++;
-  gtid270_log("lock292guard", lock292_svc, lock292_guard_n);
+  lock292_guard_svc = lock292_svc;  /* #334: bss only, no I/O on the lock path */
 }
 
 /* #310: the failing svcArbitrateLock, recorded with NO I/O at all.

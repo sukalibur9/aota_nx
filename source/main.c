@@ -1272,6 +1272,11 @@ static void *nx_jobsnoop_thread(void *arg) {
        * tramp without any I/O) are printed here, on this thread, which has
        * never wedged on the file path. */
       { extern void arb310_dump(FILE *f); arb310_dump(sf); }
+      /* #334: the lock-path records moved off write() -- that write recursed
+       * through fsdev back into the lock hook and ran a game thread's 4 MB
+       * stack into its guard page in #333. They are bss now and print here. */
+      { extern void lock292_dump(FILE *f); lock292_dump(sf); }
+      { extern void mutex179_dump(FILE *f); mutex179_dump(sf); }
       /* #311: NULL message-registry entries skipped by the loop trampoline. */
       { extern void msg311_dump(FILE *f); msg311_dump(sf); }
       /* #315: NULL registry slots compacted just before the introsort. */

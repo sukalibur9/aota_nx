@@ -259,6 +259,50 @@ int debugPrintf(char *text, ...) {
  * same thread as the caller. Test #271 proved TLS[0x1e4] (gtid) is a
  * process-global (33279 for every game thread), so tp is the registry
  * that maps holder/waiter tpidrro values back to threads. */
+/* #334: re-entrancy guard for the raw channels.
+ *
+ * Test #333's crash report and nested-exception dump proved the fatal loop:
+ * the lock-slow-path hook logged with write(), write() dispatches through the
+ * FS service (fsdev_write -> _fsObjectDispatchImpl -> sessionmgrAttachClient),
+ * and that dispatch takes a libnx mutex -- the very fn the hook is patched
+ * into. Each level re-entered the hook and wrote again (the crashed thread's
+ * return-address chain repeats fsdev_write <-> lock292_tramp_log), until a
+ * 4 MB game-thread stack ran off its bottom into the guard page (nested dump:
+ * write to 0x563f5f3f20 with sp=0x563f5f4010, below the 0x563f5f5000 stack
+ * buffer). The fs session mutex stayed held for the whole loop, so every other
+ * thread's write() blocked -- alive.log 0 bytes, the whole process silent.
+ *
+ * The hooks no longer write at all (#334, gpu_arena.c), and this guard makes
+ * any *other* nested log line a no-op as well: the same thread may not be
+ * inside a channel write twice. tp-keyed, lock-free, no TLS slot of its own;
+ * a collision only drops a line. tp == 0 (raw kernel thread) shares one flag. */
+#define LOGIO_SLOTS 32
+static volatile uintptr_t logio_tp[LOGIO_SLOTS];
+static volatile unsigned logio_busy[LOGIO_SLOTS];
+static volatile int logio_shared;
+
+static int logio_take(int *slot) {
+  uintptr_t tp;
+  __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tp));
+  if (!tp) {
+    if (logio_shared) return 0;
+    logio_shared = 1;
+    *slot = -1;
+    return 1;
+  }
+  unsigned h = (unsigned)((tp >> 5) & (LOGIO_SLOTS - 1));
+  if (logio_busy[h] && logio_tp[h] == tp) return 0;
+  logio_tp[h] = tp;
+  logio_busy[h] = 1;
+  *slot = (int)h;
+  return 1;
+}
+
+static void logio_give(int slot) {
+  if (slot < 0) { logio_shared = 0; return; }
+  logio_busy[slot] = 0;
+}
+
 static int gtid270_fd = -1;
 static int gtid270_open(void) {
   if (gtid270_fd < 0) {
@@ -279,9 +323,11 @@ static int hex16(char *buf, int n, uintptr_t v) {
   return n;
 }
 void gtid270_log(const char *tag, uintptr_t id, unsigned gtid) {
+  int logio_slot;
+  if (!logio_take(&logio_slot)) return;   /* #334: no nested channel writes */
   uintptr_t tp;
   __asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (tp));
-  if (gtid270_open() < 0) return;
+  if (gtid270_open() < 0) { logio_give(logio_slot); return; }
   char buf[128];
   int n = 0;
   const char *pre = "[gtid270] ";
@@ -308,6 +354,7 @@ void gtid270_log(const char *tag, uintptr_t id, unsigned gtid) {
   /* Single write: best-effort, ignore short/failed writes. */
   ssize_t w = write(gtid270_fd, buf, (size_t)n);
   (void)w;
+  logio_give(logio_slot);
 }
 
 /* #272: lock-free lock-wait record, same file/fd as gtid270_log (shared
@@ -318,7 +365,9 @@ void gtid270_log(const char *tag, uintptr_t id, unsigned gtid) {
  * before lock272_arm ran, or evicted by a table collision). Called from
  * mutex179_log_wait, on the waiter thread; raw write only. */
 void lock272_log_wait(uintptr_t mutex, unsigned holder_gtid, uintptr_t waiter_tp, uintptr_t holder_tp) {
-  if (gtid270_open() < 0) return;
+  int logio_slot;
+  if (!logio_take(&logio_slot)) return;   /* #334: no nested channel writes */
+  if (gtid270_open() < 0) { logio_give(logio_slot); return; }
   char buf[160];
   int n = 0;
   const char *pre = "[lock272] wait mutex=0x";
@@ -340,6 +389,7 @@ void lock272_log_wait(uintptr_t mutex, unsigned holder_gtid, uintptr_t waiter_tp
   buf[n++] = '\n';
   ssize_t w = write(gtid270_fd, buf, (size_t)n);
   (void)w;
+  logio_give(logio_slot);
 }
 
 // Per-thread bionic TLS. The engine reads its stack canary from tpidr_el0+0x28;
