@@ -526,10 +526,20 @@ static void *getproperty_value(const char *key) {
   if (which >= 0 && which <= 2 && !logged[which]) {
     logged[which] = 1;
     debugPrintf("[jni] getProperty -> %s\n",
-                which == 1 ? "24000" : which == 2 ? "256" : "(empty)");
+                which == 1 ? "48000" : which == 2 ? "512" : "(empty)");
   }
-  if (which == 1) return jni_make_string("24000");
-  if (which == 2) return jni_make_string("256");
+  /* Build #336: 24000 here was the whole of the "sound plays too fast"
+   * symptom in test #335. FMOD takes this property as the device rate and
+   * configures its software format to it -- the log's
+   * `AudioDevice.init(2, 0x5dc0, 512, 4)` is exactly 24000 Hz (0x5dc0), the
+   * documented default for FMOD's Android/OpenSL output. Our sink then
+   * appended every one of those frames to audout, which always runs at
+   * 48000 Hz, so 24 kHz PCM came out at twice the rate (and an octave up).
+   * Answer the console's real rate: libnx audout is 48000/stereo, and
+   * opensles.c feeds it at that rate, so a 48 kHz answer keeps FMOD's format
+   * and the sink in agreement with no resampling at all. */
+  if (which == 1) return jni_make_string("48000");
+  if (which == 2) return jni_make_string("512");
   return jni_make_string("");
 }
 
@@ -1815,7 +1825,114 @@ static const char *recv_class(void *recv){
   return unity_handle_class(recv);
 }
 
+/* ==========================================================================
+ * [inp336] android/view/InputDevice -- the read side Unity's event pipeline
+ * and Rewired both walk before they trust an injected event.
+ *
+ * Test #335 proved the bytes arrive: [in.i] shows the engine reading
+ * getSource/getAction/getKeyCode on our KeyEvents and getSource=4098
+ * (AINPUT_SOURCE_TOUCHSCREEN) on our MotionEvents. But immediately after each
+ * of those reads the log has
+ *     JNI id: UnityPlayer.getDevice ()Landroid/view/InputDevice;   (the class
+ *     label is a placeholder: our GetObjectClass answers one shared fake
+ *     class, so the name is really InputDevice.getDevice)
+ *     [jni] UNMATCHED -> null: ... -- managed code calling a method on this
+ *     result will throw
+ * and the frame keeps rendering with no reaction to the input. Every event
+ * carries a device id (0 for touch, 1 for the pad in [inp144] injections) and
+ * a null device is exactly the "event without a device" case: nothing can be
+ * attributed, so no action fires. Rewired's Android helper also steps through
+ * InputDevice.getDevice(...), which is the NullReferenceException it reports
+ * at init ("Exception setting up native Android input helper").
+ *
+ * Answer it the way Android would: a small pool of devices, ids 0 and 1,
+ * with the AINPUT_SOURCE_* masks our injected events already carry. The
+ * getters are routed by name because the receiver is our own tagged struct.
+ * ========================================================================== */
+#define TAG_INDEV 0x494E4431u   /* 'IND1' */
+typedef struct { uint32_t tag; int id; int sources; } FakeInputDevice;
+static FakeInputDevice g_idev[4];
+
+static int indev_is(const void *p) {
+  const FakeInputDevice *d = p;
+  return d && d->tag == TAG_INDEV;
+}
+
+static void *indev_for(int id) {
+  int i = (id >= 0 && id < 4) ? id : 0;
+  FakeInputDevice *d = &g_idev[i];
+  if (d->tag != TAG_INDEV) {
+    d->tag = TAG_INDEV;
+    d->id  = i;
+    /* 0: the panel plus the pad's key events, 1: the gamepad proper. Mirrors
+     * the sources [inp144] stamps on the events it injects. */
+    d->sources = (i == 0) ? (0x00000101 | 0x00001002 | 0x00002002)   /* kbd|touch|mouse */
+                          : (0x00000401 | 0x00000201 | 0x01000010); /* pad|dpad|joystick */
+  }
+  return d;
+}
+
+static juint indev_int(void *recv, const FakeID *id, va_list va) {
+  FakeInputDevice *d = recv;
+  const char *n = id->name;
+  if (!strcmp(n, "getId") || !strcmp(n, "getDeviceId")) return d->id;
+  if (!strcmp(n, "getSources") || !strcmp(n, "getSource")) return d->sources;
+  if (!strcmp(n, "getControllerNumber")) return d->id;
+  if (!strcmp(n, "getKeyboardType")) return 1;      /* alphabetic */
+  if (!strcmp(n, "isVirtual")) return 0;
+  if (!strcmp(n, "isExternal")) return (d->id != 0);
+  if (!strcmp(n, "getVendorId")) return 0x057E;     /* Nintendo */
+  if (!strcmp(n, "getProductId")) return d->id ? 0x2009 : 0x2006;
+  if (!strcmp(n, "hasKeys")) return 1;
+  if (!strcmp(n, "supportsSource")) {
+    int s = va_arg(va, int);
+    return (d->sources & s) != 0;
+  }
+  return 0;
+}
+
+static void *indev_object(void *recv, const FakeID *id, va_list va) {
+  (void)va;
+  FakeInputDevice *d = recv;
+  const char *n = id->name;
+  if (!strcmp(n, "getName"))
+    return jni_make_string(d->id ? "Nintendo Switch Pro Controller"
+                                 : "Nintendo Switch touchscreen");
+  if (!strcmp(n, "getDescriptor"))
+    return jni_make_string(d->id ? "switch-pro" : "switch-touch");
+  if (!strcmp(n, "getMotionRanges"))
+    return j_NewObjectArray(NULL, 0, NULL, NULL);
+  if (!strcmp(n, "getKeyCharacterMap"))
+    return jni_make_object("android/view/KeyCharacterMap");
+  return NULL;
+}
+
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
+  if (indev_is(recv)) return indev_object(recv, id, va);
+  /* Static, so the receiver is a bare class label: key on name + shape. */
+  if (!strcmp(id->name, "getDevice") &&
+      !strncmp(id->sig, "()Landroid/view/InputDevice;", 27)) {
+    /* No-arg overload seen in the same trace: the touch/current device. */
+    void *dev = indev_for(0);
+    debugPrintf("[inp336] InputDevice.getDevice() -> %p sources=0x%x\n",
+                dev, ((FakeInputDevice *)dev)->sources);
+    return dev;
+  }
+  if (!strcmp(id->name, "getDevice") &&
+      !strncmp(id->sig, "(I)Landroid/view/InputDevice;", 28)) {
+    int dev_id = va_arg(va, int);
+    void *dev = indev_for(dev_id);
+    debugPrintf("[inp336] InputDevice.getDevice(%d) -> %p sources=0x%x\n",
+                dev_id, dev, ((FakeInputDevice *)dev)->sources);
+    return dev;
+  }
+  if ((!strcmp(id->name, "getDeviceIds") || !strcmp(id->name, "getInputDeviceIds")) &&
+      !strcmp(id->sig, "()[I")) {
+    int *v = (int *)calloc(2, sizeof(int));
+    v[0] = 0; v[1] = 1;
+    debugPrintf("[inp336] InputDevice.getDeviceIds -> [0,1]\n");
+    return make_pri_array_adopt(v, 2, 4);
+  }
   log_app_upcall(id);
   { void *dlg; if (dlg325_object(recv, id, va, &dlg)) return dlg; }   /* #325 */
 
@@ -2048,6 +2165,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   return (is_t2b(id->cls) || wants_bitmap) ? t2b_object(id, va) : act_object(id, va);
 }
 static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
+  if (indev_is(recv)) return indev_int(recv, id, va);   /* [inp336] */
   log_app_upcall(id);
   // java.lang.String instance methods reached via CallIntMethod (Unity's
   // java::lang::String::length() does this to size path buffers). The receiver
@@ -2113,8 +2231,21 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
        * write([SI)V sink lives in dispatch_void. */
       int a0 = va_arg(va, int), a1 = va_arg(va, int);
       int a2 = va_arg(va, int), a3 = va_arg(va, int);
-      int rate = (a0 >= 8000 && a0 <= 192000) ? a0 : 48000;
-      int chans = (a1 == 0x04) ? 1 : 2;
+      /* Build #336: the four ints are not in the order the #143 comment
+       * assumed. Test #335 logged (2, 0x5dc0, 512, 4): 0x5dc0 is 24000, so
+       * the rate is the SECOND argument and the first is the channel count.
+       * Treating a0 as the rate meant "not in range" and silently asking for
+       * 48 kHz while FMOD produced 24 kHz -- the too-fast audio of #335.
+       * Take whichever argument can only be a sample rate, and the channel
+       * count from whichever argument is 1 or 2. */
+      int rate = 0, chans = 0;
+      const int arg[4] = { a0, a1, a2, a3 };
+      for (int i = 0; i < 4; i++)
+        if (arg[i] >= 8000 && arg[i] <= 192000) { rate = arg[i]; break; }
+      if (a0 == 1 || a0 == 2)      chans = a0;
+      else if (a1 == 0x04)         chans = 1;
+      if (!rate)  rate  = 48000;
+      if (!chans) chans = 2;
       int dev = audio_fmod_open(rate, chans);
       debugPrintf("[aud143] AudioDevice.init(%d, 0x%x, %d, %d) -> open(%d Hz, %d ch) = %d -> %s\n",
                   a0, a1, a2, a3, rate, chans, dev, dev ? "TRUE" : "FALSE");

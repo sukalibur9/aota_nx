@@ -607,6 +607,18 @@ void opensles_movie_end(void) {
 
 static volatile int    g_nxa_up;                  /* audout open + feeder up */
 static int             g_nxa_in_ch = 2;           /* channels FMOD hands us */
+/* Build #336: audout is fixed at 48000 Hz stereo, but the rate of the PCM
+ * FMOD hands us is whatever its software format is (24000 in test #335, see
+ * the [aud143] init line). Appending 24 kHz frames as if they were 48 kHz made
+ * the title-screen music play at double speed. Keep the producer rate and
+ * linearly resample to NXA_RATE here -- and when the producer already runs at
+ * 48 kHz (the normal case now that getProperty answers 48000) the fast 1:1
+ * loop below is used and no resampling cost is paid at all. */
+static volatile int    g_nxa_in_rate = NXA_RATE;
+static u32             g_rs_step   = 1u << 16;    /* src frames per dst frame, Q16 */
+static u32             g_rs_phase;                /* Q16, relative to g_rs_carry   */
+static s16             g_rs_carry[2];
+static int             g_rs_have;
 static Thread          g_nxa_th;
 static AudioOutBuffer  g_nxa_buf[NXA_SLOTS];
 static u8             *g_nxa_mem[NXA_SLOTS];
@@ -665,9 +677,14 @@ static void nxa_feed(void *arg) {
 }
 
 /* Returns 1 on success, 0 if audout is unavailable (SDL fallback then runs). */
-static int nxa_start(int channels) {
+static int nxa_start(int channels, int rate) {
   if (g_nxa_up) return 1;
   g_nxa_in_ch = (channels == 1) ? 1 : 2;
+  if (rate < 8000 || rate > 192000) rate = NXA_RATE;
+  g_nxa_in_rate = rate;
+  g_rs_step  = (u32)((((u64)rate) << 16) / NXA_RATE);
+  g_rs_phase = 0;
+  g_rs_have  = 0;
   Result rc = audoutInitialize();
   if (R_FAILED(rc)) {
     debugPrintf("[aud320] audoutInitialize=0x%x -> SDL fallback\n", rc);
@@ -705,8 +722,8 @@ static int nxa_start(int channels) {
     audoutExit();
     return 0;
   }
-  debugPrintf("[aud320] audout sink open: 48 kHz stereo, in_ch=%d, ring=%d frames\n",
-              g_nxa_in_ch, NXA_RING_FRAMES);
+  debugPrintf("[aud320] audout sink open: 48 kHz stereo, in_ch=%d in_rate=%d, ring=%d frames\n",
+              g_nxa_in_ch, g_nxa_in_rate, NXA_RING_FRAMES);
   return 1;
 }
 #endif /* __SWITCH__ */
@@ -745,7 +762,7 @@ static int fmod_sdl_open(int rate, int channels) {
 
 int audio_fmod_open(int rate, int channels) {
 #if defined(__SWITCH__)
-  if (nxa_start(channels)) return NXA_RATE;
+  if (nxa_start(channels, rate)) return NXA_RATE;
   debugPrintf("[aud320] audout unavailable, using the SDL sink\n");
 #endif
   return fmod_sdl_open(rate, channels);
@@ -760,21 +777,67 @@ uint32_t audio_fmod_write(const void *pcm, int bytes) {
     const int in_ch = g_nxa_in_ch;
     if (!s || bytes <= 0) return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
     const int frames = bytes / (in_ch * 2);
-    for (int i = 0; i < frames; i++) {
-      /* Full ring == the console is only this far into what we handed it, so
-       * waiting here IS the realtime pacing (what AudioTrack.write did on
-       * Android). Bounded by g_nxa_up so a dead feeder can never hang us. */
-      while (g_nxa_wi - g_nxa_ri >= NXA_RING_FRAMES) {
+    if (frames <= 0) return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
+    if (g_nxa_in_rate == NXA_RATE) {
+      /* 1:1, the case when FMOD mixes at the console rate: no resampling. */
+      for (int i = 0; i < frames; i++) {
+        /* Full ring == the console is only this far into what we handed it, so
+         * waiting here IS the realtime pacing (what AudioTrack.write did on
+         * Android). Bounded by g_nxa_up so a dead feeder can never hang us. */
+        while (g_nxa_wi - g_nxa_ri >= NXA_RING_FRAMES) {
+          if (!g_nxa_up) break;
+          svcSleepThread(500000ULL);   /* 0.5 ms */
+        }
         if (!g_nxa_up) break;
-        svcSleepThread(500000ULL);   /* 0.5 ms */
+        const s16 l = s[i * in_ch];
+        const s16 r = (in_ch > 1) ? s[i * in_ch + 1] : l;
+        const u64 w = g_nxa_wi % NXA_RING_FRAMES;
+        g_nxa_ring[w * 2 + 0] = l;
+        g_nxa_ring[w * 2 + 1] = r;
+        g_nxa_wi++;
       }
-      if (!g_nxa_up) break;
-      const s16 l = s[i * in_ch];
-      const s16 r = (in_ch > 1) ? s[i * in_ch + 1] : l;
-      const u64 w = g_nxa_wi % NXA_RING_FRAMES;
-      g_nxa_ring[w * 2 + 0] = l;
-      g_nxa_ring[w * 2 + 1] = r;
-      g_nxa_wi++;
+    } else {
+      /* [336] Linear resample producer rate -> 48 kHz. One source frame is
+       * carried across calls so the interpolation stays continuous at buffer
+       * boundaries: virtual frame 0 is the carry, virtual frame k is
+       * s[(k-1)*in_ch]. Only positions whose NEXT frame is inside this buffer
+       * are emitted, so nothing past the end is ever read. */
+      const int nv = frames + (g_rs_have ? 1 : 0);
+      for (;;) {
+        const int i = (int)(g_rs_phase >> 16);
+        const int f = (int)(g_rs_phase & 0xFFFFu);
+        if (i + 1 >= nv) break;
+        s16 out[2];
+        for (int c = 0; c < 2; c++) {
+          const int ca = (in_ch > 1) ? c : 0;
+          const int a = g_rs_have
+                      ? (i == 0 ? g_rs_carry[c] : s[(i - 1) * in_ch + ca])
+                      : s[i * in_ch + ca];
+          const int b = g_rs_have
+                      ? s[i * in_ch + ca]                     /* virtual i+1 */
+                      : s[(i + 1) * in_ch + ca];
+          int v = a + (int)(((long long)(b - a) * f) >> 16);
+          if (v >  32767) v =  32767;
+          if (v < -32768) v = -32768;
+          out[c] = (s16)v;
+        }
+        while (g_nxa_wi - g_nxa_ri >= NXA_RING_FRAMES) {
+          if (!g_nxa_up) break;
+          svcSleepThread(500000ULL);
+        }
+        if (!g_nxa_up) break;
+        const u64 w = g_nxa_wi % NXA_RING_FRAMES;
+        g_nxa_ring[w * 2 + 0] = out[0];
+        g_nxa_ring[w * 2 + 1] = out[1];
+        g_nxa_wi++;
+        g_rs_phase += g_rs_step;
+      }
+      /* Carry the last frame we actually have and rebase the phase on it. */
+      g_rs_carry[0] = s[(frames - 1) * in_ch];
+      g_rs_carry[1] = (in_ch > 1) ? s[(frames - 1) * in_ch + 1] : g_rs_carry[0];
+      if (nv > 1 && g_rs_phase >= ((u32)(nv - 1) << 16))
+        g_rs_phase -= (u32)(nv - 1) << 16;
+      g_rs_have = 1;
     }
     return (uint32_t)((g_nxa_wi - g_nxa_ri) * NXA_FRAME_BYTES);
   }

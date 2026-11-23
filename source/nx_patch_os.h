@@ -386,23 +386,26 @@ static const NxPatchWord OS_WAITSKIP_PATCHES[] = {
  * point. Its only essential effects are two global stores, which main.c
  * replicates.
  *
- * Recovered by disassembling THIS libil2cpp's JNI_OnLoad @ 0x673fc0 (exported
- * dynsym, 68 bytes):
- *     adrp x8,#0x256e000 ; str x19,[x8,#0x240]   -> VM global  +0x256e240
- *     adrp x0,#0x674000  ; add x0,x0,#4          -> handler fn +0x674004
- *     bl 0x6d6858, whose entire body is
- *       { adrp x8,#0x256f000 ; str x0,[x8,#0x5d8] ; ret }
- *                                                -> handler ptr +0x256f5d8
+ * Recovered by disassembling THIS title's libil2cpp JNI_OnLoad @ 0x2c0abbc
+ * (exported dynsym, 68 bytes):
+ *     adrp x8,#0x66ca000 ; str x19,[x8,#0xec0]   -> VM global  +0x66caec0
+ *     adr  x0,#0x2c0ac00                         -> handler fn +0x2c0ac00
+ *     bl   0x2c09fc0, whose entire body is
+ *       { adrp x8,#0x66ca000 ; str x0,[x8,#0xea0] ; ret }
+ *                                                -> handler ptr +0x66caea0
  *
- * Cross-check: the handler at +0x674004 opens by reading the VM global back --
- * `adrp x26,#0x256e000 ; ldr x8,[x26,#0x240]` -- so the two agree with each
- * other rather than only with the pattern.
- * Both globals land in .bss; the handler fn is in .text. Same three-instruction
- * registration shape as every other port in this lineage.
+ * (#335 carried 0x256e240/0x256f5d8/0x674004 from a DIFFERENT game's
+ * libil2cpp, so the store landed in this image's read-only first segment and
+ * the real VM slot stayed NULL. il2cpp then logged "Java VM not initialized"
+ * at test #335 and every managed AndroidJNI / AndroidJavaObject call failed --
+ * which is the Rewired init NRE in that log.)
+ * Both globals land in .bss (segment 4, 0x6352698 + 0x58f988); the handler fn
+ * is in .text. Same three-instruction registration shape as every other port
+ * in this lineage.
  * ======================================================================== */
-#define OS_IL2CPP_VM_GLOBAL     0x256e240
-#define OS_IL2CPP_HANDLER_PTR   0x256f5d8
-#define OS_IL2CPP_HANDLER_FN    0x674004
+#define OS_IL2CPP_VM_GLOBAL     0x66caec0
+#define OS_IL2CPP_HANDLER_PTR   0x66caea0
+#define OS_IL2CPP_HANDLER_FN    0x2c0ac00
 
 /* ---- il2cpp object layout (64-bit, version-independent) ------------------
  * Il2CppString : Il2CppObject{klass,monitor} = 0x10, then int32 length, chars.
