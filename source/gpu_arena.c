@@ -1123,11 +1123,21 @@ void __wrap_free(void *p) {
   {
     size_t head = *(size_t *)((char *)p - 8);
     size_t csz = head & ~(size_t)7;
-    if (csz < 32 || (csz & 15) != 0 || csz > (size_t)0x40000000) {
+    /* Build #335: the low bits are the tell this build's crash left behind.
+     * _free_r computes the next chunk as chunk + (head & ~1) (see
+     * aota_nx+0x93A6F4 in test #334), so bit0 is the only flag newlib keeps
+     * and bits 1-2 must be zero or the walk leaves the 8-byte grid. #334 died
+     * exactly there: free(0x55b81551f0) had head=0xc02, and 0xc02 & ~7 = 0xc00
+     * passed the old test while _free_r's own next chunk was 0x55b8155de2
+     * (misaligned by 2) -- the walk then read a size of 0x0021000000000000 and
+     * faulted at far=0x00210055b8155dea. Rejecting head&6 is not a heuristic:
+     * a chunk head the allocator itself could have written never has them. */
+    if ((head & 6) != 0 || csz < 32 || (csz & 15) != 0 || csz > (size_t)0x40000000) {
       static unsigned cg_n = 0;
       if (cg_n++ < 128)
-        debugPrintf("[chunk161] POISONED free(%p) caller %p head 0x%zx size 0x%zx -- leaking, NOT feeding newlib\n",
-                    p, (void *)__builtin_return_address(0), head, csz);
+        debugPrintf("[chunk161] POISONED free(%p) caller %p head 0x%zx size 0x%zx prev 0x%zx -- leaking, NOT feeding newlib\n",
+                    p, (void *)__builtin_return_address(0), head, csz,
+                    *(size_t *)((char *)p - 16));
       return;
     }
   }
@@ -1170,14 +1180,17 @@ void __wrap_free(void *p) {
    * regression) -- only the heap-top crossing that #162/#163 hit. */
   {
     uintptr_t ch = (uintptr_t)p - 0x10;   /* chunk base: size field at p-8 */
-    size_t sz = *(size_t *)(ch + 8) & ~(size_t)7;   /* own size, #161-validated */
+    /* #335: mask ~1, exactly like _free_r (head & ~1) -- ~7 hides the very
+     * bits (1-2) that decide the walk's alignment when a header is poisoned. */
+    size_t sz = *(size_t *)(ch + 8) & ~(size_t)1;   /* own size, #161-validated */
     uintptr_t heap_hi = (uintptr_t)sbrk(0);   /* #164: current break */
     for (int link = 1; link <= 4; link++) {
       uintptr_t nxt = ch + sz;
       if (nxt >= heap_hi) break;   /* #164: left the heap -- chain end, pass */
-      size_t nsz = *(size_t *)(nxt + 8) & ~(size_t)7;
+      size_t nraw = *(size_t *)(nxt + 8);
+      size_t nsz = nraw & ~(size_t)1;   /* #335: _free_r's arithmetic */
       if (nsz == 0) break;   /* #163: chain end (boundary), not poison */
-      if (nsz < 32 || (nsz & 15) != 0 || nsz > (size_t)0x40000000) {
+      if ((nraw & 6) != 0 || nsz < 32 || (nsz & 15) != 0 || nsz > (size_t)0x40000000) {
         static unsigned ch_n = 0;
         if (ch_n++ < 128)
           debugPrintf("[chain162] POISONED link %d free(%p) caller %p next %p size 0x%zx -- leaking, NOT feeding newlib\n",

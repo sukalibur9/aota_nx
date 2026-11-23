@@ -1842,11 +1842,23 @@ static int oc_contains(void *addr) { return oc_win_of(addr) != NULL; }
  * which only falls back to today's behavior. The mmap_arena pair is
  * likewise safe: mmap_arena_init_locked publishes mmap_usable before
  * mmap_arena, so a non-NULL base implies the size is already set. */
+static int fb_owned_region(void *addr);   /* #335: mmap_fallback block test */
+
 int oc_ptr_is_oc(void *addr) {
   if (!addr) return 0;
   if (oc_contains(addr)) return 1;
-  return mmap_arena && (uint8_t *)addr >= mmap_arena &&
-         (uint8_t *)addr < mmap_arena + mmap_usable;
+  if (mmap_arena && (uint8_t *)addr >= mmap_arena &&
+      (uint8_t *)addr < mmap_arena + mmap_usable) return 1;
+  /* Build #335: mmap_fallback serves Baselib reserves with memalign() from the
+   * newlib heap, so a fallback block IS a newlib chunk -- but every managed
+   * allocation carved out of it is an INTERIOR pointer. Test #334 died in
+   * newlib's chunk walk freeing 0x55b81551f0, 1.4 MB inside the 256 MB fallback
+   * block created by "[mmap] fallback 327676 KB -> 0x55b8000000": the bytes at
+   * p-8 are payload (head 0xc02, bit1 set), so _free_r computed the next chunk
+   * as 0x55b8155de2 and faulted reading 0x00210055b8155dea (esr 0x92000004).
+   * Treat a fallback block like the other managed regions: leak, never feed
+   * newlib a pointer that is not its own chunk. */
+  return fb_owned_region(addr);
 }
 
 /* Build #126: phantom tails. An over-map request (320 MB for a 256 MB block)
@@ -2376,6 +2388,22 @@ typedef struct {
 } FbBlock;
 static FbBlock g_fb[MMAP_FALLBACK_MAX];
 static int     g_fb_n = 0;
+
+/* Build #335: lock-free membership test for __wrap_free (oc_ptr_is_oc).
+ * mmap_fallback fills a slot completely before publishing it in g_fb_n, so a
+ * reader that loads g_fb_n once never inspects a half-written entry; a miss
+ * just falls back to the previous behaviour. No lock: __wrap_free can run with
+ * g_fb_lock held (mmap_fallback's own failure paths free while holding it). */
+static int fb_owned_region(void *addr) {
+  uintptr_t a = (uintptr_t)addr;
+  int n = __atomic_load_n(&g_fb_n, __ATOMIC_ACQUIRE);
+  for (int i = 0; i < n; i++) {
+    uintptr_t b = (uintptr_t)g_fb[i].ptr;
+    size_t l = g_fb[i].len;
+    if (b && l && a >= b && a < b + l) return 1;
+  }
+  return 0;
+}
 static size_t  g_fb_bytes = 0;
 static size_t  g_fb_peak = 0;
 static Mutex   g_fb_lock;
@@ -2576,8 +2604,12 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
   mutexLock(&g_fb_lock);
   int tracked = 0;
   if (g_fb_n < MMAP_FALLBACK_MAX) {
-    FbBlock *b = &g_fb[g_fb_n++];
-    b->ptr = (uint8_t *)q; b->len = alloc; b->live = alloc / MMAP_PAGE; b->dead = NULL;
+    /* #335: fill the slot FIRST, publish it second -- fb_owned_region() reads
+     * the table without g_fb_lock from __wrap_free. */
+    FbBlock *b = &g_fb[g_fb_n];
+    b->ptr = (uint8_t *)q; b->live = alloc / MMAP_PAGE; b->dead = NULL;
+    __atomic_store_n(&b->len, alloc, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fb_n, g_fb_n + 1, __ATOMIC_RELEASE);
     g_fb_bytes += alloc;
     if (g_fb_bytes > g_fb_peak) g_fb_peak = g_fb_bytes;
     tracked = 1;
