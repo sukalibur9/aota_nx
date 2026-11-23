@@ -12,6 +12,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <switch.h>
 
 #include "config.h"
@@ -1853,9 +1854,53 @@ static const char *recv_class(void *recv){
 typedef struct { uint32_t tag; int id; int sources; } FakeInputDevice;
 static FakeInputDevice g_idev[4];
 
+/* Build #338: the whole InputDevice bridge above is OPT-IN.
+ *
+ * Test #337 proved the #336 crash was NOT the JavaVM hand-off: with the VM
+ * registration disabled and the default boot path of working #335 restored,
+ * the game still crashed at the identical site, before the title screen:
+ *     [xd] desc=0x100 pc=0x0 far=0 esr=82000005
+ *     [xd] lr=libunity.so+0xf3fb80   (blr of a null slot in a callback queue)
+ *     x8=0, x9 -> a 0x90-byte queue node whose +8 handler is zero
+ *     [boot] #337 il2cpp JavaVM DISABLED   <- VM not involved
+ *     no [aud143] / no audout sink        <- audio not involved either
+ * So the only #336 change that runs before that point is THIS bridge, and the
+ * only behavioural difference it makes upstream is that Unity now enumerates
+ * two input devices instead of zero:
+ *     getInputDeviceIds ()[I  -> [0,1]   (was "UNMATCHED -> empty array")
+ *     getDevice(0)/getDevice(1) -> live objects (was null)
+ *     getSources/getName/getDescriptor/getMotionRanges -> answered
+ *     List.iterator() / Iterator.hasNext() -> empty walk
+ * Unity's native AndroidInput init therefore runs for the first time, and the
+ * null-handler queue node appears later on another thread. Until the exact
+ * hand-off in that init is pinned down with a log, the bridge stays behind a
+ * flag so one NRO can answer both questions in one boot:
+ *     create sdmc:/switch/aota/inp_on  -> bridge ON  (test path)
+ *     no file (default)                -> bridge OFF (#335 input behaviour) */
+static int nx_inp_bridge_on(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    struct stat st;
+    cached = (stat("sdmc:/switch/aota/inp_on", &st) == 0 || stat("inp_on", &st) == 0) ? 1 : 0;
+    debugPrintf("[boot] #338 InputDevice bridge %s\n",
+                cached ? "ENABLED (inp_on present)"
+                       : "DISABLED (no inp_on) -- #335 input behaviour, was the last known-good boot");
+  }
+  return cached;
+}
+
 static int indev_is(const void *p) {
+  if (!p || ((uintptr_t)p & 3) || (uintptr_t)p < 0x1000) return 0;
   const FakeInputDevice *d = p;
-  return d && d->tag == TAG_INDEV;
+  return d->tag == TAG_INDEV;
+}
+
+/* Tag probe for receivers that may be one of our own array handles, with the
+ * alignment/plausibility guard the #337 inline dereference lacked. */
+static int indev_is_container(const void *p) {
+  if (!p || ((uintptr_t)p & 3) || (uintptr_t)p < 0x1000) return 0;
+  const uint32_t t = *(const uint32_t *)p;
+  return t == TAG_OBJARR || t == TAG_PRIARR;
 }
 
 static void *indev_for(int id) {
@@ -1908,9 +1953,9 @@ static void *indev_object(void *recv, const FakeID *id, va_list va) {
 }
 
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
-  if (indev_is(recv)) return indev_object(recv, id, va);
+  if (nx_inp_bridge_on() && indev_is(recv)) return indev_object(recv, id, va);
   /* Static, so the receiver is a bare class label: key on name + shape. */
-  if (!strcmp(id->name, "getDevice") &&
+  if (nx_inp_bridge_on() && !strcmp(id->name, "getDevice") &&
       !strncmp(id->sig, "()Landroid/view/InputDevice;", 27)) {
     /* No-arg overload seen in the same trace: the touch/current device. */
     void *dev = indev_for(0);
@@ -1918,7 +1963,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
                 dev, ((FakeInputDevice *)dev)->sources);
     return dev;
   }
-  if (!strcmp(id->name, "getDevice") &&
+  if (nx_inp_bridge_on() && !strcmp(id->name, "getDevice") &&
       !strncmp(id->sig, "(I)Landroid/view/InputDevice;", 28)) {
     int dev_id = va_arg(va, int);
     void *dev = indev_for(dev_id);
@@ -1926,7 +1971,8 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
                 dev_id, dev, ((FakeInputDevice *)dev)->sources);
     return dev;
   }
-  if ((!strcmp(id->name, "getDeviceIds") || !strcmp(id->name, "getInputDeviceIds")) &&
+  if (nx_inp_bridge_on() &&
+      (!strcmp(id->name, "getDeviceIds") || !strcmp(id->name, "getInputDeviceIds")) &&
       !strcmp(id->sig, "()[I")) {
     int *v = (int *)calloc(2, sizeof(int));
     v[0] = 0; v[1] = 1;
@@ -1941,9 +1987,8 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
    * run right before it). Answer every iterator() on one of OUR containers
    * with a live, empty iterator instead: hasNext() on it falls through to the
    * generic 0, so the walk ends immediately, exactly as the empty array says. */
-  if (!strcmp(id->name, "iterator") &&
-      !strncmp(id->sig, "()Ljava/util/Iterator;", 22) && recv &&
-      (*(uint32_t *)recv == TAG_OBJARR || *(uint32_t *)recv == TAG_PRIARR)) {
+  if (nx_inp_bridge_on() && !strcmp(id->name, "iterator") &&
+      !strncmp(id->sig, "()Ljava/util/Iterator;", 22) && recv && indev_is_container(recv)) {
     void *it = jni_make_object("java/util/Iterator");
     debugPrintf("[inp337] iterator() on our container -> %p (empty; was UNMATCHED null)\n", it);
     return it;
@@ -2180,7 +2225,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   return (is_t2b(id->cls) || wants_bitmap) ? t2b_object(id, va) : act_object(id, va);
 }
 static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
-  if (indev_is(recv)) return indev_int(recv, id, va);   /* [inp336] */
+  if (nx_inp_bridge_on() && indev_is(recv)) return indev_int(recv, id, va);   /* [inp336] */
   log_app_upcall(id);
   // java.lang.String instance methods reached via CallIntMethod (Unity's
   // java::lang::String::length() does this to size path buffers). The receiver
