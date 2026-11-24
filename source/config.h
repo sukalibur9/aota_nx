@@ -144,7 +144,25 @@
  *                                              hand over a contiguous block:
  *                                              this constant is now TOO HIGH.
  * If the game instead OOMs on the managed side, trade back down. */
-#define GFX_RESERVE_MB      192u
+/* Build #346: 192 -> 96. #345 finally OOM'ed on the MANAGED side, which the
+ * note above says to answer by trading this constant back down. Its last lines
+ * are
+ *     [fb316] memalign FAILED: 53772 KB ... heap 2723/50 MB, free-chunks 44922
+ *             top-chunk 8 KB, blocks 33/1474 MB
+ *     [mmap] arena FULL and newlib fallback FAILED for 52 MB (out of RAM)
+ * i.e. the 52 MB FMOD bank needed ONE contiguous block and the heap held 50 MB
+ * in 44922 pieces with an 8 KB top chunk. #342 (same scene, 7270 frames, no
+ * crash) had 99 MB free at that moment and its 52 MB block landed right after
+ * the 107 MB libil2cpp.so map. 96 MB more newlib puts a 96 MB top chunk at the
+ * end of the heap, which is what that request needs.
+ *
+ * The check the note above asks for says the driver can afford it:
+ *     [probe] mem total=3189 MB used=2993 MB free=195 MB
+ * 195 MB free is nowhere near the "small N => raise this constant" warning, and
+ * this keeps ~99 MB, still above the 1080p swapchain + depth + render targets
+ * budget listed above (~60-80 MB). If the next log shows GPU allocation
+ * failures instead, this line is the one to put back. */
+#define GFX_RESERVE_MB      96u
 
 // Overcommit (alias-region) mode: reserve a big *virtual* window (PROT_NONE
 // costs only address space) and commit physical pages on demand -- true
