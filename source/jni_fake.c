@@ -1962,6 +1962,42 @@ static void *indev_object(void *recv, const FakeID *id, va_list va) {
 
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   if (nx_inp_bridge_on() && indev_is(recv)) return indev_object(recv, id, va);
+  /* [inp342] Rewired's Android input helper died with a NullReferenceException
+   * right after this call (log #341, frame ~190):
+   *     [jni] UNMATCHED -> null: java/lang/Object.getApplicationContext()...
+   *     IL2CPP: Rewired: Exception setting up native Android input helper.
+   *     System.NullReferenceException ... Using Unity input: False
+   * The helper asks currentActivity for the application context and then calls
+   * InputManager methods on it. A null context turns into the NRE that aborts
+   * the whole native-input setup, which is why every injected key/touch reached
+   * Unity ([in.i] getKeyCode/getSource) but no Rewired action ever fired.
+   * Answer a live Context, and hand back a live InputManager for
+   * getSystemService("input") so the rest of the setup can run. */
+  if (!strcmp(id->name, "getApplicationContext") &&
+      !strncmp(id->sig, "()Ljava/lang/Object;", 19)) {
+    void *ctx = jni_make_object("android/content/Context");
+    debugPrintf("[inp342] getApplicationContext -> %p (was UNMATCHED null)\n", ctx);
+    return ctx;
+  }
+  if (!strcmp(id->name, "getSystemService") &&
+      !strncmp(id->sig, "(Ljava/lang/String;)Ljava/lang/Object;", 37)) {
+    void *svc = jni_make_object("android/hardware/input/InputManager");
+    debugPrintf("[inp342] getSystemService(String) -> %p InputManager\n", svc);
+    return svc;
+  }
+  /* UnityPlayer.getInputDevice(I) is a different lookup from
+   * InputDevice.getDevice(I): Rewired asks UnityPlayer directly for the device
+   * that produced an event, and that call was "UNMATCHED -> null" in #341 even
+   * though the #339 bridge answered InputDevice.getDevice. Same pool, same
+   * sources the injected events carry. */
+  if (!strcmp(id->name, "getInputDevice") &&
+      !strncmp(id->sig, "(I)Landroid/view/InputDevice;", 28)) {
+    int dev_id = va_arg(va, int);
+    void *dev = indev_for(dev_id);
+    debugPrintf("[inp342] UnityPlayer.getInputDevice(%d) -> %p sources=0x%x\n",
+                dev_id, dev, ((FakeInputDevice *)dev)->sources);
+    return dev;
+  }
   /* Static, so the receiver is a bare class label: key on name + shape. */
   if (nx_inp_bridge_on() && !strcmp(id->name, "getDevice") &&
       !strncmp(id->sig, "()Landroid/view/InputDevice;", 27)) {

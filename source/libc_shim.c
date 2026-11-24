@@ -2700,9 +2700,24 @@ static void *mmap_fallback(size_t length, int prot, int flags, int fd, long offs
   mutexUnlock(&g_fb_lock);
   if (!tracked)
     debugPrintf("[mmap] fb: block table full (%d) -- %p will never be released\n", MMAP_FALLBACK_MAX, q);
-  debugPrintf("[mmap] fallback %u KB -> %p  anon=%d fd=%d off=0x%lx got=%ld aligned=%d (blocks %d, total %u MB)\n",
+  /* [aud342] FMOD's Master.bank is 54,536,224 B and #341 logs a 53,772 KB
+   * anonymous fallback immediately before
+   *     [FMOD] loadFromWeb ... result = ERR_MEMORY
+   * so this line now carries the app's free physical memory at the moment the
+   * bank allocation happens. If free is below ~54 MB here, ERR_MEMORY is the
+   * second (FMOD-owned) copy failing, not a bad download: the jar entry is in
+   * base.apk (the 40 pack entries include Master.bank). */
+  unsigned fm = 0;
+  {
+    u64 tot = 0, used = 0;
+    if (R_SUCCEEDED(svcGetInfo(&tot, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0)) &&
+        R_SUCCEEDED(svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0)) &&
+        tot > used)
+      fm = (unsigned)((tot - used) >> 20);
+  }
+  debugPrintf("[mmap] fallback %u KB -> %p  anon=%d fd=%d off=0x%lx got=%ld aligned=%d (blocks %d, total %u MB, free=%u MB)\n",
               (unsigned)(length >> 10), q, !!(flags & BIONIC_MAP_ANONYMOUS), fd, offset, got, aligned,
-              nblk, (unsigned)(total >> 20));
+              nblk, (unsigned)(total >> 20), fm);
   return q;
 }
 
