@@ -1301,11 +1301,118 @@ void apk314_done(int loud, const char *op, int fd, long long r) {
     debugPrintf("[apk314] %s fd=%d -> %lld%s\n", op, fd, r, r < 0 ? "  *** ERR ***" : "");
 }
 
+/* ---------------- #345: memory-backed synthetic /proc and /sys ----------------
+ * open() of a synthetic node used to write the content into .synth<path> and
+ * reopen it. That file was shared and truncated on every open, so two engine
+ * threads opening /proc/cpuinfo (or /proc/meminfo, or /proc/self/maps) at the
+ * same moment saw each other's partial file. Build #344 hit it: it logged
+ * "SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb" where every healthy run
+ * logs 3 cores / 512 MB -- and exactly the runs that reported 1 core / 0 MB
+ * (b337vm, b340, b344) are the runs whose scene load then failed to bind
+ * hundreds of MonoBehaviours and finally faulted inside libunity. Keep the
+ * bytes in memory, per descriptor: no shared file, no truncation, and no SD
+ * round-trip for a /proc/self/maps that Unity opens dozens of times a load. */
+#define SYNTH_FD_BASE  0x50000000
+#define SYNTH_FD_COUNT 32
+typedef struct { int used; char *data; size_t size; size_t pos; } SynthFd;
+static SynthFd g_synth_fds[SYNTH_FD_COUNT];
+static Mutex    g_synth_lock;            /* zero-init == unlocked */
+
+int synth_fd_is(int fd) {
+  return fd >= SYNTH_FD_BASE && fd < SYNTH_FD_BASE + SYNTH_FD_COUNT;
+}
+
+static int synth_fd_add(char *data, size_t size) {
+  if (!data) return -1;
+  mutexLock(&g_synth_lock);
+  for (int i = 0; i < SYNTH_FD_COUNT; i++) {
+    if (!g_synth_fds[i].used) {
+      g_synth_fds[i].used = 1;
+      g_synth_fds[i].data = data;
+      g_synth_fds[i].size = size;
+      g_synth_fds[i].pos = 0;
+      mutexUnlock(&g_synth_lock);
+      return SYNTH_FD_BASE + i;
+    }
+  }
+  mutexUnlock(&g_synth_lock);
+  free(data);
+  debugPrintf("[synth345] fd table full, open refused\n");
+  errno = EMFILE;
+  return -1;
+}
+
+long synth_fd_read(int fd, void *buf, size_t count) {
+  if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
+  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
+  mutexLock(&g_synth_lock);
+  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  size_t available = f->size - f->pos;
+  if (count > available) count = available;
+  if (count) memcpy(buf, f->data + f->pos, count);
+  f->pos += count;
+  mutexUnlock(&g_synth_lock);
+  return (long)count;
+}
+
+long synth_fd_pread(int fd, void *buf, size_t count, uint64_t off) {
+  if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
+  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
+  mutexLock(&g_synth_lock);
+  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  size_t available = off < f->size ? f->size - (size_t)off : 0;
+  if (count > available) count = available;
+  if (count) memcpy(buf, f->data + off, count);
+  mutexUnlock(&g_synth_lock);
+  return (long)count;
+}
+
+long synth_fd_lseek(int fd, long off, int whence) {
+  if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
+  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
+  mutexLock(&g_synth_lock);
+  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->pos :
+                 whence == SEEK_END ? (int64_t)f->size : -1;
+  if (base < 0 || (off < 0 && base < -off)) {
+    mutexUnlock(&g_synth_lock);
+    errno = EINVAL;
+    return -1;
+  }
+  f->pos = (size_t)(base + off);
+  long result = (long)f->pos;
+  mutexUnlock(&g_synth_lock);
+  return result;
+}
+
+int synth_fd_size(int fd, uint64_t *size) {
+  if (!synth_fd_is(fd)) return 0;
+  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
+  mutexLock(&g_synth_lock);
+  int used = f->used;
+  if (used && size) *size = f->size;
+  mutexUnlock(&g_synth_lock);
+  return used;
+}
+
+int synth_fd_close(int fd) {
+  if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
+  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
+  mutexLock(&g_synth_lock);
+  char *data = f->used ? f->data : NULL;
+  memset(f, 0, sizeof(*f));
+  mutexUnlock(&g_synth_lock);
+  free(data);
+  if (!data) { errno = EBADF; return -1; }
+  return 0;
+}
+
 /* lseek for arm64: off_t is already 64-bit, so this also services lseek64.
  * lseek64 was previously stubbed to return 0 (no seek) -- that made libunity's
  * archive reader see the main archive as empty/mis-positioned ("Unable to read
  * header from archive file"), since it lseek64(SEEK_END)s to size the file. */
 long z_lseek(int fd, long off, int whence) {
+  if (synth_fd_is(fd)) return synth_fd_lseek(fd, off, whence);
   if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
   diag_in_fs(1);   /* #327: lseek is an fs request too */
   long r = lseek(fd, off, whence);
@@ -1325,25 +1432,19 @@ static const char *synthetic_proc(const char *path);  /* defined below */
 static int synth_proc_open(const char *path) {
   if (!path) return -1;
   if (strncmp(path, "/proc/", 6) && strncmp(path, "/sys/", 5)) return -1;
-  static char buf[16384];
-  int len;
   if (!strcmp(path, "/proc/self/maps") || !strcmp(path, "/proc/self/smaps")) {
-    len = so_dump_maps(buf, sizeof buf);
-  } else {
-    const char *s = synthetic_proc(path);
-    if (!s) return -1;                                   // not /proc or /sys
-    len = (int)strlen(s);
-    if (len > (int)sizeof buf) len = (int)sizeof buf;
-    memcpy(buf, s, (size_t)len);
+    char *data = malloc(16384);
+    if (!data) return -1;
+    int len = so_dump_maps(data, 16384);
+    return synth_fd_add(data, len > 0 ? (size_t)len : 0);   /* #345: no .synth file */
   }
-  char safe[160]; size_t j = 0;
-  for (const char *p = path; *p && j < sizeof safe - 1; p++) safe[j++] = (*p == '/') ? '_' : *p;
-  safe[j] = '\0';
-  char tf[768];   /* GAME_HOME + "/.synth" + up to 160 bytes of `safe` */
-  snprintf(tf, sizeof tf, "%s/.synth%s", GAME_HOME, safe);
-  int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (wfd >= 0) { if (write(wfd, buf, (size_t)len) < 0) { /* best effort */ } close(wfd); }
-  return open(tf, O_RDONLY);
+  const char *s = synthetic_proc(path);
+  if (!s) return -1;                                       // not /proc or /sys
+  size_t len = strlen(s);
+  char *data = malloc(len ? len : 1);
+  if (!data) return -1;
+  memcpy(data, s, len);
+  return synth_fd_add(data, len);
 }
 
 /* Unity probes filesystem case-sensitivity on every boot: it creates
@@ -1377,13 +1478,12 @@ int open_fake(const char *path, int flags, ...) {
     // scene/asset load. Materialize a buffer of real CSPRNG bytes (libnx
     // randomGet) into a file and hand back a real fd so read() just works.
     if (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")) {
-      static char rbuf[65536];
-      randomGet(rbuf, sizeof rbuf);
-      char tf[768];  /* GAME_HOME + "/.synth_dev_random" */
-      snprintf(tf, sizeof tf, "%s/.synth_dev_random", GAME_HOME);
-      int wfd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-      if (wfd >= 0) { if (write(wfd, rbuf, sizeof rbuf) < 0) { /* best effort */ } close(wfd); }
-      int rfd = open(tf, O_RDONLY);
+      /* #345: same shared-file race as the /proc nodes -- two threads opening
+       * /dev/urandom truncated one buffer under the other. Each open gets its
+       * own entropy buffer now. */
+      char *rbuf = malloc(65536);
+      int rfd = -1;
+      if (rbuf) { randomGet(rbuf, 65536); rfd = synth_fd_add(rbuf, 65536); }
       debugPrintf("[io] open(%s,0x%x) -> %d [urandom]\n", path, flags, rfd);
       return rfd;
     }
@@ -1487,6 +1587,21 @@ int stat_fake(const char *path, struct bionic_stat *st) {
   return r;
 }
 int fstat_fake(int fd, struct bionic_stat *st) {
+  {
+    uint64_t ssz;
+    if (synth_fd_size(fd, &ssz)) {          /* #345: memory-backed /proc, /sys */
+      struct stat real;
+      memset(&real, 0, sizeof real);
+      real.st_mode = S_IFREG | 0444;
+      real.st_size = (off_t)ssz;
+      real.st_ino  = (ino_t)(0x5359000000000000ULL | (uint64_t)fd);
+      real.st_nlink = 1;
+      real.st_blksize = 4096;
+      real.st_blocks = (blkcnt_t)((ssz + 511) / 512);
+      convert_stat(&real, st);
+      return 0;
+    }
+  }
   {
     uint64_t psz, pino; int pdir;
     if (asset_pack_fstat_fd(fd, &psz, &pino, &pdir)) {
@@ -3400,6 +3515,7 @@ static void rc_init(void) {
 static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
   /* Pack handles carry their own cache, and their fds are outside the rc_*
    * table's range assumptions -- serve them directly. */
+  if (synth_fd_is(fd)) return synth_fd_pread(fd, buf, count, (uint64_t)off);
   if (asset_pack_fd_is(fd)) return asset_pack_pread_fd(fd, buf, count, (long)off);
   if (fd < 0 || fd >= RC_MAXFD) return -1;
   rc_init();
@@ -3443,6 +3559,7 @@ long rc_pread_pub(int fd, void *buf, size_t count, unsigned long long off) {
   return rc_pread(fd, buf, count, (uint64_t)off);
 }
 long read_fake(int fd, void *buf, size_t count) {
+  if (synth_fd_is(fd)) return synth_fd_read(fd, buf, count);
   if (asset_pack_fd_is(fd)) return asset_pack_read_fd(fd, buf, count);
   if (fakefd_is_fake(fd)) return fakefd_read(fd, buf, count);
   /* fsdev can return fewer bytes than requested for a large read; il2cpp's
@@ -3488,6 +3605,7 @@ long write_fake(int fd, const void *buf, size_t count) {
   return r;
 }
 int close_fake(int fd) {
+  if (synth_fd_is(fd)) return synth_fd_close(fd);
   if (asset_pack_fd_is(fd)) return asset_pack_close_fd(fd);
   if (apk314_is(fd)) { debugPrintf("[apk314] close fd=%d\n", fd); apk314_clear(fd); }
   rc_mark(fd, 0);                          /* fd numbers are reused: drop its blocks */
