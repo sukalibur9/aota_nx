@@ -1925,6 +1925,126 @@ static void *indev_for(int id) {
   return d;
 }
 
+/* [inp343] android/view/InputDevice$MotionRange + the List iterator that walks
+ * it. #342 answered getMotionRanges() with an EMPTY array and #337 made
+ * List.iterator() on that array a working empty walk -- so Unity's native
+ * AndroidInput built the two devices with ZERO axes:
+ *     [inp336] InputDevice.getDevice(1) -> ... sources=0x1000611   (gamepad)
+ *     [inp337] iterator() on our container -> ... (empty)
+ * With no MotionRange, UnityEngine.Input has no joystick axes at all: the
+ * analog sticks of [inp144]'s joystick MotionEvent (getAxisValue) are dropped
+ * before any Rewired action can read them, while the pad's key events keep
+ * working -- exactly "buttons arrive, nothing moves".
+ *
+ * Android reports one MotionRange per axis id; give the gamepad the set a real
+ * pad has (Android MotionEvent.AXIS_*): X/Y/Z/RX/RY, HAT_X/HAT_Y and the
+ * triggers/gas/brake. Device 0 (panel/keyboard) keeps an empty list, as before. */
+#define TAG_MRANGE 0x4D524131u   /* 'MRA1' */
+#define TAG_ITER   0x49545231u   /* 'ITR1' */
+
+typedef struct {
+  uint32_t tag; int axis; int source;
+  float min, max, flat, fuzz, res;
+} FakeMotionRange;
+
+typedef struct { uint32_t tag; void *arr; int idx; } FakeIter;
+static FakeIter g_idev_iter;
+
+static const struct { int axis; float min, max; } k_idev_axes[] = {
+  {  0, -1.0f, 1.0f },   /* AXIS_X        */
+  {  1, -1.0f, 1.0f },   /* AXIS_Y        */
+  { 11, -1.0f, 1.0f },   /* AXIS_Z        */
+  { 12, -1.0f, 1.0f },   /* AXIS_RX       */
+  { 13, -1.0f, 1.0f },   /* AXIS_RY       */
+  { 15, -1.0f, 1.0f },   /* AXIS_HAT_X    */
+  { 16, -1.0f, 1.0f },   /* AXIS_HAT_Y    */
+  { 17,  0.0f, 1.0f },   /* AXIS_LTRIGGER */
+  { 18,  0.0f, 1.0f },   /* AXIS_RTRIGGER */
+  { 22,  0.0f, 1.0f },   /* AXIS_GAS      */
+  { 23,  0.0f, 1.0f },   /* AXIS_BRAKE    */
+};
+static FakeMotionRange g_idev_ranges[sizeof k_idev_axes / sizeof k_idev_axes[0]];
+
+static int indev_tag_is(const void *p, uint32_t tag) {
+  return p && !((uintptr_t)p & 3) && (uintptr_t)p >= 0x1000 &&
+         *(const uint32_t *)p == tag;
+}
+
+/* Build the list our own getters can walk: a TAG_OBJARR of FakeMotionRange. */
+static void *indev_motion_ranges(FakeInputDevice *d) {
+  const int n = (int)(sizeof k_idev_axes / sizeof k_idev_axes[0]);
+  const int count = (d->id == 0) ? 0 : n;      /* the panel has no axes */
+  FakeObjArray *a = calloc(1, sizeof *a);
+  if (!a) return NULL;
+  a->tag   = TAG_OBJARR;
+  a->len   = count;
+  a->items = calloc(count ? count : 1, sizeof(void *));
+  if (!a->items) { free(a); return NULL; }
+  for (int i = 0; i < count; i++) {
+    FakeMotionRange *r = &g_idev_ranges[i];
+    r->tag    = TAG_MRANGE;
+    r->axis   = k_idev_axes[i].axis;
+    r->min    = k_idev_axes[i].min;
+    r->max    = k_idev_axes[i].max;
+    r->flat   = 0.05f;
+    r->fuzz   = 0.0f;
+    r->res    = 0.0f;
+    r->source = d->sources;
+    a->items[i] = r;
+  }
+  debugPrintf("[inp343] InputDevice(%d).getMotionRanges -> %d ranges "
+              "(was empty in #342)\n", d->id, count);
+  return reg_local(a);
+}
+
+static juint indev_extra_int(void *recv, const FakeID *id) {
+  const char *n = id->name;
+  if (indev_tag_is(recv, TAG_ITER)) {
+    FakeIter *it = recv;
+    FakeObjArray *a = it->arr;
+    if (!strcmp(n, "hasNext"))
+      return (a && a->tag == TAG_OBJARR && it->idx < a->len) ? 1u : 0u;
+    return 0;
+  }
+  if (indev_tag_is(recv, TAG_OBJARR) && !strcmp(n, "size"))
+    return (juint)((FakeObjArray *)recv)->len;
+  if (indev_tag_is(recv, TAG_MRANGE)) {
+    const FakeMotionRange *r = recv;
+    if (!strcmp(n, "getAxis"))   return (juint)r->axis;
+    if (!strcmp(n, "getSource")) return (juint)r->source;
+  }
+  return 0;
+}
+
+static void *indev_extra_object(void *recv, const FakeID *id, va_list va) {
+  const char *n = id->name;
+  if (indev_tag_is(recv, TAG_ITER) && !strcmp(n, "next")) {
+    FakeIter *it = recv;
+    FakeObjArray *a = it->arr;
+    if (a && a->tag == TAG_OBJARR && it->idx >= 0 && it->idx < a->len)
+      return a->items[it->idx++];
+    return NULL;
+  }
+  if (indev_tag_is(recv, TAG_OBJARR) && !strcmp(n, "get")) {
+    int i = va_arg(va, int);
+    FakeObjArray *a = recv;
+    return (i >= 0 && i < a->len) ? a->items[i] : NULL;
+  }
+  return NULL;
+}
+
+static float indev_extra_float(void *recv, const FakeID *id) {
+  if (!indev_tag_is(recv, TAG_MRANGE)) return 0.0f;
+  const FakeMotionRange *r = recv;
+  const char *n = id->name;
+  if (!strcmp(n, "getMin"))        return r->min;
+  if (!strcmp(n, "getMax"))        return r->max;
+  if (!strcmp(n, "getFlat"))       return r->flat;
+  if (!strcmp(n, "getFuzz"))       return r->fuzz;
+  if (!strcmp(n, "getResolution")) return r->res;
+  return 0.0f;
+}
+
 static juint indev_int(void *recv, const FakeID *id, va_list va) {
   FakeInputDevice *d = recv;
   const char *n = id->name;
@@ -1954,7 +2074,7 @@ static void *indev_object(void *recv, const FakeID *id, va_list va) {
   if (!strcmp(n, "getDescriptor"))
     return jni_make_string(d->id ? "switch-pro" : "switch-touch");
   if (!strcmp(n, "getMotionRanges"))
-    return j_NewObjectArray(NULL, 0, NULL, NULL);
+    return indev_motion_ranges(d);   /* [inp343] real axes, was empty */
   if (!strcmp(n, "getKeyCharacterMap"))
     return jni_make_object("android/view/KeyCharacterMap");
   return NULL;
@@ -1981,9 +2101,20 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   }
   if (!strcmp(id->name, "getSystemService") &&
       !strncmp(id->sig, "(Ljava/lang/String;)Ljava/lang/Object;", 37)) {
-    void *svc = jni_make_object("android/hardware/input/InputManager");
-    debugPrintf("[inp342] getSystemService(String) -> %p InputManager\n", svc);
-    return svc;
+    /* [inp343] only the INPUT service. #342 answered every name with an
+     * InputManager, and the log shows it being handed out for AUDIO_SERVICE
+     * too ("JNI id: UnityPlayer.AUDIO_SERVICE" then "[inp342] ... InputManager"),
+     * i.e. Unity's AudioManager stub became an InputManager. Answer the input
+     * service and let every other name fall through to the normal NULL. */
+    const char *svc = jni_utf_of(va_arg(va, void *));
+    if (svc && strstr(svc, "input")) {
+      void *mgr = jni_make_object("android/hardware/input/InputManager");
+      debugPrintf("[inp343] getSystemService(\"%s\") -> %p InputManager\n", svc, mgr);
+      return mgr;
+    }
+    debugPrintf("[inp343] getSystemService(\"%s\") -> null (not the input "
+                "service; #342 returned an InputManager here too)\n", svc ? svc : "?");
+    return NULL;
   }
   /* UnityPlayer.getInputDevice(I) is a different lookup from
    * InputDevice.getDevice(I): Rewired asks UnityPlayer directly for the device
@@ -2015,12 +2146,23 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
                 dev_id, dev, ((FakeInputDevice *)dev)->sources);
     return dev;
   }
+  /* [inp343] MATCH BY NAME ONLY. #342 required the signature "()[I", but the
+   * caller that matters -- Rewired's Android input helper, which reaches the
+   * class through AndroidJavaClass reflection -- logs the same call as
+   *     [jni] UNMATCHED -> null: android/view/InputDevice.getDeviceIds()Ljava/lang/Object;
+   * so the guard never matched and Rewired got null instead of the device
+   * list. Nothing else in this title asks for a getDeviceIds, so answering by
+   * name is safe: this is Unity's own arity-0 enumeration. */
   if (nx_inp_bridge_on() &&
-      (!strcmp(id->name, "getDeviceIds") || !strcmp(id->name, "getInputDeviceIds")) &&
-      !strcmp(id->sig, "()[I")) {
+      (!strcmp(id->name, "getDeviceIds") || !strcmp(id->name, "getInputDeviceIds"))) {
+    static unsigned n_log;
     int *v = (int *)calloc(2, sizeof(int));
+    if (!v) return NULL;
     v[0] = 0; v[1] = 1;
-    debugPrintf("[inp336] InputDevice.getDeviceIds -> [0,1]\n");
+    if (n_log++ < 8)
+      debugPrintf("[inp343] %s%s (by name) -> [0,1]%s\n",
+                  id->cls[0] ? id->cls : "?", id->name,
+                  n_log == 1 ? "  (signature-agnostic; #342 only matched ()[I)" : "");
     return make_pri_array_adopt(v, 2, 4);
   }
   /* #337: close the one NULL this bridge provably handed the engine.
@@ -2033,10 +2175,18 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
    * generic 0, so the walk ends immediately, exactly as the empty array says. */
   if (nx_inp_bridge_on() && !strcmp(id->name, "iterator") &&
       !strncmp(id->sig, "()Ljava/util/Iterator;", 22) && recv && indev_is_container(recv)) {
-    void *it = jni_make_object("java/util/Iterator");
-    debugPrintf("[inp337] iterator() on our container -> %p (empty; was UNMATCHED null)\n", it);
-    return it;
+    /* [inp343] a live iterator over our list (was a fixed empty walk). */
+    g_idev_iter.tag = TAG_ITER;
+    g_idev_iter.arr = recv;
+    g_idev_iter.idx = 0;
+    debugPrintf("[inp343] iterator() on our container (%d entries)\n",
+                ((FakeObjArray *)recv)->len);
+    return &g_idev_iter;
   }
+  if (indev_tag_is(recv, TAG_ITER) && !strcmp(id->name, "next"))
+    return indev_extra_object(recv, id, va);
+  if (indev_tag_is(recv, TAG_OBJARR) && !strcmp(id->name, "get"))
+    return indev_extra_object(recv, id, va);
   log_app_upcall(id);
   { void *dlg; if (dlg325_object(recv, id, va, &dlg)) return dlg; }   /* #325 */
 
@@ -2270,6 +2420,11 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
 }
 static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
   if (nx_inp_bridge_on() && indev_is(recv)) return indev_int(recv, id, va);   /* [inp336] */
+  if (nx_inp_bridge_on()) {                                                    /* [inp343] */
+    if (indev_tag_is(recv, TAG_ITER) || indev_tag_is(recv, TAG_MRANGE) ||
+        (indev_tag_is(recv, TAG_OBJARR) && !strcmp(id->name, "size")))
+      return indev_extra_int(recv, id);
+  }
   log_app_upcall(id);
   // java.lang.String instance methods reached via CallIntMethod (Unity's
   // java::lang::String::length() does this to size path buffers). The receiver
@@ -2359,6 +2514,8 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
   return act_int(id, va);
 }
 static float dispatch_float(void *recv, const FakeID *id, va_list va) {
+  if (nx_inp_bridge_on() && indev_tag_is(recv, TAG_MRANGE))    /* [inp343] */
+    return indev_extra_float(recv, id);
   if (unity_is_boxed(recv)) return unity_boxed_float(recv);   /* Float.floatValue */
   if (input_owns_recv(recv)) return input_dispatch_float(recv, id, va);
   if (input_owns_class(id->cls)) return input_dispatch_float(recv, id, va);
