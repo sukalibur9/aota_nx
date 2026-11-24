@@ -61,8 +61,19 @@ typedef struct { uint32_t tag; char cls[96]; char name[64]; char sig[160]; int i
  * slot can hold anything and this is reached from a hook where a wrong guess
  * would dereference a small integer. Returns NULL for anything that is not one
  * of our strings. */
+/* [inp344] Argument slots are not trustworthy. On the JNI Call*MethodA paths
+ * the arg is a jvalue[] and j_CallObjectMethodA forwards to the variadic form
+ * with no varargs, so va_arg() reads whatever was left on the stack. #343 died
+ * exactly there: getSystemService's String slot held the stack bytes of
+ * "content" (far=0x656e742f00000000, esr=0x92000004, translation fault) and the
+ * tag read faulted at source/jni_fake.c:66. Reject anything that cannot be a
+ * Switch user-space pointer before dereferencing it. */
+static int jni_ptr_sane(const void *p) {
+  uintptr_t v = (uintptr_t)p;
+  return v >= 0x10000ull && v < 0x10000000000ull;
+}
 static const char *jni_utf_of(void *obj) {
-  if (!obj) return 0;
+  if (!jni_ptr_sane(obj)) return 0;
   if (*(uint32_t *)obj != TAG_STRING) return 0;
   return ((FakeString *)obj)->utf;
 }
@@ -2080,6 +2091,35 @@ static void *indev_object(void *recv, const FakeID *id, va_list va) {
   return NULL;
 }
 
+/* [inp344] Context.getSystemService(String), shared by both argument paths:
+ * "varargs" = libunity's native wrapper (UnityPlayer.getSystemService), which
+ * really does pass the jstring; "jvalue" = managed AndroidJavaObject.Call,
+ * whose String we now read out of the jvalue[] instead of stale stack. */
+static void *context_system_service(void *arg, const char *via) {
+  const char *svc = jni_utf_of(arg);
+  if (svc && strstr(svc, "input")) {
+    void *mgr = jni_make_object("android/hardware/input/InputManager");
+    debugPrintf("[inp343] getSystemService(\"%s\") -> %p InputManager (%s)\n",
+                svc, mgr, via);
+    return mgr;
+  }
+  if (!svc && !strcmp(via, "jvalue")) {
+    /* Unreadable name on the managed path. The only managed caller of
+     * Context.getSystemService in this title is Rewired's Android input helper
+     * (log #343: Build.VERSION.SDK_INT, currentActivity, getApplicationContext,
+     * then this call), and a null InputManager is what made it give up before.
+     * Answer the input manager, but say so loudly. */
+    void *mgr = jni_make_object("android/hardware/input/InputManager");
+    debugPrintf("[inp344] getSystemService(arg=%p, unreadable via jvalue) -> %p "
+                "InputManager\n", arg, mgr);
+    return mgr;
+  }
+  debugPrintf("[inp343] getSystemService(\"%s\") -> null (not the input "
+              "service; #342 returned an InputManager here too) (%s)\n",
+              svc ? svc : "?", via);
+  return NULL;
+}
+
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   if (nx_inp_bridge_on() && indev_is(recv)) return indev_object(recv, id, va);
   /* [inp342] Rewired's Android input helper died with a NullReferenceException
@@ -2106,15 +2146,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
      * too ("JNI id: UnityPlayer.AUDIO_SERVICE" then "[inp342] ... InputManager"),
      * i.e. Unity's AudioManager stub became an InputManager. Answer the input
      * service and let every other name fall through to the normal NULL. */
-    const char *svc = jni_utf_of(va_arg(va, void *));
-    if (svc && strstr(svc, "input")) {
-      void *mgr = jni_make_object("android/hardware/input/InputManager");
-      debugPrintf("[inp343] getSystemService(\"%s\") -> %p InputManager\n", svc, mgr);
-      return mgr;
-    }
-    debugPrintf("[inp343] getSystemService(\"%s\") -> null (not the input "
-                "service; #342 returned an InputManager here too)\n", svc ? svc : "?");
-    return NULL;
+    return context_system_service(va_arg(va, void *), "varargs");
   }
   /* UnityPlayer.getInputDevice(I) is a different lookup from
    * InputDevice.getDevice(I): Rewired asks UnityPlayer directly for the device
@@ -2894,6 +2926,12 @@ static void *j_CallObjectMethodA (void *e, void *r, FakeID *id, const void *a){
             name_has(id->name, "addOnCanceledListener")))
     return r;
 
+  /* [inp344] Managed AndroidJavaObject.Call goes through this jvalue[] slot, so
+   * the service name IS here and was previously thrown away by the forward to
+   * the variadic form -- which then read stale stack and faulted. */
+  if (a && !strcmp(id->name, "getSystemService") &&
+      !strncmp(id->sig, "(Ljava/lang/String;)Ljava/lang/Object;", 37))
+    return context_system_service(((void *const *)a)[0], "jvalue");
   if (a && name_has(id->name, "getProperty"))
     return getproperty_value(jni_string_utf(((void *const *)a)[0]));
   if (a && name_has(id->cls, "net/Uri") && (name_has(id->name, "encode") || name_has(id->name, "decode")))
@@ -3253,6 +3291,7 @@ static void *field_object(const FakeID *id) {
   }
   // Context.*_SERVICE name constants -> the strings getSystemService() expects
   if (name_has(c, "content/Context")) {
+    if (!strcmp(n, "INPUT_SERVICE"))        return jni_make_string("input");
     if (!strcmp(n, "AUDIO_SERVICE"))        return jni_make_string("audio");
     if (!strcmp(n, "DISPLAY_SERVICE"))      return jni_make_string("display");
     if (!strcmp(n, "WINDOW_SERVICE"))       return jni_make_string("window");
@@ -3979,7 +4018,7 @@ void *jni_bytearray_data(void *arr, int *len_out) {
 }
 const char *jni_string_utf(void *jstr) {
   FakeString *s = jstr;
-  return (s && s->tag == TAG_STRING) ? s->utf : "";
+  return (jni_ptr_sane(s) && s->tag == TAG_STRING) ? s->utf : "";
 }
 
 void *fake_env = &env_table_ptr;
