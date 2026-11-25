@@ -1316,7 +1316,20 @@ void apk314_done(int loud, const char *op, int fd, long long r) {
 #define SYNTH_FD_COUNT 32
 typedef struct { int used; char *data; size_t size; size_t pos; } SynthFd;
 static SynthFd g_synth_fds[SYNTH_FD_COUNT];
-static Mutex    g_synth_lock;            /* zero-init == unlocked */
+/* Build #347: CAS lock, NOT a libnx Mutex. The note above futex_slot_t (#289)
+ * already proved what a Mutex used as a shim lock does here: it keeps a thread
+ * handle, the kernel refuses to arbitrate against a handle whose thread no
+ * longer exists, and the critical section then runs unprotected -- a silent
+ * race, not a panic. #346 lost exactly that race: it logged
+ *     Unity: SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb
+ * (every healthy run: "Cores = 3, Memory = 512mb") while two open() calls for
+ * /proc/cpuinfo were both handed the SAME synthetic fd 0x50000000. One slot
+ * with two owners means the first close() frees the bytes the other thread is
+ * still reading, so the engine sees an empty file and falls back to the single
+ * core libnx reports (mask 0x4). #345's own comment names this failure as the
+ * one that makes Unity bind hundreds of MonoBehaviours to nothing and then
+ * fault inside libunity -- which is where #346 died. */
+static fx_lock_t g_synth_lock;           /* zero-init == unlocked */
 
 int synth_fd_is(int fd) {
   return fd >= SYNTH_FD_BASE && fd < SYNTH_FD_BASE + SYNTH_FD_COUNT;
@@ -1324,18 +1337,18 @@ int synth_fd_is(int fd) {
 
 static int synth_fd_add(char *data, size_t size) {
   if (!data) return -1;
-  mutexLock(&g_synth_lock);
+  fx_lock(&g_synth_lock);
   for (int i = 0; i < SYNTH_FD_COUNT; i++) {
     if (!g_synth_fds[i].used) {
       g_synth_fds[i].used = 1;
       g_synth_fds[i].data = data;
       g_synth_fds[i].size = size;
       g_synth_fds[i].pos = 0;
-      mutexUnlock(&g_synth_lock);
+      fx_unlock(&g_synth_lock);
       return SYNTH_FD_BASE + i;
     }
   }
-  mutexUnlock(&g_synth_lock);
+  fx_unlock(&g_synth_lock);
   free(data);
   debugPrintf("[synth345] fd table full, open refused\n");
   errno = EMFILE;
@@ -1345,63 +1358,71 @@ static int synth_fd_add(char *data, size_t size) {
 long synth_fd_read(int fd, void *buf, size_t count) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
   SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
-  mutexLock(&g_synth_lock);
-  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  fx_lock(&g_synth_lock);
+  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   size_t available = f->size - f->pos;
   if (count > available) count = available;
   if (count) memcpy(buf, f->data + f->pos, count);
   f->pos += count;
-  mutexUnlock(&g_synth_lock);
+  /* #347: the small /proc and /sys nodes this build reads (cpuinfo, meminfo,
+   * cpu/present) are all under 4 KB; maps (16 KB) and urandom (64 KB) are not,
+   * so this stays at a handful of lines per boot. A 0-byte read here is the
+   * engine asking at EOF, not a truncation -- which is what makes the next
+   * log decisive for "Cores = 1": it proves whether the 3-processor text was
+   * handed over and how much of it the engine consumed. */
+  if (!count && f->size && f->size < 4096)
+    debugPrintf("[proc347] EOF read fd=%d pos=%zu of=%zu\n", fd, f->pos, f->size);
+  fx_unlock(&g_synth_lock);
   return (long)count;
 }
 
 long synth_fd_pread(int fd, void *buf, size_t count, uint64_t off) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
   SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
-  mutexLock(&g_synth_lock);
-  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  fx_lock(&g_synth_lock);
+  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   size_t available = off < f->size ? f->size - (size_t)off : 0;
   if (count > available) count = available;
   if (count) memcpy(buf, f->data + off, count);
-  mutexUnlock(&g_synth_lock);
+  fx_unlock(&g_synth_lock);
   return (long)count;
 }
 
 long synth_fd_lseek(int fd, long off, int whence) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
   SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
-  mutexLock(&g_synth_lock);
-  if (!f->used) { mutexUnlock(&g_synth_lock); errno = EBADF; return -1; }
+  fx_lock(&g_synth_lock);
+  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->pos :
                  whence == SEEK_END ? (int64_t)f->size : -1;
   if (base < 0 || (off < 0 && base < -off)) {
-    mutexUnlock(&g_synth_lock);
+    fx_unlock(&g_synth_lock);
     errno = EINVAL;
     return -1;
   }
   f->pos = (size_t)(base + off);
   long result = (long)f->pos;
-  mutexUnlock(&g_synth_lock);
+  fx_unlock(&g_synth_lock);
   return result;
 }
 
 int synth_fd_size(int fd, uint64_t *size) {
   if (!synth_fd_is(fd)) return 0;
   SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
-  mutexLock(&g_synth_lock);
+  fx_lock(&g_synth_lock);
   int used = f->used;
   if (used && size) *size = f->size;
-  mutexUnlock(&g_synth_lock);
+  fx_unlock(&g_synth_lock);
   return used;
 }
 
 int synth_fd_close(int fd) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
   SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
-  mutexLock(&g_synth_lock);
+  fx_lock(&g_synth_lock);
   char *data = f->used ? f->data : NULL;
   memset(f, 0, sizeof(*f));
-  mutexUnlock(&g_synth_lock);
+  fx_unlock(&g_synth_lock);
   free(data);
   if (!data) { errno = EBADF; return -1; }
   return 0;
@@ -1444,7 +1465,14 @@ static int synth_proc_open(const char *path) {
   char *data = malloc(len ? len : 1);
   if (!data) return -1;
   memcpy(data, s, len);
-  return synth_fd_add(data, len);
+  int fd = synth_fd_add(data, len);
+  /* #347: name the node, the fd it was handed and the byte count. Six such
+   * lines per boot, and they make "Cores = 1" unambiguous next run: they say
+   * whether the engine was given the 3-processor text and on which fd. */
+  if (fd >= 0 && (strstr(path, "cpuinfo") || strstr(path, "meminfo") ||
+                  strstr(path, "/cpu/")))
+    debugPrintf("[proc347] open %s -> fd %d, %zu B\n", path, fd, len);
+  return fd;
 }
 
 /* Unity probes filesystem case-sensitivity on every boot: it creates
@@ -3330,26 +3358,32 @@ static const char *synthetic_proc(const char *path) {
 // Exported (see the declarations in android_native_unity.c) for non-engine
 // callers; fopen_fake/fclose_fake below are the engine's own entry points.
 // ---------------------------------------------------------------------------
-static Mutex g_stdio_lock;   // libnx Mutex: 0 == unlocked, no init needed
+/* Build #347: same defect as g_synth_lock above, on the other half of the
+ * /proc path. /proc/meminfo is read through fopen(), and the meminfo text is
+ * handed to fmemopen() under this lock -- so a Mutex left owned by a dead
+ * thread let two fopen() calls share one strdup'ed buffer, and #346 then
+ * reported "Memory = 0mb" (i.e. it read no MemTotal at all) even though it had
+ * just fetched the 512 MB text. A CAS lock cannot be left owned. */
+static fx_lock_t g_stdio_lock;   /* zero-init == unlocked */
 
 FILE *nx_fopen_locked(const char *path, const char *mode) {
-  mutexLock(&g_stdio_lock);
+  fx_lock(&g_stdio_lock);
   FILE *f = fopen(path, mode);
-  mutexUnlock(&g_stdio_lock);
+  fx_unlock(&g_stdio_lock);
   return f;
 }
 
 int nx_fclose_locked(FILE *f) {
-  mutexLock(&g_stdio_lock);
+  fx_lock(&g_stdio_lock);
   int r = fclose(f);
-  mutexUnlock(&g_stdio_lock);
+  fx_unlock(&g_stdio_lock);
   return r;
 }
 
 static FILE *fmemopen_locked(void *buf, size_t n, const char *mode) {
-  mutexLock(&g_stdio_lock);
+  fx_lock(&g_stdio_lock);
   FILE *f = fmemopen(buf, n, mode);
-  mutexUnlock(&g_stdio_lock);
+  fx_unlock(&g_stdio_lock);
   return f;
 }
 
@@ -3361,7 +3395,11 @@ FILE *fopen_fake(const char *path, const char *mode) {
   const char *synth = synthetic_proc(path);
   if (synth) {
     size_t n = strlen(synth);
-    return fmemopen_locked((void *)strdup(synth), n ? n : 1, "r");
+    FILE *sf = fmemopen_locked((void *)strdup(synth), n ? n : 1, "r");
+    /* #347: the fopen half of the /proc path (meminfo arrives here). */
+    if (strstr(path, "meminfo") || strstr(path, "cpuinfo"))
+      debugPrintf("[proc347] fopen %s -> %s, %zu B\n", path, sf ? "fmemopen" : "FAILED", n);
+    return sf;
   }
   const int writing = strpbrk(mode, "wa+") != NULL;
   if (!writing) {
