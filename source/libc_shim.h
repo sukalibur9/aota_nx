@@ -238,4 +238,9 @@ int   closedir_fake(void *dirp);
 void port_note_main_thread(void);
 int  port_is_main_thread(void);
 
+/* Build #349: materialize the constant /proc and /sys nodes as real files so
+ * the engine's SystemInfo probe reads them through the normal libc path. */
+void synth349_prepare(void);
+int  synth349_exists(const char *path);
+
 #endif

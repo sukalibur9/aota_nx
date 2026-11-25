@@ -1313,9 +1313,25 @@ void apk314_done(int loud, const char *op, int fd, long long r) {
  * bytes in memory, per descriptor: no shared file, no truncation, and no SD
  * round-trip for a /proc/self/maps that Unity opens dozens of times a load. */
 #define SYNTH_FD_BASE  0x50000000
-#define SYNTH_FD_COUNT 32
-typedef struct { int used; char *data; size_t size; size_t pos; } SynthFd;
+#define SYNTH_FD_COUNT 64
+/* Build #349: the descriptor NUMBER now carries an owner generation, so close()
+ * can only ever release the buffer of the open() that produced that exact fd.
+ * The table used to be keyed by a client-chosen fd number that named only the
+ * slot, so a late or duplicate close() freed the bytes of whatever open() had
+ * taken the slot since -- the engine then read an EMPTY /proc node. That is the
+ * one defect that fits #348 exactly: it handed over 543 B of cpuinfo and 189 B
+ * of meminfo on the same descriptors as the healthy #347, yet printed
+ *     Unity: SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb
+ * and every run with that line (b337vm, b340, b344, b346, b348) then lost its
+ * builtin resources and Addressables load and faulted inside libunity, while
+ * every run without it (b335, b341, b342, b345, b347) reached the title screen. */
+#define SYNTH_FD_GENS  8192
+#define SYNTH_FD_SPAN  (SYNTH_FD_COUNT * SYNTH_FD_GENS)
+typedef struct {
+  int used; unsigned gen; char *data; size_t size; size_t pos;
+} SynthFd;
 static SynthFd g_synth_fds[SYNTH_FD_COUNT];
+static unsigned g_synth_gen;             /* next owner generation handed out */
 /* Build #347: CAS lock, NOT a libnx Mutex. The note above futex_slot_t (#289)
  * already proved what a Mutex used as a shim lock does here: it keeps a thread
  * handle, the kernel refuses to arbitrate against a handle whose thread no
@@ -1332,34 +1348,48 @@ static SynthFd g_synth_fds[SYNTH_FD_COUNT];
 static fx_lock_t g_synth_lock;           /* zero-init == unlocked */
 
 int synth_fd_is(int fd) {
-  return fd >= SYNTH_FD_BASE && fd < SYNTH_FD_BASE + SYNTH_FD_COUNT;
+  return fd >= SYNTH_FD_BASE && fd < SYNTH_FD_BASE + SYNTH_FD_SPAN;
+}
+static int synth_fd_slot(int fd) { return (fd - SYNTH_FD_BASE) % SYNTH_FD_COUNT; }
+static unsigned synth_fd_owner(int fd) {
+  return (unsigned)((fd - SYNTH_FD_BASE) / SYNTH_FD_COUNT);
+}
+/* #349: the live descriptor for `fd`, or NULL when that number belongs to a
+ * closed owner or to a slot that has been reused since. Caller holds the lock. */
+static SynthFd *synth_fd_get(int fd) {
+  SynthFd *f = &g_synth_fds[synth_fd_slot(fd)];
+  return (f->used && f->gen == synth_fd_owner(fd)) ? f : NULL;
 }
 
 static int synth_fd_add(char *data, size_t size) {
   if (!data) return -1;
+  int fd = -1;
   fx_lock(&g_synth_lock);
-  for (int i = 0; i < SYNTH_FD_COUNT; i++) {
-    if (!g_synth_fds[i].used) {
-      g_synth_fds[i].used = 1;
-      g_synth_fds[i].data = data;
-      g_synth_fds[i].size = size;
-      g_synth_fds[i].pos = 0;
-      fx_unlock(&g_synth_lock);
-      return SYNTH_FD_BASE + i;
-    }
+  int slot = -1;
+  for (int i = 0; i < SYNTH_FD_COUNT; i++)
+    if (!g_synth_fds[i].used) { slot = i; break; }
+  if (slot >= 0) {
+    /* #349: every open gets its own generation, so no later open() can inherit
+     * this fd number and no stale close() can free this buffer. */
+    unsigned gen = g_synth_gen++ % SYNTH_FD_GENS;
+    SynthFd *f = &g_synth_fds[slot];
+    f->used = 1; f->gen = gen; f->data = data; f->size = size; f->pos = 0;
+    fd = SYNTH_FD_BASE + (int)gen * SYNTH_FD_COUNT + slot;
   }
   fx_unlock(&g_synth_lock);
-  free(data);
-  debugPrintf("[synth345] fd table full, open refused\n");
-  errno = EMFILE;
-  return -1;
+  if (fd < 0) {
+    free(data);
+    debugPrintf("[synth345] fd table full, open refused\n");
+    errno = EMFILE;
+  }
+  return fd;
 }
 
 long synth_fd_read(int fd, void *buf, size_t count) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
-  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
   fx_lock(&g_synth_lock);
-  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
+  SynthFd *f = synth_fd_get(fd);
+  if (!f) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   size_t available = f->size - f->pos;
   if (count > available) count = available;
   if (count) memcpy(buf, f->data + f->pos, count);
@@ -1378,9 +1408,9 @@ long synth_fd_read(int fd, void *buf, size_t count) {
 
 long synth_fd_pread(int fd, void *buf, size_t count, uint64_t off) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
-  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
   fx_lock(&g_synth_lock);
-  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
+  SynthFd *f = synth_fd_get(fd);
+  if (!f) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   size_t available = off < f->size ? f->size - (size_t)off : 0;
   if (count > available) count = available;
   if (count) memcpy(buf, f->data + off, count);
@@ -1390,9 +1420,9 @@ long synth_fd_pread(int fd, void *buf, size_t count, uint64_t off) {
 
 long synth_fd_lseek(int fd, long off, int whence) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
-  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
   fx_lock(&g_synth_lock);
-  if (!f->used) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
+  SynthFd *f = synth_fd_get(fd);
+  if (!f) { fx_unlock(&g_synth_lock); errno = EBADF; return -1; }
   int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->pos :
                  whence == SEEK_END ? (int64_t)f->size : -1;
   if (base < 0 || (off < 0 && base < -off)) {
@@ -1408,9 +1438,9 @@ long synth_fd_lseek(int fd, long off, int whence) {
 
 int synth_fd_size(int fd, uint64_t *size) {
   if (!synth_fd_is(fd)) return 0;
-  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
   fx_lock(&g_synth_lock);
-  int used = f->used;
+  SynthFd *f = synth_fd_get(fd);
+  int used = f != NULL;
   if (used && size) *size = f->size;
   fx_unlock(&g_synth_lock);
   return used;
@@ -1418,15 +1448,30 @@ int synth_fd_size(int fd, uint64_t *size) {
 
 int synth_fd_close(int fd) {
   if (!synth_fd_is(fd)) { errno = EBADF; return -1; }
-  SynthFd *f = &g_synth_fds[fd - SYNTH_FD_BASE];
   fx_lock(&g_synth_lock);
-  char *data = f->used ? f->data : NULL;
+  SynthFd *f = synth_fd_get(fd);
+  if (!f) {
+    /* #349: a close() for an fd whose owner is gone (or whose number was reused
+     * by a newer open) must NOT touch the slot -- that is what used to blank a
+     * live /proc node under its reader. */
+    fx_unlock(&g_synth_lock);
+    debugPrintf("[proc349] stale close fd=%d ignored (slot has another owner)\n", fd);
+    errno = EBADF;
+    return -1;
+  }
+  char *data = f->data;
   memset(f, 0, sizeof(*f));
   fx_unlock(&g_synth_lock);
   free(data);
-  if (!data) { errno = EBADF; return -1; }
   return 0;
 }
+
+/* #349 forward declarations (definitions live next to fopen_fake, which is the
+ * first point where nx_fopen_locked() is available). */
+static int synth349_local(const char *path, char *out, size_t n);
+static int synth349_open_real(const char *path);
+static FILE *synth349_fopen_real(const char *path, const char *mode);
+void synth349_prepare(void);
 
 /* lseek for arm64: off_t is already 64-bit, so this also services lseek64.
  * lseek64 was previously stubbed to return 0 (no seek) -- that made libunity's
@@ -1515,6 +1560,10 @@ int open_fake(const char *path, int flags, ...) {
       debugPrintf("[io] open(%s,0x%x) -> %d [urandom]\n", path, flags, rfd);
       return rfd;
     }
+    // #349: the small constant nodes are real files this boot; serve them down
+    // the normal libc path so every reader (open/read/lseek/fstat) agrees.
+    int r349 = synth349_open_real(path);
+    if (r349 >= 0) return r349;
     // synthetic /proc, /sys (incl. self/maps)
     int sfd = synth_proc_open(path);
     if (sfd >= 0) { debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); return sfd; }
@@ -1591,6 +1640,16 @@ static void convert_stat(const struct stat *in, struct bionic_stat *out) {
 int stat_fake(const char *path, struct bionic_stat *st) {
   path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   path = casetest_redirect(path);
+  {
+    /* #349: a constant /proc or /sys node now has a real twin file; stat() must
+     * see it (the engine sizes a file before reading it). */
+    char local[320];
+    struct stat r349st;
+    if (synth349_local(path, local, sizeof local) && stat(local, &r349st) == 0) {
+      convert_stat(&r349st, st);
+      return 0;
+    }
+  }
   {
     uint64_t psz, pino; int pdir;
     if (asset_pack_stat_path_info(path, &psz, &pino, &pdir)) {
@@ -3387,11 +3446,125 @@ static FILE *fmemopen_locked(void *buf, size_t n, const char *mode) {
   return f;
 }
 
+/* ---------------- #349: the constant /proc and /sys nodes as REAL files ----
+ * #348 handed the engine 543 B of /proc/cpuinfo and 189 B of /proc/meminfo on
+ * the very same descriptors as the healthy #347 -- and still printed
+ *     Unity: SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb
+ * (healthy runs: 3 cores / 512mb). Every run with that line (b337vm, b340,
+ * b344, b346, b348) lost its Internal-ErrorShader/Soft.psd builtin resources,
+ * never started Addressables, bound 439-732 MonoBehaviours to "script unknown"
+ * and finally faulted in libunity+0xc4e4ac reading a table with an index of
+ * -64 (x10 = 0x07fffffe after `lsr w10, w8, #5` with w8 = -64). Every run
+ * without it (b335, b341, b342, b345, b347) reached the title screen. So the
+ * bytes the engine asked for did not arrive intact, whichever consumer path
+ * inside our shim lost them. Stop serving these nodes through the shim: write
+ * each small constant node ONCE per boot as its own real file and let the
+ * engine's open/read/lseek/fstat/fopen/fgets all see the same file. Files are
+ * written only when missing or the wrong length, so nothing truncates under a
+ * concurrent reader (the #344 failure); /proc/self/maps stays in memory -- it
+ * is 16 KB, it changes per call, and the engine opens it dozens of times per
+ * load. The in-memory path remains as the fallback when the SD write fails.
+ * ------------------------------------------------------------------------- */
+#define SYNTH349_DIR ".proc349"
+
+static int synth349_local(const char *path, char *out, size_t n) {
+  if (!path) return 0;
+  if (strncmp(path, "/proc/", 6) && strncmp(path, "/sys/", 5)) return 0;
+  if (!strcmp(path, "/proc/self/maps") || !strcmp(path, "/proc/self/smaps")) return 0;
+  char name[224]; size_t j = 0;
+  for (size_t i = 0; path[i] && j + 1 < sizeof name; i++) {
+    char c = path[i];
+    if (c == '/') { if (j == 0) continue; c = '_'; }
+    name[j++] = c;
+  }
+  name[j] = '\0';
+  snprintf(out, n, "%s/%s", game_path(SYNTH349_DIR), name);
+  return 1;
+}
+
+/* #349: access() goes through imports.c's access_impl(), which stats the REAL
+ * path -- so it must agree with open() about these nodes or the engine would
+ * skip a file it can actually read. */
+int synth349_exists(const char *path) {
+  char local[320];
+  struct stat st;
+  return synth349_local(path, local, sizeof local) && stat(local, &st) == 0;
+}
+
+static int synth349_open_real(const char *path) {
+  char local[320];
+  if (!synth349_local(path, local, sizeof local)) return -1;
+  int fd = open(local, O_RDONLY, 0);
+  if (fd < 0) return -1;
+  debugPrintf("[proc349] open %s -> fd %d [real file %s]\n", path, fd, local);
+  return fd;
+}
+
+static FILE *synth349_fopen_real(const char *path, const char *mode) {
+  char local[320];
+  if (!synth349_local(path, local, sizeof local)) return NULL;
+  FILE *f = nx_fopen_locked(local, mode);
+  if (!f) return NULL;
+  debugPrintf("[proc349] fopen %s -> %s [real file]\n", path, local);
+  return f;
+}
+
+/* #349: write (or keep) the real twin of every small constant node. Called
+ * once from main before any engine thread exists, so no reader can see a
+ * half-written file; a later boot keeps the files when the length matches. */
+void synth349_prepare(void) {
+  static const char *const nodes[] = {
+    "/proc/cpuinfo", "/proc/meminfo",
+    "/sys/devices/system/cpu/present",
+    "/sys/devices/system/cpu/possible",
+    "/sys/devices/system/cpu/online",
+    "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+    "/sys/devices/system/cpu/cpu1/cpufreq/cpuinfo_max_freq",
+    "/sys/devices/system/cpu/cpu2/cpufreq/cpuinfo_max_freq",
+    "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq",
+    "/sys/devices/system/cpu/cpu1/cpufreq/cpuinfo_min_freq",
+    "/sys/devices/system/cpu/cpu2/cpufreq/cpuinfo_min_freq",
+    "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
+    "/sys/devices/system/cpu/cpu1/cpufreq/scaling_max_freq",
+    "/sys/devices/system/cpu/cpu2/cpufreq/scaling_max_freq",
+    "/sys/devices/system/cpu/cpu0/cpu_capacity",
+    "/sys/devices/system/cpu/cpu1/cpu_capacity",
+    "/sys/devices/system/cpu/cpu2/cpu_capacity",
+  };
+  char dir[320];
+  snprintf(dir, sizeof dir, "%s", game_path(SYNTH349_DIR));
+  mkdir_p_dir(dir);
+  int wrote = 0, kept = 0, failed = 0;
+  for (unsigned i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
+    const char *text = synthetic_proc(nodes[i]);
+    if (!text || !*text) continue;
+    size_t len = strlen(text);
+    char local[320];
+    if (!synth349_local(nodes[i], local, sizeof local)) continue;
+    struct stat st;
+    if (stat(local, &st) == 0 && (size_t)st.st_size == len) { kept++; continue; }
+    int fd = open(local, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) { failed++; continue; }
+    size_t done = 0;
+    while (done < len) {
+      ssize_t w = write(fd, text + done, len - done);
+      if (w <= 0) break;
+      done += (size_t)w;
+    }
+    close(fd);
+    if (done == len) wrote++; else failed++;
+  }
+  debugPrintf("[proc349] constant /proc + /sys nodes: %d written into %s, %d kept, %d failed\n",
+              wrote, dir, kept, failed);
+}
+
 // a buffered fopen for the big .mvgl archives: the engine issues many small
 // reads/seeks and the fsdev round-trips dominate without a large buffer.
 FILE *fopen_fake(const char *path, const char *mode) {
   path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   path = casetest_redirect(path);
+  { FILE *r349 = synth349_fopen_real(path, mode);   /* #349: cpuinfo/meminfo */
+    if (r349) return r349; }
   const char *synth = synthetic_proc(path);
   if (synth) {
     size_t n = strlen(synth);

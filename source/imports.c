@@ -578,6 +578,7 @@ static int access_impl(const char *path, int mode) {
    * access("/etc/fonts.xml") probe fails and Unity abandons the font fallback
    * before ever reaching open(). */
   (void)mode; path = nx_fonts_resolve(path);
+  if (synth349_exists(path)) return 0;   /* #349: constant /proc + /sys nodes */
   struct stat st; return stat(path, &st) == 0 ? 0 : -1;
 }
 static int chmod_stub(const char *path, int mode) { (void)path; (void)mode; return 0; }

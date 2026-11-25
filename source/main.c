@@ -115,6 +115,7 @@ extern void signal181_arm(void);
 extern void dispatch182_arm(void);
 extern void worker183_arm(void);
 extern void coremask184_arm(void);
+extern void synth349_prepare(void);   /* #349: constant /proc + /sys nodes as real files */
 extern void createthread185_arm(void);
 extern void tag299_capture_main(void);   /* #300: main thread's real handle */
 extern void tag299_fix_main(void);
@@ -3025,6 +3026,14 @@ int main(int argc, char *argv[]) {
    * font config while building its fallback list, and an empty list is what
    * left Cyrillic/CJK blank. See nx_fonts.c. */
   nx_fonts_init(GAME_HOME);
+
+  /* Build #349: the engine's SystemInfo probe (/proc/cpuinfo, /proc/meminfo,
+   * /sys .../cpu/present|possible|cpufreq) read through our shim came back empty
+   * on some boots -- "Cores = 1, Memory = 0mb" -- and those are exactly the
+   * runs that then lost every builtin resource and MonoBehaviour and faulted in
+   * libunity. Write those constant nodes as real files once here, before any
+   * engine thread exists, so the probe uses the normal libc path. */
+  synth349_prepare();
 
   /* Sweep Unity's case-sensitivity probe files: CASESENSITIVETEST<guid> strays
    * from older builds, plus the single hidden scratch the probe is redirected
