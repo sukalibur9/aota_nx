@@ -3687,7 +3687,7 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 
 /* ---------------- asset read cache ---------------- */
 #define RC_BLOCK   (64u * 1024)
-#define RC_NBLOCK  384u                 /* 384 * 64K = 24 MB */
+#define RC_NBLOCK  96u                  /* 96 * 64K = 6 MB (#350: was 384/24 MB) */
 #define RC_MAXFD   64
 typedef struct { int fd; uint64_t blk; uint32_t len; } RcTag;
 static RcTag    rc_tag[RC_NBLOCK];

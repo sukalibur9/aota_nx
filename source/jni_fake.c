@@ -2668,6 +2668,23 @@ static void *j_FindClass(void *env, const char *name) {
 static void *j_GetObjectClass(void *env, void *obj) {
   (void)env;
   if (obj && *(uint32_t *)obj == BITMAP_TAG) return intern_class("android/graphics/Bitmap");
+  /* [#350] Injected input events must report their REAL class. Unity's Android
+   * input path classifies an event by the class it gets back from
+   * GetObjectClass(event) / IsInstanceOf; answering java/lang/Object here made
+   * every MotionEvent fall through the KeyEvent branch in test #349: the engine
+   * read getDeviceId/getSource/getKeyCode on a SOURCE_MOUSE event, never read
+   * getActionMasked/getPointerCount/getX, and nativeInjectEvent returned 0 for
+   * all 917 injected mouse events. KeyEvents were unaffected (they are keys). */
+  if (input_owns_recv(obj)) {
+    const char *ic = input_recv_is_motion(obj) ? "android/view/MotionEvent"
+                                               : "android/view/KeyEvent";
+    static int in_cls_log = 0;
+    if (in_cls_log < 8) {
+      in_cls_log++;
+      debugPrintf("[in.cls] GetObjectClass(event) -> %s\n", ic);
+    }
+    return intern_class(ic);
+  }
   /* [cfg146] Report the real class where unity_jni.c owns the object: the
    * AssetManager singleton carries its label, and UJ handles know their kind.
    * Everything else keeps the historical java/lang/Object answer — several
@@ -2781,11 +2798,23 @@ static juint j_IsInstanceOf(void *env, void *obj, void *clazz) {
    * check (which it does first) matches our touch event and it gets read as a
    * key (getKeyCode) and dropped. Answer by the handle's real kind. */
   if (input_owns_recv(obj)) {
-    if (strstr(cn, "MotionEvent")) return input_recv_is_motion(obj) ? 1 : 0;
-    if (strstr(cn, "KeyEvent"))    return input_recv_is_motion(obj) ? 0 : 1;
+    const int motion = input_recv_is_motion(obj);
+    int r;
+    if (strstr(cn, "MotionEvent"))   r = motion ? 1 : 0;
+    else if (strstr(cn, "KeyEvent")) r = motion ? 0 : 1;
     /* InputEvent base class, or class names collapsed by pool overflow: both
      * kinds are InputEvents, so 1 is safe for the base; overflow is now logged. */
-    return 1;
+    else                             r = 1;
+    /* [#350] Name the class the engine asks about: #349 showed every mouse
+     * MotionEvent being read as a KeyEvent, and this line says which answer
+     * drove that decision. */
+    static int in_is_log = 0;
+    if (in_is_log < 16) {
+      in_is_log++;
+      debugPrintf("[in.is] event=%s asks '%s' -> %d\n",
+                  motion ? "MotionEvent" : "KeyEvent", cn, r);
+    }
+    return r;
   }
   /* Boxed PlayerPrefs values from getAll(): Unity reads each value with
    * IsInstanceOf(value, Integer/Long/Float/Boolean/String) then unboxes. These

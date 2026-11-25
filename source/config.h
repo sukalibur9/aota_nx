@@ -162,7 +162,18 @@
  * this keeps ~99 MB, still above the 1080p swapchain + depth + render targets
  * budget listed above (~60-80 MB). If the next log shows GPU allocation
  * failures instead, this line is the one to put back. */
-#define GFX_RESERVE_MB      96u
+/* Build #350: 96 -> 48. #349 finally got past the resource failures (Cores=3,
+ * Memory=512mb, zero "is missing"), and the next managed-side OOM is the FMOD
+ * bank, exactly as the note above predicts:
+ *     [mem150] ... newlib used 2603 MB free 77 MB
+ *     [mmap] fallback 53772 KB ...   <- the jar entry buffer for Master.bank
+ *     Unity: BankLoadException: ... ERR_MEMORY
+ * The 52 MB jar buffer leaves ~25 MB, and FMOD's own ~54 MB copy of the bank
+ * then has nowhere to go. 48 MB more newlib (plus 18 MB from shrinking the
+ * asset read cache 24 -> 6 MB) puts ~140 MB free at that point. The driver
+ * keeps 147 MB (was 195 MB), still above the ~60-80 MB listed above. If a
+ * later log shows GPU allocation failures, put this back to 96. */
+#define GFX_RESERVE_MB      48u
 
 // Overcommit (alias-region) mode: reserve a big *virtual* window (PROT_NONE
 // costs only address space) and commit physical pages on demand -- true
