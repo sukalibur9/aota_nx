@@ -40,7 +40,10 @@
 #define AINPUT_SOURCE_KEYBOARD       0x0101
 #define AINPUT_SOURCE_GAMEPAD        0x0401
 #define AINPUT_SOURCE_JOYSTICK       0x01000010
+#define AINPUT_SOURCE_MOUSE          0x2002
+#define AMOTION_BUTTON_PRIMARY       0x1
 #define AMOTION_TOOL_TYPE_FINGER     1
+#define AMOTION_TOOL_TYPE_MOUSE      3
 #define AKEY_ACTION_DOWN             0
 #define AKEY_ACTION_UP               1
 #define AKEYCODE_BACK                4
@@ -68,6 +71,11 @@ void *unity_keyevent(int action, int keycode);
  * source/device so gamepad buttons arrive as SOURCE_GAMEPAD, device 1. */
 void *unity_joystick_event(const float *axes /* UI_AXIS_COUNT, or NULL */);
 void *unity_keyevent_ex(int action, int keycode, int source, int device);
+/* [348] A real SOURCE_MOUSE MotionEvent: one pointer at (x,y) in view pixels
+ * plus the button bitmask the engine reads from getButtonState(). This is the
+ * device a PC-style port's UGUI/Rewired UI actually listens to (hover/click),
+ * and unlike touch it makes Input.mousePresent true. */
+void *unity_mouseevent(int action, float x, float y, int buttons);
 /* MotionEvent.obtain(src) copy factory -- returns a separate UEvent copy of src
  * (or src unchanged if it isn't one of ours). */
 void *unity_motionevent_obtain(void *src);

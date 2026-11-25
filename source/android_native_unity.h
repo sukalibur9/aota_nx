@@ -16,11 +16,14 @@ void  android_native_update_mode(void);
 ANativeWindow *android_native_window(void);
 uint32_t android_native_width(void);
 uint32_t android_native_height(void);
-void  android_native_feed_hid(uint8_t (*inject)(void*,void*,void*),
+/* [348] inject is nativeInjectEvent(env, thiz, event, mode): the fourth
+ * argument is real (signature (Landroid/view/InputEvent;I)Z) and is now
+ * passed instead of left to whatever w3 held. */
+void  android_native_feed_hid(uint8_t (*inject)(void*,void*,void*,int),
                               void *env, void *thiz);
 /* [inp285] run the feed on its own 60 Hz thread (decoupled from the render
  * loop); call once before the frame loop, after input init + inject resolve. */
-void  android_native_start_feed_thread(uint8_t (*inject)(void*,void*,void*),
+void  android_native_start_feed_thread(uint8_t (*inject)(void*,void*,void*,int),
                                        void *env, void *thiz);
 
 /* NDK functions libunity imports (register these in imports.c) */

@@ -2578,6 +2578,29 @@ static void dispatch_void(void *recv, const FakeID *id, va_list va) {
       if (a && ((uintptr_t)a & 7) == 0 && (uintptr_t)a < 0x8000000000ULL &&
           a->tag == TAG_PRIARR && a->data && count > 0) {
         if (count > a->len) count = a->len;
+        /* [348] Silence probe. "No sound" can mean the sink is broken OR that
+         * the mixer is handing us zeros, and the #347 log cannot tell them
+         * apart: it only shows that 1024 samples arrived. Peak |sample| per
+         * chunk answers it -- non-zero peak means real PCM is reaching audout
+         * (so the fault is downstream: volume/route), all-zero means the game
+         * itself is mixing silence (master bus volume, listener, bank load). */
+        {
+          const short *pcm = (const short *)a->data;
+          int peak = 0;
+          for (int i = 0; i < count; i++) {
+            int v = pcm[i];
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+          }
+          static unsigned n_probe, n_silent;
+          n_probe++;
+          if (!peak) n_silent++;
+          if (n_probe <= 4 || (n_probe % 300) == 0)
+            debugPrintf("[aud348] write #%u %d samples peak=%d silent=%u/%u s0..3=%d,%d,%d,%d\n",
+                        n_probe, count, peak, n_silent, n_probe,
+                        pcm[0], count > 1 ? pcm[1] : 0,
+                        count > 2 ? pcm[2] : 0, count > 3 ? pcm[3] : 0);
+        }
         /* Build #284: cap the queue. Test #283 proved this path grows the
          * SDL queue unboundedly -- the game calls AudioDevice.write far
          * faster than the device drains at realtime, and this path has no

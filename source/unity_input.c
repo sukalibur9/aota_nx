@@ -20,6 +20,7 @@ typedef struct {
   int   keycode;                /* KeyEvent                                 */
   int   source;                 /* [inp144] AINPUT_SOURCE_* per event       */
   int   device;                 /* [inp144] getDeviceId: 0 touch/kbd, 1 pad */
+  int   buttons;                /* [348] getButtonState (mouse)             */
   float axes[UI_AXIS_COUNT];    /* [inp144] joystick axes (getAxisValue)    */
   int64_t time_ms;
 } UEvent;
@@ -57,6 +58,17 @@ void *unity_keyevent_ex(int action,int keycode,int source,int device){
   UEvent *e=&g_ev; memset(e,0,sizeof *e);
   e->tag=UI_TAG; e->kind=KIND_KEY; e->action=action; e->keycode=keycode; e->time_ms=now_ms();
   e->source=source; e->device=device;
+  return e;
+}
+/* [348] SOURCE_MOUSE motion event. Mirror of what Android hands Unity when a
+ * mouse moves/clicks over the view: one pointer, absolute view coordinates,
+ * and getButtonState() carrying BUTTON_PRIMARY while the button is held. */
+void *unity_mouseevent(int action,float x,float y,int buttons){
+  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  e->tag=UI_TAG; e->kind=KIND_MOTION; e->action=action; e->time_ms=now_ms();
+  e->source=AINPUT_SOURCE_MOUSE; e->device=0; e->buttons=buttons;
+  e->count=1; e->ids[0]=0; e->xs[0]=x; e->ys[0]=y;
+  e->axes[UI_AXIS_X]=x; e->axes[UI_AXIS_Y]=y;
   return e;
 }
 /* [inp144] Joystick motion event. Real Android gamepads report one pointer
@@ -158,8 +170,10 @@ static uint64_t input_dispatch_int_inner(void *recv, const void *id_, va_list va
     if (has(m,"getAction"))       return (uint64_t)e->action;
     if (has(m,"getPointerCount")) return (uint64_t)e->count;
     if (has(m,"getPointerId")){ int i=va_arg(va,int); return (uint64_t)((i>=0&&i<e->count)?e->ids[i]:0); }
-    if (has(m,"getToolType"))     return AMOTION_TOOL_TYPE_FINGER;
-    if (has(m,"getButtonState"))  return 0;
+    if (has(m,"getToolType"))     return (e->source==AINPUT_SOURCE_MOUSE)
+                                        ? AMOTION_TOOL_TYPE_MOUSE
+                                        : AMOTION_TOOL_TYPE_FINGER;
+    if (has(m,"getButtonState"))  return (uint64_t)e->buttons;   /* [348] */
     if (has(m,"getHistorySize"))  return 0;     /* no batched history -> engine skips getHistorical* */
     return 0;
   }
@@ -172,10 +186,23 @@ static uint64_t input_dispatch_int_inner(void *recv, const void *id_, va_list va
 }
 
 /* ---- float getters ------------------------------------------------------ */
+static float input_dispatch_float_inner(void *recv, const void *id_, va_list va);
+
 float input_dispatch_float(void *recv, const void *id_, va_list va){ const struct FakeID *id = id_;
   UEvent *e = recv; const char *m=id->name;
-  ILOG("    [in.f] %-16s  (cls=%s recv=%p tag=%s)\n", m, id->cls, recv,
-       (e && e->tag==UI_TAG) ? "OK" : "BAD");
+  /* [348] log the ANSWER as well: whether the engine reads getX/getY (and what
+   * it gets) is the difference between "touch reaches Unity" and "it does not". */
+  { const float rv = input_dispatch_float_inner(recv, id_, va);
+    ILOG("    [in.f] %-16s -> %.1f  (cls=%s src=0x%x act=0x%x n=%d)\n", m,
+         (double)rv, id->cls, (e && e->tag==UI_TAG) ? e->source : 0,
+         (e && e->tag==UI_TAG) ? e->action : 0,
+         (e && e->tag==UI_TAG) ? e->count : -1);
+    return rv; }
+}
+
+static float input_dispatch_float_inner(void *recv, const void *id_, va_list va){
+  const struct FakeID *id = id_;
+  UEvent *e = recv; const char *m=id->name;
   if (!e || e->tag!=UI_TAG || e->kind!=KIND_MOTION) return 0.0f;
   /* [inp144] getAxisValue(I)F -- the gamepad read path. Must be intercepted
    * before the pointer-index logic below: its int argument is an AXIS id

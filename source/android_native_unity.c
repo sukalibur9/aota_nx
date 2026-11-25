@@ -415,9 +415,14 @@ void android_native_input_init(void){
 void android_native_input_shutdown(void){
 }
 
-/* inject signature == recovered nativeInjectEvent: (env,thiz,InputEvent)->Z.
- * As a static JNI native the call shape is (JNIEnv*, jclass, jobject). */
-typedef uint8_t (*inject_fn)(void*,void*,void*);
+/* inject signature == recovered nativeInjectEvent: (env,thiz,InputEvent,I)->Z.
+ * As a static JNI native the call shape is (JNIEnv*, jclass, jobject, jint
+ * mode). Builds up to #347 passed only three arguments, so Unity read `mode`
+ * from whatever happened to be left in w3 -- undefined behaviour on the one
+ * argument its Java caller always supplies (UnityPlayer.injectEvent(event, 0)).
+ * [348] passes it explicitly. */
+typedef uint8_t (*inject_fn)(void*,void*,void*,int);
+#define AINJECT_MODE_NORMAL 0
 
 /* ---- live touch pointer set ----------------------------------------------
  * Android hands the engine the FULL set of pointers currently down on every
@@ -441,9 +446,36 @@ static void emit(inject_fn inject, void *env, void *thiz, int action){
   if (g_live_n <= 0) return;
   g_events_total++;
   uint8_t r = inject(env, thiz,
-         unity_motionevent(action, g_live_n, g_live_id, g_live_x, g_live_y));
+         unity_motionevent(action, g_live_n, g_live_id, g_live_x, g_live_y),
+         AINJECT_MODE_NORMAL);
   debugPrintf("[inp144] inject motion action=0x%x n=%d x0=%.0f y0=%.0f -> %d\n",
               action, g_live_n, g_live_x[0], g_live_y[0], (int)r);
+}
+
+/* [348] The panel now drives a REAL ANDROID MOUSE instead of a touchscreen.
+ *
+ * Why: this is the Android build of a PC point-and-click game, and the UI it
+ * ships is the mouse-driven one -- UGUI/Rewired pointer modules read
+ * Input.mousePosition / GetMouseButtonDown and, in StandaloneInputModule-style
+ * Process(), only fall back to the touch path when input.mousePresent is false.
+ * Touchscreen events were being parsed by Unity (the #347 log shows getAction
+ * reads on SOURCE_TOUCHSCREEN events) yet nothing in the game reacted, so feed
+ * the device the UI is actually built around: SOURCE_MOUSE with
+ * getButtonState carrying BUTTON_PRIMARY while the finger is down. This also
+ * makes Input.mousePresent true, which is what enables the mouse branch.
+ *
+ * One finger -> one mouse pointer: DOWN at the first contact, MOVE while it
+ * drags, UP where it lifts. */
+static int   s_mouse_down;
+static float s_mouse_x, s_mouse_y;
+
+static void emit_mouse(inject_fn inject, void *env, void *thiz, int action,
+                       float x, float y, int buttons, const char *tag){
+  g_events_total++;
+  const uint8_t r = inject(env, thiz, unity_mouseevent(action, x, y, buttons),
+                           AINJECT_MODE_NORMAL);
+  debugPrintf("[inp348] mouse %s act=0x%x x=%.0f y=%.0f btn=%d -> %d\n",
+              tag, action, (double)x, (double)y, buttons, (int)r);
 }
 
 /* ---- gamepad tables --------------------------------------------------------
@@ -495,7 +527,7 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
                   g_btns[i].keycode,
                   (int)inject(env, thiz, unity_keyevent_ex(
                       AKEY_ACTION_DOWN, g_btns[i].keycode,
-                      AINPUT_SOURCE_GAMEPAD, 1)));
+                      AINPUT_SOURCE_GAMEPAD, 1), AINJECT_MODE_NORMAL));
     }
     if (bup & g_btns[i].bit){
       g_events_total++;
@@ -503,7 +535,7 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
                   g_btns[i].keycode,
                   (int)inject(env, thiz, unity_keyevent_ex(
                       AKEY_ACTION_UP, g_btns[i].keycode,
-                      AINPUT_SOURCE_GAMEPAD, 1)));
+                      AINPUT_SOURCE_GAMEPAD, 1), AINJECT_MODE_NORMAL));
     }
   }
 
@@ -540,7 +572,8 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
       memcpy(s_sent, ax, sizeof ax);
       s_sent_valid = 1;
       g_events_total++;
-      const uint8_t r = inject(env, thiz, unity_joystick_event(ax));
+      const uint8_t r = inject(env, thiz, unity_joystick_event(ax),
+                               AINJECT_MODE_NORMAL);
       static int nlog = 0;
       if (nlog < 24){
         nlog++;
@@ -554,11 +587,43 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     }
   }
 
-  /* ---- touchscreen -> MotionEvents (handheld only; the panel reports in
-   * its own 1280x720 space regardless of render size, so scale up). Touch
-   * entries are slot-ordered: slot i is the same finger while it stays
-   * down, which is exactly the pointer-id stability Android expects. ---- */
+  /* ---- [348] panel -> Android MOUSE (handheld only; the panel reports in its
+   * own 1280x720 space regardless of render size, so scale up). One finger is
+   * one mouse pointer: DOWN on contact, MOVE while dragging, UP on lift, with
+   * getButtonState carrying BUTTON_PRIMARY for exactly the span of the press. */
   if (appletGetOperationMode() == AppletOperationMode_Handheld){
+    HidTouchScreenState ts = {0};
+    hidGetTouchScreenStates(&ts, 1);
+    const float msx = (float)g_w / 1280.0f, msy = (float)g_h / 720.0f;
+    if (ts.count > 0){
+      float x = (float)ts.touches[0].x * msx;
+      float y = (float)ts.touches[0].y * msy;
+      if (x < 0) x = 0;
+      if (y < 0) y = 0;
+      if (x > (float)g_w - 1) x = (float)g_w - 1;
+      if (y > (float)g_h - 1) y = (float)g_h - 1;
+      if (!s_mouse_down){
+        s_mouse_down = 1;
+        s_mouse_x = x; s_mouse_y = y;
+        /* Trace this whole gesture: the getter budget is refilled per press so
+         * the [in.f] lines in the log describe the tap the game ignored. */
+        input_log_budget = 40;
+        emit_mouse(inject, env, thiz, AMOTION_ACTION_DOWN, x, y,
+                   AMOTION_BUTTON_PRIMARY, "down");
+      } else if (x != s_mouse_x || y != s_mouse_y){
+        s_mouse_x = x; s_mouse_y = y;
+        emit_mouse(inject, env, thiz, AMOTION_ACTION_MOVE, x, y,
+                   AMOTION_BUTTON_PRIMARY, "move");
+      }
+    } else if (s_mouse_down){
+      s_mouse_down = 0;
+      emit_mouse(inject, env, thiz, AMOTION_ACTION_UP, s_mouse_x, s_mouse_y,
+                 0, "up");
+    }
+  }
+
+  /* ---- old touchscreen path, kept for a one-line switch back ---- */
+  if (0 && appletGetOperationMode() == AppletOperationMode_Handheld){
     HidTouchScreenState ts = {0};
     hidGetTouchScreenStates(&ts, 1);
     int count = ts.count > 8 ? 8 : ts.count;
@@ -620,7 +685,7 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
    * never change, libnx is not seeing the controller at all. */
   if ((s_calls % 60) == 1)
     debugPrintf("[inp144] feed calls=%u events_total=%u live=%d held=0x%llx down=0x%llx style=0x%llx\n",
-                s_calls, g_events_total, g_live_n,
+                s_calls, g_events_total, s_mouse_down ? 1 : 0,
                 (unsigned long long)held, (unsigned long long)bdown,
                 (unsigned long long)padGetStyleSet(&g_pad));
 }
@@ -660,7 +725,7 @@ static void *feed285_thread(void *arg) {
   return NULL;
 }
 
-void android_native_start_feed_thread(uint8_t (*inject)(void*,void*,void*),
+void android_native_start_feed_thread(uint8_t (*inject)(void*,void*,void*,int),
                                       void *env, void *thiz) {
   static int started = 0;
   if (started) return;

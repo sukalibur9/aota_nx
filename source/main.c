@@ -3792,7 +3792,7 @@ int main(int argc, char *argv[]) {
    * polled at ~1 Hz and every tap ended before the next poll (test #284:
    * ZERO touch events injected all run). The feed call is removed from
    * the loop below. */
-  android_native_start_feed_thread((uint8_t (*)(void*,void*,void*))Unity_nativeInjectEvent,
+  android_native_start_feed_thread((uint8_t (*)(void*,void*,void*,int))Unity_nativeInjectEvent,
                                    fake_env, fake_unityplayer_thiz);
   xd_stage("stage:feed-returned");
 
