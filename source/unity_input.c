@@ -28,6 +28,13 @@ typedef struct {
 /* single reused handle -- injection is synchronous */
 static UEvent g_ev;
 
+/* [351] One event's lifetime == one constructor call. nativeInjectEvent asks
+ * IsInstanceOf(event, KeyEventClass) first and, only if that answers false,
+ * IsInstanceOf(event, MotionEventClass). Counting the questions between two
+ * constructors is therefore enough to tell the two calls apart -- see
+ * input_isinstance(). */
+static unsigned g_ev_seq;
+
 /* ---- touch diagnostics (see unity_input.h) ---- */
 int (*input_log_fn)(char *fmt, ...) = 0;
 int   input_log_budget = 0;
@@ -43,7 +50,7 @@ static int  is_ev(void *p,int kind){ UEvent*e=p; return e && e->tag==UI_TAG && e
 
 /* ---- constructors ------------------------------------------------------- */
 void *unity_motionevent(int action,int count,const int *ids,const float *xs,const float *ys){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=&g_ev; memset(e,0,sizeof *e); g_ev_seq++;
   e->tag=UI_TAG; e->kind=KIND_MOTION; e->action=action; e->time_ms=now_ms();
   e->source=AINPUT_SOURCE_TOUCHSCREEN; e->device=0;
   if (count>UI_MAX_POINTERS) count=UI_MAX_POINTERS;
@@ -55,7 +62,7 @@ void *unity_keyevent(int action,int keycode){
   return unity_keyevent_ex(action, keycode, AINPUT_SOURCE_KEYBOARD, 0);
 }
 void *unity_keyevent_ex(int action,int keycode,int source,int device){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=&g_ev; memset(e,0,sizeof *e); g_ev_seq++;
   e->tag=UI_TAG; e->kind=KIND_KEY; e->action=action; e->keycode=keycode; e->time_ms=now_ms();
   e->source=source; e->device=device;
   return e;
@@ -64,7 +71,7 @@ void *unity_keyevent_ex(int action,int keycode,int source,int device){
  * mouse moves/clicks over the view: one pointer, absolute view coordinates,
  * and getButtonState() carrying BUTTON_PRIMARY while the button is held. */
 void *unity_mouseevent(int action,float x,float y,int buttons){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=&g_ev; memset(e,0,sizeof *e); g_ev_seq++;
   e->tag=UI_TAG; e->kind=KIND_MOTION; e->action=action; e->time_ms=now_ms();
   e->source=AINPUT_SOURCE_MOUSE; e->device=0; e->buttons=buttons;
   e->count=1; e->ids[0]=0; e->xs[0]=x; e->ys[0]=y;
@@ -75,7 +82,7 @@ void *unity_mouseevent(int action,float x,float y,int buttons){
  * whose coords mirror the left stick, plus the full axis set; mirror that so
  * engines reading sticks via getX/getY see the same values as getAxisValue. */
 void *unity_joystick_event(const float *axes){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=&g_ev; memset(e,0,sizeof *e); g_ev_seq++;
   e->tag=UI_TAG; e->kind=KIND_MOTION; e->action=AMOTION_ACTION_MOVE; e->time_ms=now_ms();
   e->source=AINPUT_SOURCE_JOYSTICK; e->device=1;
   if (axes) memcpy(e->axes, axes, sizeof e->axes);
@@ -125,6 +132,44 @@ int input_owns_recv(const void *recv){
  * MotionEvent (vs KeyEvent). Caller must have checked input_owns_recv first. */
 int input_recv_is_motion(const void *recv){
   const UEvent *e = recv; return e && e->tag==UI_TAG && e->kind==KIND_MOTION;
+}
+
+/* ---- [351] event classification ------------------------------------------
+ * Test #350 named the last blocker: on every injected MOUSE MotionEvent the
+ * engine read getRepeatCount/getEventTime/getMetaState/getKeyCode -- KeyEvent
+ * only methods -- and nativeInjectEvent returned 0 for all 913 of them. So the
+ * engine was running its KeyEvent handler on our motion events.
+ *
+ * Why: nativeInjectEvent classifies with IsInstanceOf(event, KeyEventClass)
+ * FIRST (0x110a494 -> 0x110a510, cache at 0x17e54f8) and only asks
+ * IsInstanceOf(event, MotionEventClass) (0x110a594, cache at 0x17e5698) when
+ * that answers false. Both cached classes are opaque here: #350's log shows
+ * IsInstanceOf being asked about a handle whose name is 'UnityPlayer', and
+ * android/view/KeyEvent + android/view/MotionEvent are never interned, so the
+ * answer can never be keyed on the class NAME.
+ *
+ * It can be keyed on the question ORDER instead, which is fixed and provable:
+ * between two event constructions the engine asks about KeyEvent first. So for
+ * a motion event answer NO to the first question and YES after that, and for a
+ * key event answer YES to the first (the handler it leads to is the right one).
+ * A real class name, if the engine ever hands one over, still wins. */
+unsigned input_event_seq(void){ return g_ev_seq; }
+
+int input_isinstance(void *obj, const char *cls_name, void *clazz, int *probe_no){
+  (void)clazz;
+  const UEvent *e = obj;
+  const int motion = (e && e->tag==UI_TAG && e->kind==KIND_MOTION);
+
+  static unsigned probe_seq;
+  static int      probe_n;
+  if (probe_seq != g_ev_seq){ probe_seq = g_ev_seq; probe_n = 0; }
+  probe_n++;
+  if (probe_no) *probe_no = probe_n;
+
+  if (cls_name && strstr(cls_name,"MotionEvent")) return motion;
+  if (cls_name && strstr(cls_name,"KeyEvent"))    return motion ? 0 : 1;
+
+  return motion ? (probe_n >= 2) : (probe_n == 1);
 }
 
 /* getX/getY/getPressure/... come as ()F or (I)F -- pull the pointer index when

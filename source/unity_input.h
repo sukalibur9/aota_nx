@@ -84,6 +84,15 @@ void *unity_motionevent_obtain(void *src);
 int       input_owns_class(const char *cls);
 int       input_owns_recv (const void *recv);   /* true if recv is our event handle */
 int       input_recv_is_motion(const void *recv); /* true if recv is a MotionEvent */
+
+/* [351] nativeInjectEvent's classification answer. obj must be one of our
+ * events. cls_name is the name the JNI layer has for the asked class (opaque in
+ * this build -- the engine caches a handle named 'UnityPlayer'); clazz is its
+ * raw handle. probe_no, when non-NULL, receives which question this was for the
+ * current event (1 = the KeyEvent check, which the engine always asks first,
+ * 2 = the MotionEvent check). Returns 1 for "is an instance", 0 for "is not". */
+unsigned  input_event_seq(void);
+int       input_isinstance(void *obj, const char *cls_name, void *clazz, int *probe_no);
 uint64_t  input_dispatch_int  (void *recv, const void *id, va_list va); /* int + long */
 float     input_dispatch_float(void *recv, const void *id, va_list va);
 

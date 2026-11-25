@@ -2798,21 +2798,29 @@ static juint j_IsInstanceOf(void *env, void *obj, void *clazz) {
    * check (which it does first) matches our touch event and it gets read as a
    * key (getKeyCode) and dropped. Answer by the handle's real kind. */
   if (input_owns_recv(obj)) {
+    /* [#351] Answer by QUESTION ORDER, not by class name.
+     *
+     * #350 evidence: on a SOURCE_MOUSE MotionEvent the engine read
+     * getDeviceId/getSource/getKeyCode and nativeInjectEvent returned 0, while a
+     * KeyEvent got getRepeatCount/getEventTime/getMetaState/getKeyCode/getAction
+     * and returned 1. getRepeatCount/getMetaState are KeyEvent-only, so the
+     * handler behind the FIRST check was the KeyEvent handler -- and it was
+     * reading our motion events because this function said yes to it.
+     *
+     * libunity asks IsInstanceOf(event, KeyEventClass) first (0x110a494, cache
+     * at 0x17e54f8) and only asks MotionEvent (0x110a594, 0x17e5698) when the
+     * first answers false. Neither class is ever interned -- the log shows the
+     * asked handle is named 'UnityPlayer' -- so the name cannot decide it; the
+     * order can. input_isinstance() counts the questions per event and answers
+     * 0/1 for a motion event and 1/0 for a key event. */
     const int motion = input_recv_is_motion(obj);
-    int r;
-    if (strstr(cn, "MotionEvent"))   r = motion ? 1 : 0;
-    else if (strstr(cn, "KeyEvent")) r = motion ? 0 : 1;
-    /* InputEvent base class, or class names collapsed by pool overflow: both
-     * kinds are InputEvents, so 1 is safe for the base; overflow is now logged. */
-    else                             r = 1;
-    /* [#350] Name the class the engine asks about: #349 showed every mouse
-     * MotionEvent being read as a KeyEvent, and this line says which answer
-     * drove that decision. */
+    int probe = 0;
+    const int r = input_isinstance(obj, cn, clazz, &probe);
     static int in_is_log = 0;
-    if (in_is_log < 16) {
+    if (in_is_log < 40) {
       in_is_log++;
-      debugPrintf("[in.is] event=%s asks '%s' -> %d\n",
-                  motion ? "MotionEvent" : "KeyEvent", cn, r);
+      debugPrintf("[in.is] #%d event=%s asks '%s'(%p) -> %d\n",
+                  probe, motion ? "MotionEvent" : "KeyEvent", cn, clazz, r);
     }
     return r;
   }
