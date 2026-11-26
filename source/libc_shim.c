@@ -1114,6 +1114,39 @@ int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso) { (v
 #define LINUX_SC_PHYS_PAGES 85
 #define LINUX_SC_AVPHYS_PAGES 86
 
+/* #356: the /proc and /sys twins are REAL files now (#349), so their content
+ * reaches the engine through newlib's stdio/devoptab -- none of our shim code
+ * sees it. Every broken run since #344 still prints
+ *     Unity: SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb
+ * (healthy: 3 cores / 512mb) together with the real kernel affinity mask
+ * 0x4 instead of the 0x7 sched_getaffinity_fake() publishes, which says the
+ * engine's probe did NOT take any of the inputs we control. Rather than guess
+ * a sixth time, trace the three inputs: every read of a twin node (bytes and
+ * text), every sched_getaffinity() call, and every sysconf() query. */
+static int g_twin_fds[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static int g_twin_n = 0;
+static int g_twin_logs = 0;
+static void twin_track(int fd) {
+  if (fd < 0) return;
+  for (int i = 0; i < g_twin_n; i++) if (g_twin_fds[i] == fd) return;
+  if (g_twin_n < 8) g_twin_fds[g_twin_n++] = fd;
+}
+static int twin_is(int fd) {
+  if (fd < 0) return 0;
+  for (int i = 0; i < g_twin_n; i++) if (g_twin_fds[i] == fd) return 1;
+  return 0;
+}
+static void twin_log(const char *op, int fd, long req, long got, const void *buf) {
+  if (g_twin_logs >= 48) return;
+  g_twin_logs++;
+  char pre[41]; size_t k = 0;
+  const unsigned char *p = (const unsigned char *)buf;
+  if (p && got > 0)
+    for (; k < 40 && k < (size_t)got; k++) pre[k] = (p[k] >= 32 && p[k] < 127) ? (char)p[k] : '.';
+  pre[k] = 0;
+  debugPrintf("[proc356] %s fd=%d req=%ld got=%ld '%s'\n", op, fd, req, got, pre);
+}
+
 /* #304: bionic sched_getaffinity(pid, cpusetsize, mask). This used to be
  * z_stub0 in the import table: it returned 0 (success) and never touched the
  * mask, so the engine's core detection read whatever was in that buffer and
@@ -1124,11 +1157,15 @@ int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso) { (v
  * accept (never reject) pin requests: an affinity call that fails can make the
  * job system drop workers. */
 int sched_getaffinity_fake(int pid, size_t cpusetsize, void *mask) {
-  (void)pid;
   if (!mask || cpusetsize == 0) { errno = EINVAL; return -1; }
   memset(mask, 0, cpusetsize);
   uint64_t m = 0x7ull;                       /* cores 0,1,2 */
   memcpy(mask, &m, cpusetsize < sizeof m ? cpusetsize : sizeof m);
+  { /* #356: does the engine ask at all, and is this the mask it uses? */
+    static int n = 0;
+    if (n < 8) { n++; debugPrintf("[aff356] #%d pid=%d size=%zu -> 0x%llx\n",
+                                 n, pid, cpusetsize, (unsigned long long)m); }
+  }
   return 0;
 }
 int sched_setaffinity_fake(int pid, size_t cpusetsize, const void *mask) {
@@ -1136,7 +1173,7 @@ int sched_setaffinity_fake(int pid, size_t cpusetsize, const void *mask) {
   return 0;                                  /* honour nothing, fail nothing */
 }
 
-long sysconf_fake(int name) {
+static long sysconf_fake_impl(int name) {
   switch (name) {
     case BIONIC_SC_PAGESIZE:
     case BIONIC_SC_PAGE_SIZE:
@@ -1166,6 +1203,15 @@ long sysconf_fake(int name) {
       return -1;
     }
   }
+}
+/* #356: trace every query (the values Unity's SystemInfo prints come from
+ * here: PHYS_PAGES == "Memory", NPROCESSORS == "Cores"), so a broken run says
+ * whether the engine asked at all and what it was told. */
+long sysconf_fake(int name) {
+  long r = sysconf_fake_impl(name);
+  static int n = 0;
+  if (n < 24) { n++; debugPrintf("[sysconf356] name=%d -> %ld\n", name, r); }
+  return r;
 }
 long pathconf_fake(const char *path, int name) { (void)path; (void)name; return -1; }
 
@@ -3497,6 +3543,13 @@ static int synth349_open_real(const char *path) {
   int fd = open(local, O_RDONLY, 0);
   if (fd < 0) return -1;
   debugPrintf("[proc349] open %s -> fd %d [real file %s]\n", path, fd, local);
+  /* #356: this open bypasses open_fake(), so it never bumped the read cache's
+   * generation for this fd number. rc_cacheable[fd] and every block cached for
+   * the PREVIOUS file on that number survived, and a read here could be served
+   * from them (#355 only fixed the generation compare, not the missing bump).
+   * Drop them and keep these tiny nodes out of the cache entirely. */
+  rc_mark(fd, 0);
+  twin_track(fd);
   return fd;
 }
 
@@ -3505,7 +3558,10 @@ static FILE *synth349_fopen_real(const char *path, const char *mode) {
   if (!synth349_local(path, local, sizeof local)) return NULL;
   FILE *f = nx_fopen_locked(local, mode);
   if (!f) return NULL;
-  debugPrintf("[proc349] fopen %s -> %s [real file]\n", path, local);
+  int fd = fileno(f);
+  debugPrintf("[proc349] fopen %s -> %s [real file fd %d]\n", path, local, fd);
+  rc_mark(fd, 0);      /* #356: same stale-cache hole as the raw open above */
+  twin_track(fd);
   return f;
 }
 
@@ -3632,7 +3688,10 @@ size_t fwrite_fake(const void *ptr, size_t size, size_t n, FILE *f) {
 }
 size_t fread_fake(void *ptr, size_t size, size_t n, FILE *f) {
   if (is_fake_file(f)) return 0;
-  return fread(ptr, size, n, f);
+  size_t r = fread(ptr, size, n, f);
+  { int fd = fileno(f);                            /* #356: twin-node trace */
+    if (twin_is(fd)) twin_log("fread", fd, (long)(size * n), (long)(r * size), ptr); }
+  return r;
 }
 int fputc_fake(int c, FILE *f) { if (is_fake_file(f)) return c; return fputc(c, f); }
 int fputs_fake(const char *s, FILE *f) { if (is_fake_file(f)) { debugPrintf("stdio: %s", s); return 0; } return fputs(s, f); }
@@ -3812,7 +3871,9 @@ long read_fake(int fd, void *buf, size_t count) {
       int tr = apk314_is(fd) ? apk314_begin("read", fd, cur, (long long)count) : 0;
       long got = rc_pread(fd, buf, count, (uint64_t)cur);
       if (tr) apk314_done(tr, "read", fd, got);
-      if (got >= 0) { lseek(fd, cur + got, SEEK_SET); return got; }
+      if (got >= 0) { lseek(fd, cur + got, SEEK_SET);
+        if (twin_is(fd)) twin_log("read", fd, (long)count, got, buf);      /* #356 */
+        return got; }
     }
   }
   size_t total = 0;
@@ -3824,6 +3885,7 @@ long read_fake(int fd, void *buf, size_t count) {
     total += (size_t)r;
   }
   if (tr) apk314_done(tr, "read*", fd, (long long)total);
+  if (twin_is(fd)) twin_log("read*", fd, (long)count, (long)total, buf);  /* #356 */
   if (count >= (1u << 20))
     debugPrintf("[io] read(fd=%d, %zu) -> %zu%s\n", fd, count, total,
                 total < count ? "  *** SHORT READ ***" : "");
