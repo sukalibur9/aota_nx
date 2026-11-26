@@ -1929,8 +1929,15 @@ static void *indev_for(int id) {
     d->tag = TAG_INDEV;
     d->id  = i;
     /* 0: the panel plus the pad's key events, 1: the gamepad proper. Mirrors
-     * the sources [inp144] stamps on the events it injects. */
-    d->sources = (i == 0) ? (0x00000101 | 0x00001002 | 0x00002002)   /* kbd|touch|mouse */
+     * the sources [inp144] stamps on the events it injects.
+     * [353] Device 0 is a PHONE panel: keyboard + touchscreen, and deliberately
+     * NO SOURCE_MOUSE. #348 added the mouse bit so UnityEngine.Input would
+     * report mousePresent=true, but that makes the Rewired UI module take its
+     * mouse branch on a device it also sees as touch-capable; a real Android
+     * handset has no mouse device at all. Without it Unity reports
+     * mousePresent=false and turns the touches into the mouse state (default
+     * simulateMouseWithTouches), which is the path the shipped build uses. */
+    d->sources = (i == 0) ? (0x00000101 | 0x00001002)                /* kbd|touch */
                           : (0x00000401 | 0x00000201 | 0x01000010); /* pad|dpad|joystick */
   }
   return d;

@@ -445,10 +445,15 @@ static int live_find(int id){
 static void emit(inject_fn inject, void *env, void *thiz, int action){
   if (g_live_n <= 0) return;
   g_events_total++;
+  /* [353] Trace a whole gesture: the getter budget refills on every press so
+   * the [in.i]/[in.f] lines describe the tap the game did or did not take. */
+  if ((action & 0xff) == AMOTION_ACTION_DOWN ||
+      (action & 0xff) == AMOTION_ACTION_POINTER_DOWN)
+    input_log_budget = 60;
   uint8_t r = inject(env, thiz,
          unity_motionevent(action, g_live_n, g_live_id, g_live_x, g_live_y),
          AINJECT_MODE_NORMAL);
-  debugPrintf("[inp144] inject motion action=0x%x n=%d x0=%.0f y0=%.0f -> %d\n",
+  debugPrintf("[inp353] touch action=0x%x n=%d x0=%.0f y0=%.0f -> %d\n",
               action, g_live_n, g_live_x[0], g_live_y[0], (int)r);
 }
 
@@ -587,11 +592,24 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     }
   }
 
-  /* ---- [348] panel -> Android MOUSE (handheld only; the panel reports in its
-   * own 1280x720 space regardless of render size, so scale up). One finger is
-   * one mouse pointer: DOWN on contact, MOVE while dragging, UP on lift, with
-   * getButtonState carrying BUTTON_PRIMARY for exactly the span of the press. */
-  if (appletGetOperationMode() == AppletOperationMode_Handheld){
+  /* ---- [353] panel -> Android TOUCHSCREEN (handheld only).
+   *
+   * Why this replaces the [348] mouse: the title scene (data.unity3d/level0)
+   * puts Rewired in charge of the pointer -- EventSystem carries a
+   * RewiredStandaloneInputModule, the UI pointer is a Rewired PlayerMouse
+   * ("Virtual Cursor") driving the VirtualCursor image, and the Rewired Input
+   * Manager ships Point/Click/Navigate/Submit Actions. Rewired on Android is
+   * 100% UnityEngine.Input, and the pointer module takes the touch branch on a
+   * touch device. #351/#352 proved the engine reads and accepts our SOURCE_MOUSE
+   * events (hover MOVE read getX/getY, DOWN set getButtonState=1) yet no Rewired
+   * action ever fired, so the mouse is the wrong device for this build: a phone
+   * reports a touchscreen, never a mouse, and Unity turns touches into the
+   * mouse state Rewired's mouse path reads anyway (simulateMouseWithTouches).
+   *
+   * The panel reports in its own 1280x720 space regardless of render size, so
+   * scale up. One finger is one pointer; the live set below mirrors Android's
+   * "full pointer array on every event" contract. */
+  if (0 && appletGetOperationMode() == AppletOperationMode_Handheld){
     HidTouchScreenState ts = {0};
     hidGetTouchScreenStates(&ts, 1);
     const float msx = (float)g_w / 1280.0f, msy = (float)g_h / 720.0f;
@@ -638,8 +656,8 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     }
   }
 
-  /* ---- old touchscreen path, kept for a one-line switch back ---- */
-  if (0 && appletGetOperationMode() == AppletOperationMode_Handheld){
+  /* ---- [353] touchscreen path (see the note above the disabled mouse block) ---- */
+  if (appletGetOperationMode() == AppletOperationMode_Handheld){
     HidTouchScreenState ts = {0};
     hidGetTouchScreenStates(&ts, 1);
     int count = ts.count > 8 ? 8 : ts.count;
