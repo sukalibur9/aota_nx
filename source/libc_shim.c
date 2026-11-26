@@ -3689,8 +3689,14 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 #define RC_BLOCK   (64u * 1024)
 #define RC_NBLOCK  96u                  /* 96 * 64K = 6 MB (#350: was 384/24 MB) */
 #define RC_MAXFD   64
-typedef struct { int fd; uint64_t blk; uint32_t len; } RcTag;
+/* Build #355: the tag carries the fd's open GENERATION. (fd, blk) alone is not
+ * an identity: open() hands the same small number straight back after a close,
+ * so a block cached for the previous file on that number matched the new file's
+ * tag and rc_pread served its bytes as a HIT. Every open bumps the counter and
+ * drops the fd's blocks, so a reused number can never match an old tag. */
+typedef struct { int fd; uint64_t blk; uint32_t len; uint32_t gen; } RcTag;
 static RcTag    rc_tag[RC_NBLOCK];
+static uint32_t rc_gen[RC_MAXFD];
 static uint8_t *rc_data;
 /* Build #354: CAS lock, NOT a libnx Mutex. This cache is entered from every
  * thread the engine reads files on, and a libnx Mutex publishes the owner's
@@ -3711,6 +3717,7 @@ void rc_mark(int fd, int on) {           /* called from open_fake/close_fake */
   if (fd < 0 || fd >= RC_MAXFD) return;
   fx_lock(&rc_lock);
   rc_cacheable[fd] = on ? 1 : 0;
+  rc_gen[fd]++;                          /* #355: new generation for this number */
   if (rc_state == 1)                     /* fd numbers get reused: drop stale blocks */
     for (unsigned i = 0; i < RC_NBLOCK; i++) if (rc_tag[i].fd == fd) rc_tag[i].fd = -1;
   fx_unlock(&rc_lock);
@@ -3750,7 +3757,9 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
     uint64_t blk = abs / RC_BLOCK;
     unsigned idx = (unsigned)(((blk * 2654435761ull) ^ (unsigned)fd) % RC_NBLOCK);
     uint8_t *slot = rc_data + (size_t)idx * RC_BLOCK;
-    if (rc_tag[idx].fd != fd || rc_tag[idx].blk != blk) {   /* miss -> fill one block */
+    uint32_t gen = rc_gen[fd];            /* #355: also part of the identity */
+    if (rc_tag[idx].fd != fd || rc_tag[idx].blk != blk ||
+        rc_tag[idx].gen != gen) {                           /* miss -> fill one block */
       /* #354: fill with the caller's file position saved and restored, under
        * the lock. The old code left the fd parked at the end of the block it
        * had just cached; with two threads holding the same descriptor (the
@@ -3766,6 +3775,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
       }
       if (saved >= 0) lseek(fd, saved, SEEK_SET);
       rc_tag[idx].fd = fd; rc_tag[idx].blk = blk; rc_tag[idx].len = (uint32_t)got;
+      rc_tag[idx].gen = gen;
       rc_fills++;
     } else rc_hits++;
     uint32_t blen  = rc_tag[idx].len;
