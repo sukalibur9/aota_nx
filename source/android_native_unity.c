@@ -608,6 +608,22 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
         /* Trace this whole gesture: the getter budget is refilled per press so
          * the [in.f] lines in the log describe the tap the game ignored. */
         input_log_budget = 40;
+        /* [352] HOVER FIRST. Test #351 proved, over all 147 presses and all
+         * 147 releases, that the engine reads NO position on DOWN or UP
+         * (getDeviceId/getSource/getEventTime/getActionMasked/getButtonState
+         * only); it reads getHistorySize + getX + getY exclusively on MOVE
+         * (506 of 655 moves logged, all of them action 0x2). So Unity tracks
+         * the mouse position from MOVE events and turns a DOWN purely into a
+         * button-state change: a tap that starts at a place the cursor never
+         * hovered presses at the PREVIOUS position (the last MOVE of the
+         * previous gesture, or the initial 0,0). The UI therefore never
+         * receives a click where the finger landed.
+         *
+         * A real Android mouse always hovers before it clicks, so mirror it:
+         * one MOVE with the button up at the contact point, then the DOWN at
+         * the same coordinates. The engine's tracked pointer is then exactly
+         * under the press, and getButtonState goes 0 -> 1 there. */
+        emit_mouse(inject, env, thiz, AMOTION_ACTION_MOVE, x, y, 0, "hover");
         emit_mouse(inject, env, thiz, AMOTION_ACTION_DOWN, x, y,
                    AMOTION_BUTTON_PRIMARY, "down");
       } else if (x != s_mouse_x || y != s_mouse_y){
