@@ -1123,28 +1123,59 @@ int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso) { (v
  * engine's probe did NOT take any of the inputs we control. Rather than guess
  * a sixth time, trace the three inputs: every read of a twin node (bytes and
  * text), every sched_getaffinity() call, and every sysconf() query. */
-static int g_twin_fds[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+typedef struct { int fd; char name[44]; } TwinSlot;
+static TwinSlot g_twin[8];
 static int g_twin_n = 0;
 static int g_twin_logs = 0;
-static void twin_track(int fd) {
+static void twin_track(int fd, const char *path) {
   if (fd < 0) return;
-  for (int i = 0; i < g_twin_n; i++) if (g_twin_fds[i] == fd) return;
-  if (g_twin_n < 8) g_twin_fds[g_twin_n++] = fd;
+  int i;
+  for (i = 0; i < g_twin_n; i++) if (g_twin[i].fd == fd) break;
+  if (i == g_twin_n) { if (g_twin_n >= 8) return; g_twin_n++; }
+  g_twin[i].fd = fd;
+  /* keep only the tail of the path: it is the part that identifies the node */
+  const char *nm = path ? path : "?";
+  size_t l = strlen(nm);
+  if (l > sizeof(g_twin[i].name) - 1) nm += l - (sizeof(g_twin[i].name) - 1);
+  snprintf(g_twin[i].name, sizeof(g_twin[i].name), "%s", nm);
+}
+static const char *twin_name(int fd) {
+  if (fd < 0) return "?";
+  for (int i = 0; i < g_twin_n; i++) if (g_twin[i].fd == fd) return g_twin[i].name;
+  return "?";
 }
 static int twin_is(int fd) {
   if (fd < 0) return 0;
-  for (int i = 0; i < g_twin_n; i++) if (g_twin_fds[i] == fd) return 1;
+  for (int i = 0; i < g_twin_n; i++) if (g_twin[i].fd == fd) return 1;
   return 0;
 }
 static void twin_log(const char *op, int fd, long req, long got, const void *buf) {
-  if (g_twin_logs >= 48) return;
+  if (g_twin_logs >= 240) return;
   g_twin_logs++;
   char pre[41]; size_t k = 0;
   const unsigned char *p = (const unsigned char *)buf;
   if (p && got > 0)
     for (; k < 40 && k < (size_t)got; k++) pre[k] = (p[k] >= 32 && p[k] < 127) ? (char)p[k] : '.';
   pre[k] = 0;
-  debugPrintf("[proc356] %s fd=%d req=%ld got=%ld '%s'\n", op, fd, req, got, pre);
+  debugPrintf("[proc356] %s fd=%d req=%ld got=%ld '%s' %s\n", op, fd, req, got, pre, twin_name(fd));
+}
+static int is_fake_file(const void *f);   /* defined with the stdio wrappers below */
+/* #356 follow-up: the numbers libunity pulls OUT of these nodes with fscanf().
+ * The text is proven correct (#356 logged the exact 543 B cpuinfo and 189 B
+ * meminfo), so the only remaining place a wrong value can appear is here. */
+int fscanf_fake(FILE *f, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  void *arg0 = NULL;
+  const int intfmt = fmt && fmt[0] == '%' && (fmt[1] == 'd' || fmt[1] == 'u' || fmt[1] == 'i');
+  if (intfmt) { va_list ac; va_copy(ac, ap); arg0 = va_arg(ac, void *); va_end(ac); }
+  int ret = is_fake_file(f) ? 0 : vfscanf(f, fmt, ap);
+  va_end(ap);
+  int fd = f ? fileno(f) : -1;
+  if (twin_is(fd))
+    debugPrintf("[scan357] fscanf fd=%d fmt='%s' -> %d%s%d '%s'\n", fd, fmt ? fmt : "?", ret,
+                (intfmt && arg0 && ret > 0) ? " value=" : " value=-",
+                (intfmt && arg0) ? *(int *)arg0 : 0, twin_name(fd));
+  return ret;
 }
 
 /* #304: bionic sched_getaffinity(pid, cpusetsize, mask). This used to be
@@ -3549,7 +3580,10 @@ static int synth349_open_real(const char *path) {
    * from them (#355 only fixed the generation compare, not the missing bump).
    * Drop them and keep these tiny nodes out of the cache entirely. */
   rc_mark(fd, 0);
-  twin_track(fd);
+  twin_track(fd, path);
+  { struct stat sts;                              /* #357: prove the bytes on disk */
+    if (fstat(fd, &sts) == 0)
+      debugPrintf("[size357] %s fd=%d size=%lld\n", path, fd, (long long)sts.st_size); }
   return fd;
 }
 
@@ -3561,7 +3595,10 @@ static FILE *synth349_fopen_real(const char *path, const char *mode) {
   int fd = fileno(f);
   debugPrintf("[proc349] fopen %s -> %s [real file fd %d]\n", path, local, fd);
   rc_mark(fd, 0);      /* #356: same stale-cache hole as the raw open above */
-  twin_track(fd);
+  twin_track(fd, path);
+  { struct stat sts;                              /* #357: prove the bytes on disk */
+    if (fstat(fd, &sts) == 0)
+      debugPrintf("[size357] fopen %s fd=%d size=%lld\n", path, fd, (long long)sts.st_size); }
   return f;
 }
 
@@ -3704,7 +3741,14 @@ int fseek_fake(FILE *f, long off, int whence) { if (is_fake_file(f)) return -1; 
 long ftell_fake(FILE *f) { if (is_fake_file(f)) return -1; return ftell(f); }
 int getc_fake(FILE *f) { if (is_fake_file(f)) return -1; return getc(f); }
 int fgetc_fake(FILE *f) { if (is_fake_file(f)) return -1; return fgetc(f); }
-char *fgets_fake(char *s, int n, FILE *f) { if (is_fake_file(f)) return NULL; return fgets(s, n, f); }
+char *fgets_fake(char *s, int n, FILE *f) {
+  if (is_fake_file(f)) return NULL;
+  char *r = fgets(s, n, f);
+  { int fd = fileno(f);                            /* #357: does libunity read lines? */
+    if (twin_is(fd)) debugPrintf("[line357] fgets fd=%d n=%d -> %s '%s' %s\n",
+                                 fd, n, r ? "line" : "EOF", r ? r : "", twin_name(fd)); }
+  return r;
+}
 int ungetc_fake(int c, FILE *f) { if (is_fake_file(f)) return -1; return ungetc(c, f); }
 void setbuf_fake(FILE *f, char *buf) { if (is_fake_file(f)) return; setbuf(f, buf); }
 

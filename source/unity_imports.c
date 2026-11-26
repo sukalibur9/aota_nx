@@ -276,7 +276,7 @@ DynLibFunction unity_dynlib_functions[] = {
   { "flock", (uintptr_t)&z_stub0 },
   { "fmod", (uintptr_t)&fmod },
   { "fnmatch", (uintptr_t)&z_stub0 },
-  { "fscanf", (uintptr_t)&fscanf },
+  { "fscanf", (uintptr_t)&fscanf_fake },   /* #357: log what libunity parses out of /proc + /sys */
   { "futimens", (uintptr_t)&z_stub0 },
   { "gethostbyaddr", (uintptr_t)&z_stub0 },
   { "gethostbyname", (uintptr_t)&z_stub0 },

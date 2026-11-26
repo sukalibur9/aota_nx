@@ -120,6 +120,7 @@ size_t wcsnrtombs_fake(char *dst, const wchar_t **src, size_t nwc, size_t len, v
 extern uint8_t fake_sF[3][0x100];
 size_t fwrite_fake(const void *ptr, size_t size, size_t n, FILE *f);
 size_t fread_fake(void *ptr, size_t size, size_t n, FILE *f);
+int fscanf_fake(FILE *f, const char *fmt, ...);      /* #357 */
 int fputc_fake(int c, FILE *f);
 int fputs_fake(const char *s, FILE *f);
 int fflush_fake(FILE *f);
