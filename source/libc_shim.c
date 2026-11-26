@@ -3692,21 +3692,32 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 typedef struct { int fd; uint64_t blk; uint32_t len; } RcTag;
 static RcTag    rc_tag[RC_NBLOCK];
 static uint8_t *rc_data;
-static Mutex    rc_lock;
+/* Build #354: CAS lock, NOT a libnx Mutex. This cache is entered from every
+ * thread the engine reads files on, and a libnx Mutex publishes the owner's
+ * kernel handle: once the thread that last locked it has exited, libnx cannot
+ * arbitrate and the critical section runs unprotected (the defect #289 and
+ * #347 already fixed elsewhere in this file). Lost arbitration here returns
+ * stale or empty blocks -- #353 read /proc/cpuinfo through this cache and
+ * logged "SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb" (healthy: Cores = 3,
+ * Memory = 512mb), then failed to bind every MonoBehaviour in the scene and
+ * faulted at libunity+0xe344c0. The same cache also serves the asset reads, so
+ * a lost block there is "The resource Internal-ErrorShader.shader could not be
+ * loaded from the resource file!". */
+static fx_lock_t rc_lock;
 static int      rc_state;               /* 0=untried 1=ready -1=disabled */
 static uint8_t  rc_cacheable[RC_MAXFD];
 static unsigned long rc_hits, rc_fills;
 void rc_mark(int fd, int on) {           /* called from open_fake/close_fake */
   if (fd < 0 || fd >= RC_MAXFD) return;
-  mutexLock(&rc_lock);
+  fx_lock(&rc_lock);
   rc_cacheable[fd] = on ? 1 : 0;
   if (rc_state == 1)                     /* fd numbers get reused: drop stale blocks */
     for (unsigned i = 0; i < RC_NBLOCK; i++) if (rc_tag[i].fd == fd) rc_tag[i].fd = -1;
-  mutexUnlock(&rc_lock);
+  fx_unlock(&rc_lock);
 }
 static void rc_init(void) {
   if (rc_state) return;
-  mutexLock(&rc_lock);
+  fx_lock(&rc_lock);
   if (!rc_state) {
     rc_data = (uint8_t *)malloc((size_t)RC_NBLOCK * RC_BLOCK);
     if (rc_data) {
@@ -3719,7 +3730,7 @@ static void rc_init(void) {
       debugPrintf("[rc] asset read cache DISABLED (alloc failed)\n");
     }
   }
-  mutexUnlock(&rc_lock);
+  fx_unlock(&rc_lock);
 }
 /* Serve `count` bytes at absolute `off`. Returns bytes served, or -1 to say
  * "not cacheable, caller should do it the plain way". */
@@ -3732,7 +3743,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
   rc_init();
   if (rc_state != 1 || !rc_cacheable[fd] || count == 0) return -1;
   size_t done = 0;
-  mutexLock(&rc_lock);
+  fx_lock(&rc_lock);
   diag_in_fs(1);   /* #327: the watchdog must not pause us inside these reads */
   while (done < count) {
     uint64_t abs = off + done;
@@ -3740,6 +3751,12 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
     unsigned idx = (unsigned)(((blk * 2654435761ull) ^ (unsigned)fd) % RC_NBLOCK);
     uint8_t *slot = rc_data + (size_t)idx * RC_BLOCK;
     if (rc_tag[idx].fd != fd || rc_tag[idx].blk != blk) {   /* miss -> fill one block */
+      /* #354: fill with the caller's file position saved and restored, under
+       * the lock. The old code left the fd parked at the end of the block it
+       * had just cached; with two threads holding the same descriptor (the
+       * engine hands the same archive fd to several loaders) that position is
+       * shared state and the next reader picked up the other thread's offset. */
+      long saved = lseek(fd, 0, SEEK_CUR);
       if (lseek(fd, (long)(blk * RC_BLOCK), SEEK_SET) < 0) break;
       size_t got = 0;
       while (got < RC_BLOCK) {
@@ -3747,6 +3764,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
         if (r <= 0) break;
         got += (size_t)r;
       }
+      if (saved >= 0) lseek(fd, saved, SEEK_SET);
       rc_tag[idx].fd = fd; rc_tag[idx].blk = blk; rc_tag[idx].len = (uint32_t)got;
       rc_fills++;
     } else rc_hits++;
@@ -3762,7 +3780,7 @@ static long rc_pread(int fd, void *buf, size_t count, uint64_t off) {
   if (0)
     debugPrintf("[rc] hits=%lu fills=%lu\n", rc_hits, rc_fills);
   diag_in_fs(0);
-  mutexUnlock(&rc_lock);
+  fx_unlock(&rc_lock);
   return (long)done;
 }
 

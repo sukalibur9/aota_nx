@@ -22,7 +22,20 @@
 // logs from several worker threads. No nxlink/socket: this must work on bare
 // hardware. The log lands in the game dir (main() chdir()s there at startup).
 #if DEBUG_LOG
-static Mutex g_log_lock; // libnx Mutex: 0 == unlocked, no init needed
+/* #354: CAS spin lock, NOT a libnx Mutex. libnx mutexLock() publishes the
+ * owner's kernel handle, so a lock last taken by a thread that has since exited
+ * can no longer be arbitrated and the section runs unprotected -- which is
+ * exactly how runs #346/#348/#353 ended up with interleaved, truncated log
+ * lines ("orShader.shader could not be loaded ..."). A CAS lock keeps no owner
+ * handle, so the worst case is a short spin. */
+typedef struct { volatile u32 v; } cas_lock_t;
+static inline int cas_trylock(cas_lock_t *l) {
+  u32 expected = 0;
+  return (int)__atomic_compare_exchange_n(&l->v, &expected, 1u, 0,
+                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+static inline void cas_unlock(cas_lock_t *l) { __atomic_store_n(&l->v, 0u, __ATOMIC_RELEASE); }
+static cas_lock_t g_log_lock; // zero-init == unlocked
 #endif
 
 static int  g_log_fd = -1;
@@ -111,19 +124,19 @@ static int log_ring_push(const char *p, size_t n) {
   u32 h, t, off, first;
   if (n > LOGRING_SIZE) n = LOGRING_SIZE;
   for (int i = 0; i < 100; i++) {
-    if (mutexTryLock(&g_log_lock)) { got = 1; break; }
+    if (cas_trylock(&g_log_lock)) { got = 1; break; }
     svcSleepThread(0);            /* yield: let the holder run */
   }
   if (!got) return 0;
   h = g_ring_head; t = g_ring_tail;
-  if ((u32)(h - t) + (u32)n > LOGRING_SIZE) { mutexUnlock(&g_log_lock); return 0; }
+  if ((u32)(h - t) + (u32)n > LOGRING_SIZE) { cas_unlock(&g_log_lock); return 0; }
   off = h % LOGRING_SIZE;
   first = LOGRING_SIZE - off;
   if (first > n) first = (u32)n;
   memcpy(g_ring + off, p, first);
   if (n > first) memcpy(g_ring, p + first, n - first);
   g_ring_head = h + (u32)n;
-  mutexUnlock(&g_log_lock);
+  cas_unlock(&g_log_lock);
   return 1;
 }
 
@@ -135,7 +148,7 @@ static void log_drain_once(void) {
     int got = 0;
     u32 n = 0, t = 0, off, first;
     ssize_t wrote;
-    if (!mutexTryLock(&g_log_lock)) return;
+    if (!cas_trylock(&g_log_lock)) return;
     got = 1;
     t = g_ring_tail; n = g_ring_head - t;
     if (n > sizeof chunk) n = sizeof chunk;
@@ -146,7 +159,7 @@ static void log_drain_once(void) {
       memcpy(chunk, g_ring + off, first);
       if (n > first) memcpy(chunk + first, g_ring, n - first);
     }
-    mutexUnlock(&g_log_lock);
+    cas_unlock(&g_log_lock);
     if (!got || !n) return;
     {
       int fd = log_fd_open();
@@ -155,9 +168,9 @@ static void log_drain_once(void) {
     }
     if (wrote <= 0) return;      /* keep the bytes; try again next tick */
     g_log_flush_seq++;           /* #329: one completed write == fs is alive */
-    mutexTryLock(&g_log_lock);   /* best effort, single consumer */
+    cas_trylock(&g_log_lock);   /* best effort, single consumer */
     g_ring_tail = t + (u32)wrote;
-    mutexUnlock(&g_log_lock);
+    cas_unlock(&g_log_lock);
     if ((u32)wrote < n) return;
   }
 }

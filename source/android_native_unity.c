@@ -407,7 +407,7 @@ void android_native_input_init(void){
   input_log_fn     = debugPrintf;
   input_log_budget = 600;
 
-  debugPrintf("[inp144] input init: gamepad keys+axes + direct touch (nx_pointer removed)\n");
+  debugPrintf("[inp144] input init: controller only (gamepad keys+axes, touchscreen ignored)\n");
 }
 
 /* nx_pointer flushed a pending pointer.cfg save here; there is no settings
@@ -423,65 +423,6 @@ void android_native_input_shutdown(void){
  * [348] passes it explicitly. */
 typedef uint8_t (*inject_fn)(void*,void*,void*,int);
 #define AINJECT_MODE_NORMAL 0
-
-/* ---- live touch pointer set ----------------------------------------------
- * Android hands the engine the FULL set of pointers currently down on every
- * event; the action word says what happened, and for the multi-pointer
- * variants its high byte says which INDEX in that array it happened to. So
- * we keep the set ourselves rather than forwarding events one at a time. */
-#define NXG_MAX UI_MAX_POINTERS
-
-static int   g_live_id[NXG_MAX];
-static float g_live_x [NXG_MAX];
-static float g_live_y [NXG_MAX];
-static int   g_live_n = 0;
-
-static int live_find(int id){
-  for (int i = 0; i < g_live_n; i++)
-    if (g_live_id[i] == id) return i;
-  return -1;
-}
-
-static void emit(inject_fn inject, void *env, void *thiz, int action){
-  if (g_live_n <= 0) return;
-  g_events_total++;
-  /* [353] Trace a whole gesture: the getter budget refills on every press so
-   * the [in.i]/[in.f] lines describe the tap the game did or did not take. */
-  if ((action & 0xff) == AMOTION_ACTION_DOWN ||
-      (action & 0xff) == AMOTION_ACTION_POINTER_DOWN)
-    input_log_budget = 60;
-  uint8_t r = inject(env, thiz,
-         unity_motionevent(action, g_live_n, g_live_id, g_live_x, g_live_y),
-         AINJECT_MODE_NORMAL);
-  debugPrintf("[inp353] touch action=0x%x n=%d x0=%.0f y0=%.0f -> %d\n",
-              action, g_live_n, g_live_x[0], g_live_y[0], (int)r);
-}
-
-/* [348] The panel now drives a REAL ANDROID MOUSE instead of a touchscreen.
- *
- * Why: this is the Android build of a PC point-and-click game, and the UI it
- * ships is the mouse-driven one -- UGUI/Rewired pointer modules read
- * Input.mousePosition / GetMouseButtonDown and, in StandaloneInputModule-style
- * Process(), only fall back to the touch path when input.mousePresent is false.
- * Touchscreen events were being parsed by Unity (the #347 log shows getAction
- * reads on SOURCE_TOUCHSCREEN events) yet nothing in the game reacted, so feed
- * the device the UI is actually built around: SOURCE_MOUSE with
- * getButtonState carrying BUTTON_PRIMARY while the finger is down. This also
- * makes Input.mousePresent true, which is what enables the mouse branch.
- *
- * One finger -> one mouse pointer: DOWN at the first contact, MOVE while it
- * drags, UP where it lifts. */
-static int   s_mouse_down;
-static float s_mouse_x, s_mouse_y;
-
-static void emit_mouse(inject_fn inject, void *env, void *thiz, int action,
-                       float x, float y, int buttons, const char *tag){
-  g_events_total++;
-  const uint8_t r = inject(env, thiz, unity_mouseevent(action, x, y, buttons),
-                           AINJECT_MODE_NORMAL);
-  debugPrintf("[inp348] mouse %s act=0x%x x=%.0f y=%.0f btn=%d -> %d\n",
-              tag, action, (double)x, (double)y, buttons, (int)r);
-}
 
 /* ---- gamepad tables --------------------------------------------------------
  * Android keycodes: BUTTON_A=96 B=97 X=99 Y=100 L1=102 R1=103 L2=104 R2=105
@@ -592,122 +533,6 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     }
   }
 
-  /* ---- [353] panel -> Android TOUCHSCREEN (handheld only).
-   *
-   * Why this replaces the [348] mouse: the title scene (data.unity3d/level0)
-   * puts Rewired in charge of the pointer -- EventSystem carries a
-   * RewiredStandaloneInputModule, the UI pointer is a Rewired PlayerMouse
-   * ("Virtual Cursor") driving the VirtualCursor image, and the Rewired Input
-   * Manager ships Point/Click/Navigate/Submit Actions. Rewired on Android is
-   * 100% UnityEngine.Input, and the pointer module takes the touch branch on a
-   * touch device. #351/#352 proved the engine reads and accepts our SOURCE_MOUSE
-   * events (hover MOVE read getX/getY, DOWN set getButtonState=1) yet no Rewired
-   * action ever fired, so the mouse is the wrong device for this build: a phone
-   * reports a touchscreen, never a mouse, and Unity turns touches into the
-   * mouse state Rewired's mouse path reads anyway (simulateMouseWithTouches).
-   *
-   * The panel reports in its own 1280x720 space regardless of render size, so
-   * scale up. One finger is one pointer; the live set below mirrors Android's
-   * "full pointer array on every event" contract. */
-  if (0 && appletGetOperationMode() == AppletOperationMode_Handheld){
-    HidTouchScreenState ts = {0};
-    hidGetTouchScreenStates(&ts, 1);
-    const float msx = (float)g_w / 1280.0f, msy = (float)g_h / 720.0f;
-    if (ts.count > 0){
-      float x = (float)ts.touches[0].x * msx;
-      float y = (float)ts.touches[0].y * msy;
-      if (x < 0) x = 0;
-      if (y < 0) y = 0;
-      if (x > (float)g_w - 1) x = (float)g_w - 1;
-      if (y > (float)g_h - 1) y = (float)g_h - 1;
-      if (!s_mouse_down){
-        s_mouse_down = 1;
-        s_mouse_x = x; s_mouse_y = y;
-        /* Trace this whole gesture: the getter budget is refilled per press so
-         * the [in.f] lines in the log describe the tap the game ignored. */
-        input_log_budget = 40;
-        /* [352] HOVER FIRST. Test #351 proved, over all 147 presses and all
-         * 147 releases, that the engine reads NO position on DOWN or UP
-         * (getDeviceId/getSource/getEventTime/getActionMasked/getButtonState
-         * only); it reads getHistorySize + getX + getY exclusively on MOVE
-         * (506 of 655 moves logged, all of them action 0x2). So Unity tracks
-         * the mouse position from MOVE events and turns a DOWN purely into a
-         * button-state change: a tap that starts at a place the cursor never
-         * hovered presses at the PREVIOUS position (the last MOVE of the
-         * previous gesture, or the initial 0,0). The UI therefore never
-         * receives a click where the finger landed.
-         *
-         * A real Android mouse always hovers before it clicks, so mirror it:
-         * one MOVE with the button up at the contact point, then the DOWN at
-         * the same coordinates. The engine's tracked pointer is then exactly
-         * under the press, and getButtonState goes 0 -> 1 there. */
-        emit_mouse(inject, env, thiz, AMOTION_ACTION_MOVE, x, y, 0, "hover");
-        emit_mouse(inject, env, thiz, AMOTION_ACTION_DOWN, x, y,
-                   AMOTION_BUTTON_PRIMARY, "down");
-      } else if (x != s_mouse_x || y != s_mouse_y){
-        s_mouse_x = x; s_mouse_y = y;
-        emit_mouse(inject, env, thiz, AMOTION_ACTION_MOVE, x, y,
-                   AMOTION_BUTTON_PRIMARY, "move");
-      }
-    } else if (s_mouse_down){
-      s_mouse_down = 0;
-      emit_mouse(inject, env, thiz, AMOTION_ACTION_UP, s_mouse_x, s_mouse_y,
-                 0, "up");
-    }
-  }
-
-  /* ---- [353] touchscreen path (see the note above the disabled mouse block) ---- */
-  if (appletGetOperationMode() == AppletOperationMode_Handheld){
-    HidTouchScreenState ts = {0};
-    hidGetTouchScreenStates(&ts, 1);
-    int count = ts.count > 8 ? 8 : ts.count;
-    const float sx = (float)g_w / 1280.0f, sy = (float)g_h / 720.0f;
-    int move_pending = 0;
-
-    for (int i = 0; i < count; i++){
-      float x = (float)ts.touches[i].x * sx;
-      float y = (float)ts.touches[i].y * sy;
-      if (x < 0) x = 0;
-      if (y < 0) y = 0;
-      if (x > (float)g_w - 1) x = (float)g_w - 1;
-      if (y > (float)g_h - 1) y = (float)g_h - 1;
-      const int idx = live_find(i);
-      if (idx >= 0){
-        if (g_live_x[idx] != x || g_live_y[idx] != y){
-          g_live_x[idx] = x; g_live_y[idx] = y;
-          move_pending = 1;
-        }
-        continue;
-      }
-      if (move_pending){ emit(inject, env, thiz, AMOTION_ACTION_MOVE); move_pending = 0; }
-      if (g_live_n >= NXG_MAX) continue;
-      const int nidx = g_live_n++;
-      g_live_id[nidx] = i; g_live_x[nidx] = x; g_live_y[nidx] = y;
-      emit(inject, env, thiz,
-           (g_live_n == 1)
-             ? AMOTION_ACTION_DOWN
-             : (AMOTION_ACTION_POINTER_DOWN | (nidx << AMOTION_ACTION_PTR_IDX_SHIFT)));
-    }
-    if (move_pending){ emit(inject, env, thiz, AMOTION_ACTION_MOVE); move_pending = 0; }
-
-    /* Lifts: any live slot beyond this frame's touch count is gone. The
-     * lifting pointer stays IN the array for its own UP (that is how
-     * getActionIndex identifies it) and is removed afterwards. */
-    for (int idx = g_live_n - 1; idx >= 0; idx--){
-      if (g_live_id[idx] < count) continue;
-      emit(inject, env, thiz,
-           (g_live_n == 1)
-             ? AMOTION_ACTION_UP
-             : (AMOTION_ACTION_POINTER_UP | (idx << AMOTION_ACTION_PTR_IDX_SHIFT)));
-      for (int k = idx + 1; k < g_live_n; k++){
-        g_live_id[k-1] = g_live_id[k];
-        g_live_x [k-1] = g_live_x [k];
-        g_live_y [k-1] = g_live_y [k];
-      }
-      g_live_n--;
-    }
-  }
-
   /* [inp144] heartbeat: the feed runs at 60 Hz on its own thread since
    * [inp285], so every 60 calls is ~1s -- the events_total trend separates
    * "nothing is being injected" from "injected but unread" in one glance
@@ -719,7 +544,7 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
    * never change, libnx is not seeing the controller at all. */
   if ((s_calls % 60) == 1)
     debugPrintf("[inp144] feed calls=%u events_total=%u live=%d held=0x%llx down=0x%llx style=0x%llx\n",
-                s_calls, g_events_total, s_mouse_down ? 1 : 0,
+                s_calls, g_events_total, 0,
                 (unsigned long long)held, (unsigned long long)bdown,
                 (unsigned long long)padGetStyleSet(&g_pad));
 }

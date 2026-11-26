@@ -3412,9 +3412,24 @@ static juint field_int(const FakeID *id) {
   const char *n = id->name, *c = id->cls;
   if (!strcmp(n, "what") && name_has(c, "Message")) return (juint)g_msg_what;
   if (!strcmp(n, "versionCode")) return APP_VERSION_CODE;
-  // UnityPlayer integer statics
-  if (name_has(c, "unity3d/player/UnityPlayer")) {
+  // UnityPlayer integer statics.
+  // #354: the class name that reaches this dispatcher is the SHORT one
+  // ("UnityPlayer"), not "com/unity3d/player/UnityPlayer" -- the boot log shows
+  //     JNI id: UnityPlayer.SDK_INT I
+  //     [jni] CONSTANT UnityPlayer.SDK_INT not modelled -> 0
+  // so the old unity3d/player/UnityPlayer test never matched and every one of
+  // these answered 0. SDK_INT 0 is not neutral: the engine gates cursor
+  // locking on it and printed "Cursor locking is only supported on devices
+  // with API Level 26 or higher, this device API Level is 0" the moment the
+  // game handled a controller key, and the KEYCODE_* zeros made every named
+  // volume/camera key look like keycode 0.
+  if (name_has(c, "UnityPlayer")) {
     if (!strcmp(n, "SDK_INT"))     return NX_SDK_INT;
+    if (!strcmp(n, "KEYCODE_VOLUME_UP"))   return 24;
+    if (!strcmp(n, "KEYCODE_VOLUME_DOWN")) return 25;
+    if (!strcmp(n, "KEYCODE_CAMERA"))      return 27;
+    if (!strcmp(n, "KEYCODE_ZOOM_IN"))     return 168;
+    if (!strcmp(n, "KEYCODE_ZOOM_OUT"))    return 169;
     if (!strcmp(n, "densityDpi"))  return 320;
     if (!strcmp(n, "widthPixels")) return screen_width;   /* real panel (landscape) */
     if (!strcmp(n, "heightPixels"))return screen_height;
