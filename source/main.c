@@ -1270,15 +1270,20 @@ static void *nx_jobsnoop_thread(void *arg) {
      * arena used/free/spill numbers were unanswerable. */
     unsigned marena_used = 0, marena_free = 0, marena_spill = 0;
     mem290_arena_snap(&marena_used, &marena_free, &marena_spill);
+    /* Build #358: libunity's CPU-affinity filter word (VA 0x16fc950). -1 means
+     * "use the classification mask as-is" (the healthy state); any other value
+     * ANDs the big.LITTLE masks, so a stray 0x4 turns a 3-core report into
+     * "1 big (mask: 0x4)". Logging it here says when the engine writes it. */
+    uint32_t cpumask = *(volatile uint32_t *)(ub + 0x16fc950u);
     if (sf) {
-      fprintf(sf, "[snoop] qptr=%p flag=%u count=%d js2=%p q0=%llx pools=%p/%p/%p impl=%p stop=%d s128=%llx s192=%llx push=%llu sched=%llu compl=%llu wunlock=%u start251=%u w183=%u lspin=%u lmtx=%p ltid=%u l274id=%u l274tp=%u u277tp=%u n280=%u lrsmp=%s pcs=%s audst=%d audq=%u heap=%u/%u marena=%u/%u/%u\n",
+      fprintf(sf, "[snoop] qptr=%p flag=%u count=%d js2=%p q0=%llx pools=%p/%p/%p impl=%p stop=%d s128=%llx s192=%llx push=%llu sched=%llu compl=%llu wunlock=%u start251=%u w183=%u lspin=%u lmtx=%p ltid=%u l274id=%u l274tp=%u u277tp=%u n280=%u lrsmp=%s pcs=%s audst=%d audq=%u heap=%u/%u marena=%u/%u/%u cpumask=%x\n",
               qptr, flag, (int)count, js2,
               (unsigned long long)q0, pool0, pool1, pool2, impl, stop,
               (unsigned long long)s128, (unsigned long long)s192,
               (unsigned long long)nx_push_count,
               (unsigned long long)nx_sched_count,
               (unsigned long long)nx_complete_count,
-              waiter188_unlock_n, start251_n, worker183_n, waiter220_n, (void *)waiter220_last_mtx, waiter220_last_tid, lock274_fires_id, lock274_fires_tp, unlock277_fires_tp, lock280_null_n, lrsmp, pcs, audst, (unsigned)audq, heap_used, heap_free, marena_used, marena_free, marena_spill);
+              waiter188_unlock_n, start251_n, worker183_n, waiter220_n, (void *)waiter220_last_mtx, waiter220_last_tid, lock274_fires_id, lock274_fires_tp, unlock277_fires_tp, lock280_null_n, lrsmp, pcs, audst, (unsigned)audq, heap_used, heap_free, marena_used, marena_free, marena_spill, (unsigned)cpumask);
       fflush(sf);
       /* #310: failed svcArbitrateLock records (bss, written by the lock
        * tramp without any I/O) are printed here, on this thread, which has
@@ -3580,6 +3585,36 @@ int main(int argc, char *argv[]) {
     }
   }
 
+
+  /* Build #358: Unity filters its own big.LITTLE result through one global.
+   * Capstone-verified in this libunity: the per-core gatherer at +0x123ef18
+   * ends with
+   *     +0x123f104  adrp x8, #0x16fc000
+   *     +0x123f108  ldr  w9, [x8, #0x950]      <- the filter word (VA 0x16fc950)
+   *     +0x123f110  cmn  w9, #1
+   *     +0x123f114  b.eq <use the classification mask untouched>
+   *     +0x123f118  and  w1, w9, w1 / and w8, w9, w8  <- filter applied
+   * and the word's only writer (+0x123f88c, reached from +0x11076b4 after the
+   * syscall(__NR_sched_getaffinity) probe at +0x110755c) stores either -1 or
+   * whatever mask that probe returned. Test #357 logged
+   *     SystemInfo ARM big.LITTLE configuration: 1 big (mask: 0x4), 0 little
+   * (healthy b352: "3 big (mask: 0x7)"), i.e. the probe's mask held one core
+   * and the popcount of (classMask & 0x4) reported a single usable CPU, so too
+   * few job workers were created for frame 1. Since #304 sched_getaffinity()
+   * already publishes cores 0-2, make the classifier trust its own detection by
+   * replacing that load with `mov w9, #-1` ("no filter"). Verify-first. */
+  {
+    const uint32_t stock   = 0xB9495109u;   /* ldr w9, [x8, #0x950] */
+    const uint32_t patched = 0x12800009u;   /* mov w9, #-1 */
+    uintptr_t site = (uintptr_t)unity_mod.load_virtbase + 0x123f108u;
+    if (*(volatile uint32_t *)site == stock) {
+      so_patch_code((void *)site, &patched, sizeof patched);
+      debugPrintf("[cpu358] big.LITTLE mask filter disabled @libunity+0x123f108\n");
+    } else {
+      debugPrintf("[cpu358] SKIP mask-filter patch: +0x123f108 = 0x%08x, not `ldr w9,[x8,#0x950]`\n",
+                  *(volatile uint32_t *)site);
+    }
+  }
 
   /* The main thread runs init_array + the engine lifecycle; give it its own
    * stable bionic TLS for the stack-protector guard (tpidr_el0+0x28). */

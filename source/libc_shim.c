@@ -173,6 +173,7 @@ int port_is_main_thread(void) {
 
 #define ARM64_SYS_GETTID            178
 #define ARM64_SYS_FUTEX             98
+#define ARM64_SYS_SCHED_GETAFFINITY 123
 #define ARM64_SYS_SCHED_SETAFFINITY 122
 #define ARM64_SYS_PROCESS_VM_READV  270
 #define ARM64_SYS_PROCESS_VM_WRITEV 271
@@ -1000,8 +1001,27 @@ static ssize_t nx_process_vm_xfer(int writing, const struct nx_iovec *liov,
 }
 
 long syscall_fake(long number, ...) {
+  { /* #358: is this route used at all? libunity imports syscall() and its
+     * big.LITTLE probe (libunity+0x110755c..0x11075b4) asks for 123/122, but
+     * no run has ever logged a syscall() line from us, so trace the entry. */
+    static int n = 0;
+    if (n < 24) { n++; debugPrintf("[sys358] #%d number=%ld\n", n, number); }
+  }
   switch (number) {
     case ARM64_SYS_GETTID: return gettid_fake();
+    case ARM64_SYS_SCHED_GETAFFINITY: {
+      /* #358: the engine's CPU probe calls syscall(__NR_sched_getaffinity,
+       * tid, 128, cpu_set_t*). Unhandled it fell through to ENOSYS below, which
+       * the engine treats as "probe failed" and turns into mask -1; answering it
+       * with the same 0x7 that sched_getaffinity_fake() publishes keeps the
+       * detection successful and deterministic instead. */
+      va_list va; va_start(va, number);
+      const long pid  = va_arg(va, long);
+      const size_t sz = va_arg(va, size_t);
+      void *mask      = va_arg(va, void *);
+      va_end(va);
+      return sched_getaffinity_fake((int)pid, sz, mask);
+    }
     case ARM64_SYS_FUTEX: {
       va_list va; va_start(va, number);
       volatile int32_t *uaddr = va_arg(va, volatile int32_t *);
