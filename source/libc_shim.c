@@ -1581,7 +1581,12 @@ long z_lseek(int fd, long off, int whence) {
   long r = lseek(fd, off, whence);
   diag_in_fs(0);
   if (fd == g_watch_fd) debugPrintf("[io] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
-  if (apk314_is(fd)) debugPrintf("[apk314] lseek fd=%d off=%ld whence=%d -> %ld\n", fd, off, whence, r);
+  if (apk314_is(fd)) {   /* #359: same volume cut as apk314_begin (769 lines in 24 s) */
+    static unsigned nl359;
+    unsigned k = nl359++;
+    if (k < 160 || (k & 63u) == 0)
+      debugPrintf("[apk314] lseek fd=%d off=%ld whence=%d -> %ld (n=%u)\n", fd, off, whence, r, k);
+  }
   return r;
 }
 

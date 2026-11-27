@@ -840,12 +840,23 @@ void nx_msg317_stats(uint64_t *calls, uint64_t *anom);   /* main.c */
 
 static void alive2_main(void *unused) {
   (void)unused;
-  FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
-  if (!fs) return;
-  (void)fsFsCreateFile(fs, "/switch/aota/alive.log", 0, 0);   /* EEXIST is fine */
-  FsFile f;
-  if (R_FAILED(fsFsOpenFile(fs, "/switch/aota/alive.log", FsOpenMode_Write, &f)))
+  /* #359: own SD session, not fsdevGetDeviceFileSystem("sdmc"). Test #358's
+   * alive.log stayed 0 bytes for the whole run: fsdevGetDeviceFileSystem()
+   * returned no filesystem (or the first write failed), so the one witness
+   * that could have told "process alive, fsdev wedged" from "process gone"
+   * stayed silent. fsOpenSdCardFileSystem() asks the fs service directly. */
+  FsFileSystem fs;
+  fsInitialize();
+  if (R_FAILED(fsOpenSdCardFileSystem(&fs))) {
+    debugPrintf("[a318] own SD session FAILED (alive.log unavailable)\n");
     return;
+  }
+  (void)fsFsCreateFile(&fs, "/switch/aota/alive.log", 0, 0);   /* EEXIST is fine */
+  FsFile f;
+  if (R_FAILED(fsFsOpenFile(&fs, "/switch/aota/alive.log", FsOpenMode_Write, &f))) {
+    debugPrintf("[a318] alive.log open FAILED\n");
+    return;
+  }
   (void)fsFileSetSize(&f, 0);
   s64 off = 0;
   for (int n = 1; n <= 2400; n++) {
@@ -871,7 +882,12 @@ static void alive2_main(void *unused) {
                        (unsigned long long)mwait,
                        (unsigned long long)c317, (unsigned long long)a317);
     if (len <= 0) continue;
-    if (R_FAILED(fsFileWrite(&f, off, buf, (size_t)len, FsWriteOption_Flush))) return;
+    Result wr = fsFileWrite(&f, off, buf, (size_t)len, FsWriteOption_Flush);
+    if (R_FAILED(wr)) {
+      /* #359: say WHY the witness died instead of vanishing silently. */
+      if (n == 1) debugPrintf("[a318] alive.log write FAILED rc=0x%x\n", wr);
+      return;
+    }
     off += len;
   }
   fsFileClose(&f);

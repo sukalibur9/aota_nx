@@ -213,8 +213,14 @@ int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
   /* Build #101: diagnostic logging for once-init deadlock investigation.
    * Log all broadcasts to see if the once-init completer ever signals. */
   cond127_tab[cond127_slot(*cnd)].sigs++;
-  debugPrintf("[cond] BROADCAST cnd=%p caller=%p\n", (void *)*cnd,
-              __builtin_return_address(0));
+  /* #359: log volume. This trace wrote 891 SD-bound lines in the first 24 s of
+   * test #358 -- the single biggest producer in debug.log. Keep the evidence
+   * (first 40, then every 256th) without paying for every broadcast. */
+  { static unsigned b359;
+    unsigned k = b359++;
+    if (k < 40 || (k & 255u) == 0)
+      debugPrintf("[cond] BROADCAST cnd=%p caller=%p (n=%u)\n", (void *)*cnd,
+                  __builtin_return_address(0), k); }
   return pthread_cond_broadcast(*cnd);
 }
 int pthread_cond_signal_fake(pthread_cond_t **cnd) {
