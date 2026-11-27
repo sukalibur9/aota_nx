@@ -3586,33 +3586,91 @@ int main(int argc, char *argv[]) {
   }
 
 
-  /* Build #358: Unity filters its own big.LITTLE result through one global.
-   * Capstone-verified in this libunity: the per-core gatherer at +0x123ef18
-   * ends with
-   *     +0x123f104  adrp x8, #0x16fc000
-   *     +0x123f108  ldr  w9, [x8, #0x950]      <- the filter word (VA 0x16fc950)
-   *     +0x123f110  cmn  w9, #1
-   *     +0x123f114  b.eq <use the classification mask untouched>
-   *     +0x123f118  and  w1, w9, w1 / and w8, w9, w8  <- filter applied
-   * and the word's only writer (+0x123f88c, reached from +0x11076b4 after the
-   * syscall(__NR_sched_getaffinity) probe at +0x110755c) stores either -1 or
-   * whatever mask that probe returned. Test #357 logged
-   *     SystemInfo ARM big.LITTLE configuration: 1 big (mask: 0x4), 0 little
-   * (healthy b352: "3 big (mask: 0x7)"), i.e. the probe's mask held one core
-   * and the popcount of (classMask & 0x4) reported a single usable CPU, so too
-   * few job workers were created for frame 1. Since #304 sched_getaffinity()
-   * already publishes cores 0-2, make the classifier trust its own detection by
-   * replacing that load with `mov w9, #-1` ("no filter"). Verify-first. */
+  /* Build #360: SystemInfo's CPU topology is forced to the real homebrew shape
+   * (3 cores 0-2, all "big", mask 0x7), instead of trusting Unity's own
+   * classification of our synthetic /proc + /sys nodes.
+   *
+   * Why #358 was not enough: #358 replaced the big.LITTLE *filter* word load at
+   * +0x123f108 with `mov w9, #-1`, and test #359 had that patch applied
+   * (`[cpu358] big.LITTLE mask filter disabled`) and still printed
+   *     Unity: SystemInfo CPU = ARM64, Cores = 1, Memory = 0mb
+   *     Unity: SystemInfo ARM big.LITTLE configuration: 1 big (mask: 0x4)
+   * -- so the filter was not the source; the per-core classification itself
+   * came back one-core (0x4 = core 2 only) in that run and 0x7 in b358.
+   *
+   * Capstone-verified chain in this libunity (all offsets verified against
+   * .rea_in/x/arm64-v8a/libunity.so):
+   *   +0x1107944  "SystemInfo CPU = %s, Cores = %d, Memory = %dmb"
+   *               w2 = bl +0x123f900 (cores), w3 = bl +0x123f5fc (memory mb)
+   *   +0x123f900  pthread_once(+0x17dca40, init +0x123f718) then
+   *               w0 = [0x17dc988] + [0x17dc990]      <- bigCount + littleCount
+   *   +0x123f718  init: bl +0x123ef18 (gatherer), stp x0,x1,[0x17dc988]
+   *               x0 = bigCount | bigMask<<32, x1 = littleCount | littleMask<<32
+   *   +0x123ef18  gatherer ends by classifying (bl +0x123e8fc) and returning
+   *               that pair through the #358 filter block at +0x123f104.
+   * The gatherer's inputs are provably identical in the healthy and the broken
+   * run -- test #359's own traces show fscanf reading cpu_capacity = 1024 and
+   * cpuinfo_max_freq = 0 for cpu0, cpu1 AND cpu2, /proc/cpuinfo 543 B,
+   * /sys/.../{present,possible} = "0-2", and sysconf(NPROCESSORS) = 3 -- yet the
+   * packed pair differs between runs, so something the traces do not cover (the
+   * struct is built once per process and its per-core "valid"/part fields come
+   * from a /proc/cpuinfo parse) makes the classification nondeterministic.
+   * Cores=1 also starves the job queue: b359 crashed at frame 1 in
+   * libunity+0xe344c0 (NULL element in a resource list) with every MonoBehaviour
+   * reported as "referenced script (Unknown)" -- the documented
+   * Cores=1/Memory=0 failure mode of this port (#349).
+   *
+   * Fix: short-circuit the gatherer's return, not its inputs. At +0x123f104 the
+   * five words that compute/apply the filter become
+   *     mov  x0, #3                 ; bigCount   = 3
+   *     movk x0, #7, lsl #32        ; bigMask    = 0x7 (cores 0,1,2)
+   *     mov  x1, xzr                ; littleCount= 0, littleMask = 0
+   *     lsr  x8, x1, #0x20          ; (x8 must mirror x1's high word for the
+   *                                 ;  epilogue at +0x123f168)
+   *     b    +0x123f144             ; straight to the return path
+   * so both readers (+0x123f718's cache and every later getter) see 3 cores /
+   * 0x7 no matter what the /proc + /sys parse produced. The struct build and the
+   * per-core /sys reads still run unchanged (they are harmless), only the
+   * answer is pinned. Verify-first: the site must still be the stock
+   * `adrp x8, #0x16fc000`; #358's patched word is inside the range we rewrite.
+   *
+   * Memory is pinned the same way: +0x123f5fc is the getter the printf reads
+   * (bl +0x1240934; ldr x8,[x0,#8]; lsr x0,x8,#0x14 => MB). It returned 0 in
+   * b359 even though /proc/meminfo was read correctly (189 B, MemTotal 524288
+   * kB), i.e. the same one-shot cached-struct defect. `mov w0,#512 ; ret`
+   * matches what this port already publishes through sysconf(PHYS_PAGES) and
+   * the synthetic meminfo. */
   {
-    const uint32_t stock   = 0xB9495109u;   /* ldr w9, [x8, #0x950] */
-    const uint32_t patched = 0x12800009u;   /* mov w9, #-1 */
-    uintptr_t site = (uintptr_t)unity_mod.load_virtbase + 0x123f108u;
-    if (*(volatile uint32_t *)site == stock) {
-      so_patch_code((void *)site, &patched, sizeof patched);
-      debugPrintf("[cpu358] big.LITTLE mask filter disabled @libunity+0x123f108\n");
+    const uint32_t stock_spare = 0xF81F0FFEu;  /* str x30, [sp, #-0x10]!  @+0x123f5fc */
+    const uint32_t stock_bl    = 0x940004CDu;  /* bl +0x1240934            @+0x123f600 */
+    const uint32_t stock_adrp  = 0xB00025E8u;  /* adrp x8, #0x16fc000      @+0x123f104 */
+    /* +0x123f104: force bigCount=3 / bigMask=0x7 / little 0, then return. */
+    const uint32_t topo[5] = {
+      0xD2800060u,   /* mov  x0, #3                */
+      0xF2C000E0u,   /* movk x0, #7, lsl #32       */
+      0xAA1F03E1u,   /* mov  x1, xzr               */
+      0xD360FC28u,   /* lsr  x8, x1, #0x20         */
+      0x1400000Cu,   /* b    +0x123f144            */
+    };
+    /* +0x123f5fc: systemMemorySize() -> 512 MB. */
+    const uint32_t mem[2] = { 0x52804000u /* mov w0, #512 */, 0xD65F03C0u /* ret */ };
+    uintptr_t ub    = (uintptr_t)unity_mod.load_virtbase;
+    uintptr_t site  = ub + 0x123f104u;
+    uintptr_t msite = ub + 0x123f5fcu;
+    if (*(volatile uint32_t *)site == stock_adrp) {
+      so_patch_code((void *)site, topo, sizeof topo);
+      debugPrintf("[cpu360] topology pinned: 3 big (mask 0x7), 0 little @libunity+0x123f104\n");
     } else {
-      debugPrintf("[cpu358] SKIP mask-filter patch: +0x123f108 = 0x%08x, not `ldr w9,[x8,#0x950]`\n",
+      debugPrintf("[cpu360] SKIP topology pin: +0x123f104 = 0x%08x, not `adrp x8,#0x16fc000`\n",
                   *(volatile uint32_t *)site);
+    }
+    if (*(volatile uint32_t *)msite == stock_spare &&
+        *(volatile uint32_t *)(msite + 4) == stock_bl) {
+      so_patch_code((void *)msite, mem, sizeof mem);
+      debugPrintf("[cpu360] SystemInfo memory pinned: 512 MB @libunity+0x123f5fc\n");
+    } else {
+      debugPrintf("[cpu360] SKIP memory pin: +0x123f5fc = 0x%08x / 0x%08x, not the expected getter\n",
+                  *(volatile uint32_t *)msite, *(volatile uint32_t *)(msite + 4));
     }
   }
 

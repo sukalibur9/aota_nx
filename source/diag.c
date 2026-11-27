@@ -840,20 +840,19 @@ void nx_msg317_stats(uint64_t *calls, uint64_t *anom);   /* main.c */
 
 static void alive2_main(void *unused) {
   (void)unused;
-  /* #359: own SD session, not fsdevGetDeviceFileSystem("sdmc"). Test #358's
-   * alive.log stayed 0 bytes for the whole run: fsdevGetDeviceFileSystem()
-   * returned no filesystem (or the first write failed), so the one witness
-   * that could have told "process alive, fsdev wedged" from "process gone"
-   * stayed silent. fsOpenSdCardFileSystem() asks the fs service directly. */
-  FsFileSystem fs;
-  fsInitialize();
-  if (R_FAILED(fsOpenSdCardFileSystem(&fs))) {
-    debugPrintf("[a318] own SD session FAILED (alive.log unavailable)\n");
-    return;
-  }
-  (void)fsFsCreateFile(&fs, "/switch/aota/alive.log", 0, 0);   /* EEXIST is fine */
+  /* #360: back to the shared fsdev filesystem. #359 gave this witness its own
+   * session (fsOpenSdCardFileSystem) and test #359 showed it bought nothing:
+   * the log flusher's session open failed outright (`[log359] own SD session
+   * unavailable`) and this one's first write came back rc=0x307202 (an fs
+   * service error), so alive.log stayed 0 bytes again -- while the extra sdmc
+   * session was live exactly while Unity parsed /proc and /sys at boot (that
+   * run's SystemInfo came back Cores=1 / Memory=0 / mask 0x4). One fs client,
+   * as in b358, and say WHY the witness died if it does. */
+  FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
+  if (!fs) { debugPrintf("[a318] no sdmc filesystem (alive.log unavailable)\n"); return; }
+  (void)fsFsCreateFile(fs, "/switch/aota/alive.log", 0, 0);   /* EEXIST is fine */
   FsFile f;
-  if (R_FAILED(fsFsOpenFile(&fs, "/switch/aota/alive.log", FsOpenMode_Write, &f))) {
+  if (R_FAILED(fsFsOpenFile(fs, "/switch/aota/alive.log", FsOpenMode_Write, &f))) {
     debugPrintf("[a318] alive.log open FAILED\n");
     return;
   }
@@ -884,7 +883,6 @@ static void alive2_main(void *unused) {
     if (len <= 0) continue;
     Result wr = fsFileWrite(&f, off, buf, (size_t)len, FsWriteOption_Flush);
     if (R_FAILED(wr)) {
-      /* #359: say WHY the witness died instead of vanishing silently. */
       if (n == 1) debugPrintf("[a318] alive.log write FAILED rc=0x%x\n", wr);
       return;
     }

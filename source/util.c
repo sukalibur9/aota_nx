@@ -77,48 +77,6 @@ static int log_fd_open(void) {
 
 int debugLogFd(void) { return log_fd_open(); }
 
-/* ---- build #359: the log flusher gets its OWN SD session -------------------
- * Test #358 (the first build that reached the title screen, SystemInfo now
- * Cores=3 / 512mb / mask 0x7, cpumask=ffffffff in every snoop line) froze at
- * frame 190: debug.log, wd290.log AND the raw-write sentinel all stopped in the
- * same instant, while the game's audio kept playing -- i.e. the process was
- * alive and every thread that touched the filesystem was blocked. The one
- * fs call the flusher made that nothing else made was `fsync` once a second
- * (#329). An fs request that never returns wedges the shared fsdev session
- * (same failure family as #317/#327/#334), so producers and the game itself
- * block behind it.
- *
- * Fix: drain debug.log through a SECOND FsFileSystem session opened straight
- * from the fs service (fsOpenSdCardFileSystem), and drop the periodic fsync
- * (flush every 2 s instead). A stall in this session can now only lose log
- * lines; it can no longer freeze the game's own fsdev traffic. */
-static FsFileSystem g_log_fs;
-static FsFile    g_log_file;
-static int       g_log_fs_state;   /* 0 = untried, 1 = ready, -1 = failed */
-static s64       g_log_off;
-
-static int log_fs_open(void) {
-#if DEBUG_LOG
-  if (g_log_fs_state == 1) return 1;
-  if (g_log_fs_state == -1) return 0;
-  g_log_fs_state = -1;
-  if (!g_log_path[0]) return 0;
-  fsInitialize();                       /* refcounted; fsdev already did it */
-  if (R_FAILED(fsOpenSdCardFileSystem(&g_log_fs))) return 0;
-  (void)fsFsCreateFile(&g_log_fs, g_log_path, 0, 0);   /* EEXIST is fine */
-  if (R_FAILED(fsFsOpenFile(&g_log_fs, g_log_path,
-                            FsOpenMode_Write | FsOpenMode_Append, &g_log_file)))
-    return 0;
-  s64 sz = 0;
-  if (R_FAILED(fsFileGetSize(&g_log_file, &sz))) return 0;
-  g_log_off = sz;
-  g_log_fs_state = 1;
-  return 1;
-#else
-  return 0;
-#endif
-}
-
 /* ---- build #328: producers never touch SD ----------------------------------
  * Test #327 finally sampled the main thread at the stall (#327 works):
  *
@@ -203,14 +161,7 @@ static void log_drain_once(void) {
     }
     cas_unlock(&g_log_lock);
     if (!got || !n) return;
-    if (log_fs_open()) {
-      /* #359: own session, explicit offset, no fsync in the hot path. */
-      if (R_FAILED(fsFileWrite(&g_log_file, g_log_off, chunk, (u64)n,
-                               FsWriteOption_None)))
-        return;                  /* keep the bytes; try again next tick */
-      g_log_off += (s64)n;
-      wrote = (ssize_t)n;
-    } else {
+    {
       int fd = log_fd_open();
       if (fd < 0) return;
       wrote = write(fd, chunk, (size_t)n);
@@ -234,18 +185,10 @@ static void log_flusher_main(void *arg) {
      * still be sitting in the FAT cache, so "last line" may be far behind "last
      * thing that ran". fsync once a second commits what we have; the flusher is
      * the only thread that pays for it, and only it can be delayed. */
-    if (++ticks >= 40) {         /* 40 * 50 ms = 2 s */
+    if (++ticks >= 20) {         /* 20 * 50 ms = 1 s */
       ticks = 0;
-      /* #359: flush, do not fsync. The #329 fsync (once a second) is the one
-       * fs request the flusher made that no producer made, and test #358's
-       * freeze took every fs-touching thread down at once. A 2 s flush keeps
-       * the tail reasonably fresh without a synchronous commit on the
-       * critical path. */
-      if (g_log_fs_state == 1) { (void)fsFileFlush(&g_log_file); g_log_flush_seq++; }
-      else {
-        int fd = log_fd_open();
-        if (fd >= 0) { (void)fsync(fd); g_log_flush_seq++; }
-      }
+      int fd = log_fd_open();
+      if (fd >= 0) { (void)fsync(fd); g_log_flush_seq++; }
     }
     /* 50 ms: short enough that a crash loses almost nothing, long enough that
      * the SD sees a handful of writes per second instead of one per line. */
@@ -257,16 +200,7 @@ static void log_flusher_main(void *arg) {
 void log_init(void) {
 #if DEBUG_LOG
   if (g_log_thr_ok) return;
-  {
-    int fd = log_fd_open();     /* open on a healthy process, not in a producer */
-    /* One-time commit of the build stamp so the own-session writer below appends
-     * after it instead of overwriting it (#359). */
-    if (fd >= 0) (void)fsync(fd);
-  }
-  if (log_fs_open())
-    debugPrintf("[log359] flusher on its own SD session (no periodic fsync)\n");
-  else
-    debugPrintf("[log359] own SD session unavailable -- flusher stays on fsdev\n");
+  (void)log_fd_open();          /* open on a healthy process, not in a producer */
   if (R_FAILED(threadCreate(&g_log_thr, log_flusher_main, NULL, NULL,
                             0x4000, 0x2C, -2)))
     return;
